@@ -1097,7 +1097,7 @@ tryCatch({
       obj <- item$obj
       DefaultAssay(obj) <- "SCT"
       genes_avail <- intersect(all_var_genes, rownames(obj))
-      mat <- GetAssayData(obj, slot = "data")[genes_avail, item$cells, drop = FALSE]
+      mat <- GetAssayData(obj, layer = "data")[genes_avail, item$cells, drop = FALSE]
       mat
     })
 
