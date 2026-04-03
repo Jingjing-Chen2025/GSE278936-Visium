@@ -314,6 +314,7 @@ for (sn in names(sample_manifest)) {
         bcs_with_pos <- colnames(obj)[colnames(obj) %in% rownames(pos)]
         obj <- subset(obj, cells = bcs_with_pos)
         pos_matched <- pos[colnames(obj), ]
+        obj$in_tissue <- pos_matched$in_tissue
         obj$row      <- pos_matched$array_row
         obj$col      <- pos_matched$array_col
         obj$imagerow <- pos_matched$pxl_row
