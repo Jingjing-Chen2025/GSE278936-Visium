@@ -29,8 +29,22 @@ cat("Libraries loaded\n")
 # ------------------------------------------------------------------------------
 # 1. Define Paths — Auto-detect all samples & organize GEO-prefixed files
 # ------------------------------------------------------------------------------
-visium_root <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE278936 Visium"
+resolve_visium_root <- function() {
+  args <- commandArgs(trailingOnly = TRUE)
+  cli_arg <- args[startsWith(args, "--visium-root=")]
+  if (length(cli_arg) > 0) {
+    return(normalizePath(sub("^--visium-root=", "", cli_arg[1]), winslash = "/", mustWork = FALSE))
+  }
 
+  env_root <- Sys.getenv("VISIUM_ROOT", unset = "")
+  if (nzchar(env_root)) {
+    return(normalizePath(env_root, winslash = "/", mustWork = FALSE))
+  }
+
+  normalizePath(file.path(getwd(), "GSE278936 Visium"), winslash = "/", mustWork = FALSE)
+}
+
+visium_root <- resolve_visium_root()
 sample_dirs <- c(
   "GSM8557976_BPH_1",
   "GSM8557977_BPH_2",
