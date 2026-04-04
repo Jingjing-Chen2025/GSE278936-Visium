@@ -773,7 +773,7 @@ tryCatch({
       if (!"dist_to_interface" %in% colnames(obj@meta.data)) return(NULL)
       DefaultAssay(obj) <- "SCT"
       genes_avail <- intersect(all_sig_genes, rownames(obj))
-      expr <- GetAssayData(obj, slot = "data")[genes_avail, , drop = FALSE]
+      expr <- GetAssayData(obj, layer = "data")[genes_avail, , drop = FALSE]
       df <- as.data.frame(t(as.matrix(expr)))
       df$dist <- obj$dist_to_interface
       df
