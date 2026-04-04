@@ -668,7 +668,7 @@ tryCatch({
         cells <- colnames(obj)[obj$dist_bin == "bin_0_interface"]
         if (length(cells) == 0) return(NULL)
         DefaultAssay(obj) <- "SCT"
-        rowMeans(GetAssayData(obj, slot = "data")[common_genes, cells, drop = FALSE])
+        rowMeans(GetAssayData(obj, layer = "data")[common_genes, cells, drop = FALSE])
       })
       vals50 <- lapply(cond_samples, function(sn) {
         obj <- seurat_list[[sn]]
@@ -676,7 +676,7 @@ tryCatch({
         cells <- colnames(obj)[obj$dist_bin == "bin_50plus"]
         if (length(cells) == 0) return(NULL)
         DefaultAssay(obj) <- "SCT"
-        rowMeans(GetAssayData(obj, slot = "data")[common_genes, cells, drop = FALSE])
+        rowMeans(GetAssayData(obj, layer = "data")[common_genes, cells, drop = FALSE])
       })
       vals0  <- do.call(cbind, Filter(Negate(is.null), vals0))
       vals50 <- do.call(cbind, Filter(Negate(is.null), vals50))
