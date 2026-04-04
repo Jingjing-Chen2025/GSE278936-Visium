@@ -609,7 +609,7 @@ tryCatch({
       obj <- seurat_list[[sn]]
       if (!"dist_bin" %in% colnames(obj@meta.data)) next
       DefaultAssay(obj) <- "SCT"
-      expr_mat <- GetAssayData(obj, slot = "data")
+      expr_mat <- GetAssayData(obj, layer = "data")
       for (bn in dist_bin_labels) {
         cells_in_bin <- colnames(obj)[obj$dist_bin == bn]
         if (length(cells_in_bin) == 0) next
