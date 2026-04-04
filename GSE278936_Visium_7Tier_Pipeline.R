@@ -6,24 +6,12 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 0. Check & Load Packages
+# 0. Install & Load Packages
 # ------------------------------------------------------------------------------
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
 pkgs <- c("Seurat", "ggplot2", "patchwork", "dplyr", "Matrix", "scales",
           "RColorBrewer", "grDevices", "png", "jsonlite", "data.table")
-missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
-if (length(missing_pkgs) > 0) {
-  stop(
-    paste0(
-      "Missing required package(s): ",
-      paste(missing_pkgs, collapse = ", "),
-      "\nPlease install them before running this script, for example:\n",
-      "install.packages(c(",
-      paste(sprintf('"%s"', missing_pkgs), collapse = ", "),
-      "))"
-    ),
-    call. = FALSE
-  )
-}
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
 
 library(Seurat)
 library(ggplot2)
@@ -41,19 +29,7 @@ cat("Libraries loaded\n")
 # ------------------------------------------------------------------------------
 # 1. Define Paths — Auto-detect all samples & organize GEO-prefixed files
 # ------------------------------------------------------------------------------
-args <- commandArgs(trailingOnly = TRUE)
-visium_root_arg <- grep("^--visium-root=", args, value = TRUE)
-visium_root_arg <- if (length(visium_root_arg) > 0) sub("^--visium-root=", "", visium_root_arg[1]) else ""
-visium_root_env <- Sys.getenv("VISIUM_ROOT", unset = "")
-visium_root_default <- normalizePath("GSE278936 Visium", mustWork = FALSE)
-visium_root <- if (nzchar(visium_root_arg)) {
-  normalizePath(visium_root_arg, mustWork = FALSE)
-} else if (nzchar(visium_root_env)) {
-  normalizePath(visium_root_env, mustWork = FALSE)
-} else {
-  visium_root_default
-}
-cat("Using visium_root:", visium_root, "\n")
+visium_root <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE278936 Visium"
 
 sample_dirs <- c(
   "GSM8557976_BPH_1",
