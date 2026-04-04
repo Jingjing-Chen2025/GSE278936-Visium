@@ -6,20 +6,12 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 0. Check & Load Packages
+# 0. Install & Load Packages
 # ------------------------------------------------------------------------------
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
 pkgs <- c("Seurat", "ggplot2", "patchwork", "dplyr", "Matrix", "scales",
           "RColorBrewer", "grDevices", "png", "jsonlite", "data.table")
-missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
-if (length(missing_pkgs) > 0) {
-  stop(
-    paste0(
-      "Missing required packages: ",
-      paste(missing_pkgs, collapse = ", "),
-      ". Please install them before running this pipeline."
-    )
-  )
-}
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
 
 library(Seurat)
 library(ggplot2)
@@ -37,22 +29,8 @@ cat("Libraries loaded\n")
 # ------------------------------------------------------------------------------
 # 1. Define Paths — Auto-detect all samples & organize GEO-prefixed files
 # ------------------------------------------------------------------------------
-resolve_visium_root <- function() {
-  args <- commandArgs(trailingOnly = TRUE)
-  cli_arg <- args[startsWith(args, "--visium-root=")]
-  if (length(cli_arg) > 0) {
-    return(normalizePath(sub("^--visium-root=", "", cli_arg[1]), winslash = "/", mustWork = FALSE))
-  }
+visium_root <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE278936 Visium"
 
-  env_root <- Sys.getenv("VISIUM_ROOT", unset = "")
-  if (nzchar(env_root)) {
-    return(normalizePath(env_root, winslash = "/", mustWork = FALSE))
-  }
-
-  normalizePath(file.path(getwd(), "GSE278936 Visium"), winslash = "/", mustWork = FALSE)
-}
-
-visium_root <- resolve_visium_root()
 sample_dirs <- c(
   "GSM8557976_BPH_1",
   "GSM8557977_BPH_2",
@@ -336,6 +314,7 @@ for (sn in names(sample_manifest)) {
         bcs_with_pos <- colnames(obj)[colnames(obj) %in% rownames(pos)]
         obj <- subset(obj, cells = bcs_with_pos)
         pos_matched <- pos[colnames(obj), ]
+        obj$in_tissue <- pos_matched$in_tissue
         obj$row      <- pos_matched$array_row
         obj$col      <- pos_matched$array_col
         obj$imagerow <- pos_matched$pxl_row
@@ -392,8 +371,14 @@ for (sn in names(sample_manifest)) {
     cat("  Running SCTransform...\n")
     obj <- SCTransform(obj, verbose = FALSE)
 
-    # Module scores
-    all_genes <- rownames(obj)
+    # Normalize RNA assay for module scoring (avoids Seurat v5 SCT
+    # multi-layer issue where AddModuleScore matches both "data" and
+    # "scale.data" layers via grep, causing errors on the limited-
+    # feature scale.data layer)
+    obj <- NormalizeData(obj, assay = "RNA", verbose = FALSE)
+
+    # Module scores (scored on RNA assay)
+    all_genes <- rownames(obj[["RNA"]])
 
     aspc_use  <- intersect(ASPC_genes,         all_genes)
     ar_use    <- intersect(Hallmark_AR_genes,  all_genes)
@@ -401,13 +386,13 @@ for (sn in names(sample_manifest)) {
     nepc_dn   <- intersect(NEPC_Beltran_DOWN,  all_genes)
 
     if (length(aspc_use)  > 0)
-      obj <- AddModuleScore(obj, features = list(aspc_use),  name = "ASPC_score",    ctrl = min(100, length(aspc_use)))
+      obj <- AddModuleScore(obj, features = list(aspc_use),  name = "ASPC_score",    ctrl = 5, assay = "RNA")
     if (length(ar_use)    > 0)
-      obj <- AddModuleScore(obj, features = list(ar_use),    name = "AR_score",      ctrl = min(100, length(ar_use)))
+      obj <- AddModuleScore(obj, features = list(ar_use),    name = "AR_score",      ctrl = 5, assay = "RNA")
     if (length(nepc_up)   > 0)
-      obj <- AddModuleScore(obj, features = list(nepc_up),   name = "NEPC_UP_score", ctrl = min(100, length(nepc_up)))
+      obj <- AddModuleScore(obj, features = list(nepc_up),   name = "NEPC_UP_score", ctrl = 5, assay = "RNA")
     if (length(nepc_dn)   > 0)
-      obj <- AddModuleScore(obj, features = list(nepc_dn),   name = "NEPC_DOWN_score", ctrl = min(100, length(nepc_dn)))
+      obj <- AddModuleScore(obj, features = list(nepc_dn),   name = "NEPC_DOWN_score", ctrl = 5, assay = "RNA")
 
     # Rename AddModuleScore appended "1"
     for (sc_col in c("ASPC_score1","AR_score1","NEPC_UP_score1","NEPC_DOWN_score1")) {
@@ -668,7 +653,7 @@ tryCatch({
         cells <- colnames(obj)[obj$dist_bin == "bin_0_interface"]
         if (length(cells) == 0) return(NULL)
         DefaultAssay(obj) <- "SCT"
-        rowMeans(GetAssayData(obj, layer = "data")[common_genes, cells, drop = FALSE])
+        rowMeans(GetAssayData(obj, slot = "data")[common_genes, cells, drop = FALSE])
       })
       vals50 <- lapply(cond_samples, function(sn) {
         obj <- seurat_list[[sn]]
@@ -676,7 +661,7 @@ tryCatch({
         cells <- colnames(obj)[obj$dist_bin == "bin_50plus"]
         if (length(cells) == 0) return(NULL)
         DefaultAssay(obj) <- "SCT"
-        rowMeans(GetAssayData(obj, layer = "data")[common_genes, cells, drop = FALSE])
+        rowMeans(GetAssayData(obj, slot = "data")[common_genes, cells, drop = FALSE])
       })
       vals0  <- do.call(cbind, Filter(Negate(is.null), vals0))
       vals50 <- do.call(cbind, Filter(Negate(is.null), vals50))
@@ -773,7 +758,7 @@ tryCatch({
       if (!"dist_to_interface" %in% colnames(obj@meta.data)) return(NULL)
       DefaultAssay(obj) <- "SCT"
       genes_avail <- intersect(all_sig_genes, rownames(obj))
-      expr <- GetAssayData(obj, layer = "data")[genes_avail, , drop = FALSE]
+      expr <- GetAssayData(obj, slot = "data")[genes_avail, , drop = FALSE]
       df <- as.data.frame(t(as.matrix(expr)))
       df$dist <- obj$dist_to_interface
       df
@@ -969,7 +954,7 @@ tryCatch({
 
     DefaultAssay(obj) <- "SCT"
     all_genes_obj <- rownames(obj)
-    expr_mat <- GetAssayData(obj, layer = "data")
+    expr_mat <- GetAssayData(obj, slot = "data")
 
     iface_cells <- colnames(obj)[md$interface_zone == "Interface"]
     if (length(iface_cells) < 3) next
@@ -1283,7 +1268,7 @@ tryCatch({
     iface_cells <- colnames(obj)[obj$interface_zone == "Interface"]
     if (length(iface_cells) < 3) next
     DefaultAssay(obj) <- "SCT"
-    all_iface_expr_list[[sn]] <- GetAssayData(obj, layer = "data")[, iface_cells, drop = FALSE]
+    all_iface_expr_list[[sn]] <- GetAssayData(obj, slot = "data")[, iface_cells, drop = FALSE]
   }
 
   if (length(all_iface_expr_list) == 0) {
@@ -1476,7 +1461,7 @@ tryCatch({
       iface_cells  <- colnames(obj)[obj$interface_zone == "Interface"]
       other_cells  <- colnames(obj)[obj$interface_zone != "Interface"]
       if (length(iface_cells) < 3 || length(other_cells) < 3) return(character(0))
-      expr_mat <- GetAssayData(obj, layer = "data")
+      expr_mat <- GetAssayData(obj, slot = "data")
       mean_iface <- rowMeans(expr_mat[, iface_cells, drop = FALSE], na.rm = TRUE)
       mean_other <- rowMeans(expr_mat[, other_cells, drop = FALSE], na.rm = TRUE)
       fc <- mean_iface - mean_other
