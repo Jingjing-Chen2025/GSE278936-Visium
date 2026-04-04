@@ -969,7 +969,7 @@ tryCatch({
 
     DefaultAssay(obj) <- "SCT"
     all_genes_obj <- rownames(obj)
-    expr_mat <- GetAssayData(obj, slot = "data")
+    expr_mat <- GetAssayData(obj, layer = "data")
 
     iface_cells <- colnames(obj)[md$interface_zone == "Interface"]
     if (length(iface_cells) < 3) next
