@@ -1283,7 +1283,7 @@ tryCatch({
     iface_cells <- colnames(obj)[obj$interface_zone == "Interface"]
     if (length(iface_cells) < 3) next
     DefaultAssay(obj) <- "SCT"
-    all_iface_expr_list[[sn]] <- GetAssayData(obj, slot = "data")[, iface_cells, drop = FALSE]
+    all_iface_expr_list[[sn]] <- GetAssayData(obj, layer = "data")[, iface_cells, drop = FALSE]
   }
 
   if (length(all_iface_expr_list) == 0) {
