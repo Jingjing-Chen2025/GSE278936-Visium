@@ -6,12 +6,20 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# 0. Install & Load Packages
+# 0. Check & Load Packages
 # ------------------------------------------------------------------------------
-if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
 pkgs <- c("Seurat", "ggplot2", "patchwork", "dplyr", "Matrix", "scales",
           "RColorBrewer", "grDevices", "png", "jsonlite", "data.table")
-for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+missing_pkgs <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  stop(
+    paste0(
+      "Missing required packages: ",
+      paste(missing_pkgs, collapse = ", "),
+      ". Please install them before running this pipeline."
+    )
+  )
+}
 
 library(Seurat)
 library(ggplot2)
