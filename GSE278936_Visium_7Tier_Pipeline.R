@@ -371,8 +371,14 @@ for (sn in names(sample_manifest)) {
     cat("  Running SCTransform...\n")
     obj <- SCTransform(obj, verbose = FALSE)
 
-    # Module scores
-    all_genes <- rownames(obj)
+    # Normalize RNA assay for module scoring (avoids Seurat v5 SCT
+    # multi-layer issue where AddModuleScore matches both "data" and
+    # "scale.data" layers via grep, causing errors on the limited-
+    # feature scale.data layer)
+    obj <- NormalizeData(obj, assay = "RNA", verbose = FALSE)
+
+    # Module scores (scored on RNA assay)
+    all_genes <- rownames(obj[["RNA"]])
 
     aspc_use  <- intersect(ASPC_genes,         all_genes)
     ar_use    <- intersect(Hallmark_AR_genes,  all_genes)
@@ -380,13 +386,13 @@ for (sn in names(sample_manifest)) {
     nepc_dn   <- intersect(NEPC_Beltran_DOWN,  all_genes)
 
     if (length(aspc_use)  > 0)
-      obj <- AddModuleScore(obj, features = list(aspc_use),  name = "ASPC_score",    ctrl = min(100, length(aspc_use)))
+      obj <- AddModuleScore(obj, features = list(aspc_use),  name = "ASPC_score",    ctrl = 5, assay = "RNA")
     if (length(ar_use)    > 0)
-      obj <- AddModuleScore(obj, features = list(ar_use),    name = "AR_score",      ctrl = min(100, length(ar_use)))
+      obj <- AddModuleScore(obj, features = list(ar_use),    name = "AR_score",      ctrl = 5, assay = "RNA")
     if (length(nepc_up)   > 0)
-      obj <- AddModuleScore(obj, features = list(nepc_up),   name = "NEPC_UP_score", ctrl = min(100, length(nepc_up)))
+      obj <- AddModuleScore(obj, features = list(nepc_up),   name = "NEPC_UP_score", ctrl = 5, assay = "RNA")
     if (length(nepc_dn)   > 0)
-      obj <- AddModuleScore(obj, features = list(nepc_dn),   name = "NEPC_DOWN_score", ctrl = min(100, length(nepc_dn)))
+      obj <- AddModuleScore(obj, features = list(nepc_dn),   name = "NEPC_DOWN_score", ctrl = 5, assay = "RNA")
 
     # Rename AddModuleScore appended "1"
     for (sc_col in c("ASPC_score1","AR_score1","NEPC_UP_score1","NEPC_DOWN_score1")) {
