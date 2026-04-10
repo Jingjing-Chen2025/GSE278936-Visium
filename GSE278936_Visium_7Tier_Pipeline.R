@@ -543,27 +543,94 @@ for (sn in names(sample_manifest)) {
 cat(paste0("\nSuccessfully loaded ", length(successfully_loaded), " samples.\n"))
 
 # ==============================================================================
-# SECTION 3: TIER 1 — Spatial Annotation (Interface Zone Classification)
-# Saves each sample as individual RDS + defines helpers for downstream tiers
+# SECTION 3: TIER 1 — PARACRINE GRADIENT MODEL (5-Zone Spatial Annotation)
 # ==============================================================================
-cat("\n=== TIER 1: Spatial Annotation ===\n")
+#
+# BIOLOGICAL MODEL — ESR1-Driven ASPC Paracrine Niche:
+#
+#   ASPCs (adipose stem/progenitor cells) are ESR1+ cells whose estrogen
+#   receptor drives transcription of neurotrophic ligands TNFSF12 (TWEAK)
+#   and MDK. These ligands diffuse into the tumor, creating a spatial
+#   gradient that induces NE transdifferentiation in epithelial cancer cells.
+#
+#   The NE conversion at the interface triggers GLOBAL silencing of the
+#   luminal/hormone-responsive program (AR, FOXA1, estrogen response)
+#   via EZH2-mediated H3K27me3. This is TRUE TRANSDIFFERENTIATION —
+#   not partial phenotype acquisition.
+#
+# 5 ZONES (ordered by distance from ASPC stroma):
+#
+#   ASPC Stroma (ESR1+ niche, source of TNFSF12/MDK)
+#        │
+#        ▼ neurotrophic signals diffuse inward
+#   ┌─────────────────────────────────────────────────────────────┐
+#   │ Zone 1: INTERFACE (dist = 0)                                │
+#   │    Epithelial cells receiving PEAK paracrine signal          │
+#   │    from ASPCs. TRANSITORY cells initiating NE diff.         │
+#   │    - Highest ASPC_score (direct contact)                    │
+#   │    - Rising NEPC_UP: NE program activating                  │
+#   │    - EZH2 ↑ → AR/FOXA1/ER silencing begins                │
+#   │    - Co-expression of epithelial + early NE markers         │
+#   ├─────────────────────────────────────────────────────────────┤
+#   │ Zone 2: PROXIMAL NE (immediately adjacent to interface)     │
+#   │    Emergent NE cells that have committed to NE fate          │
+#   │    - Highest NEPC_UP among non-interface spots              │
+#   │    - Strong NE markers: ASCL1, INSM1, DLL3, SYP            │
+#   │    - AR/FOXA1 already silenced                              │
+#   │    - Still within effective paracrine signal range           │
+#   ├─────────────────────────────────────────────────────────────┤
+#   │ Zone 3: DISTAL NE (farther from interface, NE decaying)     │
+#   │    NE cells where paracrine signal has attenuated            │
+#   │    - NE score DECREASED vs Proximal NE (decay gradient)     │
+#   │    - Weaker NE commitment, stress accumulating              │
+#   │    - Transitional state between viable NE and dying cells   │
+#   │    - Cell death pathways beginning to activate              │
+#   ├─────────────────────────────────────────────────────────────┤
+#   │ Zone 4: NECROTIC CORE (farthest from interface)             │
+#   │    Dead zone / NECROTIC VALLEY                               │
+#   │    - Beyond paracrine signal reach                           │
+#   │    - Ghost mRNA from dead cells                              │
+#   │    - All 7 cell death modalities peak here                   │
+#   │    - Retains luminal/ER ghost mRNA (never underwent          │
+#   │      NE conversion → program never silenced)                │
+#   │    - Tumor cells died from hypoxia, NOT lineage switch      │
+#   ├─────────────────────────────────────────────────────────────┤
+#   │ Zone 5: EPITHELIAL (AR-dominant cancer cells)               │
+#   │    Luminal adenocarcinoma cells far from ASPC niche          │
+#   │    - AR-dominant: full androgen response program active      │
+#   │    - FOXA1+, NKX3-1+, KLK3+ (luminal identity intact)     │
+#   │    - Estrogen response genes at baseline levels              │
+#   │    - Never received ASPC paracrine signal                    │
+#   │    - Represents the "untransformed" baseline                 │
+#   └─────────────────────────────────────────────────────────────┘
+#
+# ZONE ASSIGNMENT STRATEGY:
+#   1. Interface        = dist == 0 (ASPC boundary spots)
+#   2. Proximal NE      = 0 < dist ≤ Q15 AND NEPC_UP > median
+#   3. Distal NE        = Q15 < dist ≤ Q35 AND NEPC_UP > condition_Q25
+#   4. Necrotic Core    = dist > Q70 (farthest from interface)
+#   5. Epithelial       = remaining spots (middle distances, low NE)
+#
+# OUTPUT METADATA COLUMNS:
+#   zone_5class:        "Interface" | "Proximal_NE" | "Distal_NE" |
+#                       "Necrotic_Core" | "Epithelial"
+#   dist_to_interface:  Euclidean distance to nearest Interface spot
+#   interface_zone:     Backward-compatible label for Tiers 3-7
+# ==============================================================================
+
+cat("\n=== TIER 1: Paracrine Gradient Model — 5-Zone Spatial Annotation ===\n")
 tier1_status <- "SKIPPED"
 
 tryCatch({
   tier1_dir <- file.path(visium_root, "TIER1_Interface")
   dir.create(tier1_dir, showWarnings = FALSE, recursive = TRUE)
 
-  # ================================================================
-  # Create RDS directory for per-sample objects (memory-efficient)
-  # ================================================================
   rds_dir <- file.path(visium_root, "sample_rds")
   dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
 
   # ================================================================
-  # Define helper functions used by Tier 1-7
+  # Helper functions
   # ================================================================
-
-  # Load a single sample from RDS
   load_sample <- function(sample_name) {
     rds_path <- file.path(rds_dir, paste0(sample_name, ".rds"))
     if (!file.exists(rds_path)) return(NULL)
@@ -574,22 +641,17 @@ tryCatch({
     })
   }
 
-  # Safe GetAssayData — handles Seurat v5 (layers) and v4 (slots)
   safe_GetAssayData <- function(obj, layer = "data") {
     tryCatch({
-      # Try SCT first, fall back to RNA
       for (assay_name in c("SCT", "RNA")) {
         if (assay_name %in% Assays(obj)) {
           DefaultAssay(obj) <- assay_name
           mat <- tryCatch(
             GetAssayData(obj, layer = layer),
             error = function(e) {
-              tryCatch(
-                GetAssayData(obj, slot = layer),
-                error = function(e2) NULL
-              )
-            }
-          )
+              tryCatch(GetAssayData(obj, slot = layer),
+                       error = function(e2) NULL)
+            })
           if (!is.null(mat) && ncol(mat) > 0 && nrow(mat) > 0)
             return(mat)
         }
@@ -598,351 +660,1019 @@ tryCatch({
     }, error = function(e) NULL)
   }
 
+  `%||%` <- function(x, y) if (!is.null(x)) x else y
+
   # ================================================================
-  # Process each sample: score, classify zones, save RDS
+  # Phase 1: Score validation & Interface identification
   # ================================================================
+  cat("  Phase 1: Validating scores & identifying Interface spots...\n")
+
   zone_prop_list <- list()
   successfully_loaded <- character(0)
 
-  for (sn in names(seurat_list)) {
+  # Determine input source
+  if (exists("seurat_list") && length(seurat_list) > 0) {
+    input_samples <- names(seurat_list)
+    use_seurat_list <- TRUE
+    cat(paste0("    Input: seurat_list (", length(input_samples),
+               " samples)\n"))
+  } else {
+    rds_files <- list.files(rds_dir, pattern = "\\.rds$",
+                            full.names = FALSE)
+    input_samples <- sub("\\.rds$", "", rds_files)
+    use_seurat_list <- FALSE
+    cat(paste0("    Input: RDS files (", length(input_samples),
+               " samples)\n"))
+  }
+
+  if (length(input_samples) == 0) stop("No samples available")
+
+  for (sn in input_samples) {
     cat(paste0("  TIER1 — ", sn, "\n"))
 
     tryCatch({
-      obj <- seurat_list[[sn]]
-      md  <- obj@meta.data
-
-      # --- Verify score columns exist ---
-      score_cols <- c("ASPC_score", "AR_score", "NEPC_UP_score")
-      missing_sc <- setdiff(score_cols, colnames(md))
-      if (length(missing_sc) > 0) {
-        cat(paste0("    Missing: ",
-                   paste(missing_sc, collapse = ", "), " — skipping\n"))
+      if (use_seurat_list) {
+        obj <- seurat_list[[sn]]
+      } else {
+        obj <- load_sample(sn)
+      }
+      if (is.null(obj)) {
+        cat(paste0("    ", sn, ": load failed — skipping\n"))
         next
       }
 
-      # --- Compute medians for thresholding ---
+      md <- obj@meta.data
+
+      if (!all(c("row", "col") %in% colnames(md))) {
+        cat(paste0("    ", sn, ": missing row/col — skipping\n"))
+        if (!use_seurat_list) rm(obj)
+        next
+      }
+
+      # Verify score columns
+      score_cols <- c("ASPC_score", "AR_score", "NEPC_UP_score")
+      missing_sc <- setdiff(score_cols, colnames(md))
+      if (length(missing_sc) > 0) {
+        cat(paste0("    ", sn, ": missing ",
+                   paste(missing_sc, collapse = ", "),
+                   " — skipping\n"))
+        if (!use_seurat_list) rm(obj)
+        next
+      }
+
+      # --- Step 1A: Identify Interface spots ---
+      # Interface = high ASPC (paracrine source) AND responsive cells
       med_aspc <- median(md$ASPC_score,    na.rm = TRUE)
       med_ar   <- median(md$AR_score,      na.rm = TRUE)
       med_nepc <- median(md$NEPC_UP_score, na.rm = TRUE)
 
-      # --- Classify interface zones ---
-      # Interface: high ASPC AND (high NEPC OR high AR)
       is_interface <- (md$ASPC_score > med_aspc) &
         (md$NEPC_UP_score > med_nepc | md$AR_score > med_ar)
-      is_aspc_high <- (md$ASPC_score > med_aspc) & !is_interface
-      is_ar_high   <- (md$AR_score > med_ar) &
-        !is_interface & !is_aspc_high
-      is_nepc_high <- (md$NEPC_UP_score > med_nepc) &
-        !is_interface & !is_aspc_high & !is_ar_high
 
-      zone <- rep("Other", nrow(md))
-      zone[is_nepc_high] <- "NEPC_high"
-      zone[is_ar_high]   <- "AR_high"
-      zone[is_aspc_high] <- "ASPC_high"
-      zone[is_interface] <- "Interface"
-
-      obj$interface_zone <- zone
-
-      # --- Zone proportions ---
-      tbl <- table(zone)
-      zp <- as.data.frame(tbl, stringsAsFactors = FALSE)
-      colnames(zp) <- c("zone", "count")
-      zp$sample    <- sn
-      zp$condition <- extract_condition(sn)
-      zone_prop_list[[sn]] <- zp
-
-      cat(paste0("    Zones: ",
-                 paste(paste0(names(tbl), "=", tbl), collapse = ", "),
-                 "\n"))
-
-      # --- Spatial zone plot ---
-      if (all(c("col", "row") %in% colnames(md))) {
-        tryCatch({
-          plot_df <- data.frame(
-            x    = md$col,
-            y    = -md$row,
-            zone = zone,
-            stringsAsFactors = FALSE
-          )
-          spot_sz <- compute_spot_size(plot_df[, c("x", "y")])
-          zone_colors <- c(
-            Interface = "#E31A1C",
-            ASPC_high = "#1F78B4",
-            AR_high   = "#33A02C",
-            NEPC_high = "#FF7F00",
-            Other     = "#CCCCCC"
-          )
-          p <- ggplot(plot_df, aes(x = x, y = y, color = zone)) +
-            geom_point(size = spot_sz) +
-            scale_color_manual(values = zone_colors) +
-            labs(title = paste0(sn, " — Interface Zones"),
-                 x = "Array Col", y = "Array Row (inv)",
-                 color = "Zone") +
-            theme_minimal(base_size = 10) +
-            coord_fixed()
-          ggsave(file.path(tier1_dir,
-                           paste0(sn, "_interface_zones.pdf")),
-                 plot = p, width = 10, height = 8)
-        }, error = function(e) {
-          cat(paste0("    Plot error: ",
-                     conditionMessage(e), "\n"))
-        })
+      n_iface <- sum(is_interface)
+      if (n_iface == 0) {
+        cat(paste0("    ", sn, ": no Interface — skipping\n"))
+        if (!use_seurat_list) rm(obj)
+        next
       }
 
-      # --- Score distribution plots per sample ---
-      tryCatch({
-        score_df <- data.frame(
-          ASPC    = md$ASPC_score,
-          AR      = md$AR_score,
-          NEPC_UP = md$NEPC_UP_score,
-          zone    = zone,
-          stringsAsFactors = FALSE
-        )
-        p_scores <- ggplot(
-          tidyr::pivot_longer(score_df, cols = c("ASPC","AR","NEPC_UP"),
-                              names_to = "score_type",
-                              values_to = "value"),
-          aes(x = zone, y = value, fill = zone)) +
-          geom_boxplot(outlier.size = 0.5) +
-          facet_wrap(~score_type, scales = "free_y") +
-          scale_fill_manual(values = c(
-            Interface = "#E31A1C", ASPC_high = "#1F78B4",
-            AR_high = "#33A02C", NEPC_high = "#FF7F00",
-            Other = "#CCCCCC")) +
-          labs(title = paste0(sn, " — Score Distributions by Zone"),
-               x = "Zone", y = "Score") +
-          theme_minimal(base_size = 9) +
-          theme(axis.text.x = element_text(angle = 45, hjust = 1))
-        ggsave(file.path(tier1_dir,
-                         paste0(sn, "_score_distributions.pdf")),
-               plot = p_scores, width = 12, height = 5)
-      }, error = function(e) NULL)
+      cat(paste0("    ", sn, ": ", n_iface, " Interface / ",
+                 ncol(obj), " total\n"))
 
-      # --- Save individual RDS ---
+      # --- Step 1B: Compute distance to interface ---
+      coords <- as.matrix(md[, c("row", "col")])
+      iface_idx <- which(is_interface)
+      ic <- coords[iface_idx, , drop = FALSE]
+      ns <- nrow(coords)
+      dti <- numeric(ns)
+
+      for (ci in seq(1, ns, by = 1000)) {
+        ce <- min(ci + 999, ns)
+        ch <- coords[ci:ce, , drop = FALSE]
+        if (nrow(ic) <= 5000) {
+          rd <- outer(ch[, 1], ic[, 1], "-")
+          cd <- outer(ch[, 2], ic[, 2], "-")
+          dti[ci:ce] <- apply(sqrt(rd^2 + cd^2), 1, min)
+          rm(rd, cd)
+        } else {
+          for (j in seq_len(nrow(ch))) {
+            dd <- sweep(ic, 2, ch[j, ])
+            dti[ci + j - 1] <- min(sqrt(rowSums(dd^2)))
+          }
+        }
+      }
+      dti[iface_idx] <- 0
+      obj$dist_to_interface <- dti
+
+      cat(paste0("    ", sn, ": distances computed [0, ",
+                 round(max(dti), 2), "]\n"))
+
+      rm(coords, ic); invisible(gc())
+
       saveRDS(obj, file.path(rds_dir, paste0(sn, ".rds")))
       successfully_loaded <- c(successfully_loaded, sn)
 
-      # Update in seurat_list too
-      seurat_list[[sn]] <- obj
+      if (use_seurat_list) seurat_list[[sn]] <- obj
+      rm(obj); invisible(gc())
 
     }, error = function(e) {
-      cat(paste0("    ERROR processing ", sn, ": ",
+      cat(paste0("    ERROR: ", sn, ": ",
                  conditionMessage(e), "\n"))
     })
   }
 
-  cat(paste0("\n  Samples processed: ",
-             length(successfully_loaded), "/",
-             length(names(seurat_list)), "\n"))
+  cat(paste0("\n  Phase 1 complete: ", length(successfully_loaded),
+             " samples\n"))
+  if (length(successfully_loaded) == 0)
+    stop("No valid samples after Phase 1")
 
   # ================================================================
-  # Aggregate zone proportions across all samples
+  # Phase 2: Condition-specific zone boundary computation
   # ================================================================
+  cat("\n  Phase 2: Computing condition-specific zone boundaries...\n")
+
+  # Collect per-condition: distances + NEPC_UP scores
+  cond_dist_data <- list()   # condition -> list(dist, nepc_up)
+
+  for (sn in successfully_loaded) {
+    obj <- load_sample(sn)
+    if (is.null(obj) ||
+        !"dist_to_interface" %in% colnames(obj@meta.data) ||
+        !"NEPC_UP_score" %in% colnames(obj@meta.data)) {
+      if (!is.null(obj)) rm(obj); invisible(gc())
+      next
+    }
+    cn <- extract_condition(sn)
+    d  <- obj$dist_to_interface
+    ne <- obj@meta.data$NEPC_UP_score
+    ni <- which(d > 0)  # non-interface
+
+    if (is.null(cond_dist_data[[cn]]))
+      cond_dist_data[[cn]] <- list(dist = numeric(0),
+                                    nepc = numeric(0))
+    cond_dist_data[[cn]]$dist <- c(cond_dist_data[[cn]]$dist, d[ni])
+    cond_dist_data[[cn]]$nepc <- c(cond_dist_data[[cn]]$nepc, ne[ni])
+
+    rm(obj); invisible(gc())
+  }
+
+  # Compute zone boundaries per condition
+  # 5 Zones:
+  #   Interface:     dist == 0
+  #   Proximal NE:   0 < dist ≤ Q15 AND NEPC_UP > cond_median
+  #   Distal NE:     Q15 < dist ≤ Q35 AND NEPC_UP > cond_Q25
+  #   Necrotic Core: dist > Q70
+  #   Epithelial:    everything else (middle dist, low NE score)
+  cond_zone_breaks <- list()
+
+  for (cn in names(cond_dist_data)) {
+    dd <- cond_dist_data[[cn]]
+    d_ni <- dd$dist
+    ne_ni <- dd$nepc
+
+    if (length(d_ni) < 20) {
+      cat(paste0("    ", cn, ": too few non-interface spots — fallback\n"))
+      cond_zone_breaks[[cn]] <- NULL
+      next
+    }
+
+    q15 <- quantile(d_ni, 0.15, na.rm = TRUE)
+    q35 <- quantile(d_ni, 0.35, na.rm = TRUE)
+    q70 <- quantile(d_ni, 0.70, na.rm = TRUE)
+
+    # NEPC score thresholds for NE zone qualification
+    nepc_median <- median(ne_ni, na.rm = TRUE)
+    nepc_q25    <- quantile(ne_ni, 0.25, na.rm = TRUE)
+
+    # Ensure minimum separation
+    d_range <- max(d_ni, na.rm = TRUE) - min(d_ni, na.rm = TRUE)
+    if ((q35 - q15) < d_range * 0.03) {
+      q15 <- quantile(d_ni, 0.12, na.rm = TRUE)
+      q35 <- quantile(d_ni, 0.38, na.rm = TRUE)
+    }
+    if ((q70 - q35) < d_range * 0.05) {
+      q70 <- quantile(d_ni, 0.75, na.rm = TRUE)
+    }
+
+    cond_zone_breaks[[cn]] <- list(
+      proximal_max  = q15,      # Proximal NE: 0 < d ≤ Q15
+      distal_ne_max = q35,      # Distal NE:   Q15 < d ≤ Q35
+      necrotic_min  = q70,      # Necrotic:    d > Q70
+      nepc_prox_th  = nepc_median,  # NEPC threshold for Proximal NE
+      nepc_dist_th  = nepc_q25      # NEPC threshold for Distal NE
+    )
+
+    cat(paste0("    ", cn, ":\n",
+               "      Interface         = dist == 0\n",
+               "      Proximal NE       = 0 < d ≤ ", round(q15, 2),
+               " & NEPC_UP > ", round(nepc_median, 3), "\n",
+               "      Distal NE         = ", round(q15, 2),
+               " < d ≤ ", round(q35, 2),
+               " & NEPC_UP > ", round(nepc_q25, 3), "\n",
+               "      Necrotic Core     = d > ", round(q70, 2), "\n",
+               "      Epithelial        = remainder (AR-dominant)\n",
+               "      Non-iface spots: ", length(d_ni), "\n"))
+  }
+
+  rm(cond_dist_data); invisible(gc())
+
+  # ================================================================
+  # Phase 3: Assign 5-zone labels to each sample
+  # ================================================================
+  cat("\n  Phase 3: Assigning 5-zone Paracrine Gradient labels...\n")
+
+  for (sn in successfully_loaded) {
+    obj <- load_sample(sn)
+    if (is.null(obj) ||
+        !"dist_to_interface" %in% colnames(obj@meta.data)) {
+      if (!is.null(obj)) rm(obj); invisible(gc())
+      next
+    }
+
+    cn <- extract_condition(sn)
+    zb <- cond_zone_breaks[[cn]]
+    d  <- obj$dist_to_interface
+    md <- obj@meta.data
+    ne <- md$NEPC_UP_score
+
+    zone5 <- rep(NA_character_, length(d))
+
+    # Zone 1: Interface
+    zone5[d == 0] <- "Interface"
+
+    if (!is.null(zb)) {
+      ni <- which(d > 0)
+      if (length(ni) > 0) {
+        d_ni  <- d[ni]
+        ne_ni <- ne[ni]
+
+        # Zone 2: Proximal NE — closest non-interface + high NEPC
+        prox_candidates <- ni[d_ni <= zb$proximal_max]
+        if (length(prox_candidates) > 0) {
+          prox_ne_high <- prox_candidates[
+            ne[prox_candidates] > zb$nepc_prox_th]
+          prox_ne_low  <- setdiff(prox_candidates, prox_ne_high)
+          zone5[prox_ne_high] <- "Proximal_NE"
+          zone5[prox_ne_low]  <- "Epithelial"  # close but not NE
+        }
+
+        # Zone 3: Distal NE — next distance band + moderate NEPC
+        distal_candidates <- ni[d_ni > zb$proximal_max &
+                                  d_ni <= zb$distal_ne_max]
+        if (length(distal_candidates) > 0) {
+          distal_ne_high <- distal_candidates[
+            ne[distal_candidates] > zb$nepc_dist_th]
+          distal_ne_low  <- setdiff(distal_candidates, distal_ne_high)
+          zone5[distal_ne_high] <- "Distal_NE"
+          zone5[distal_ne_low]  <- "Epithelial"
+        }
+
+        # Zone 4: Necrotic Core — farthest
+        necrotic_idx <- ni[d_ni > zb$necrotic_min]
+        zone5[necrotic_idx] <- "Necrotic_Core"
+
+        # Zone 5: Epithelial — everything still NA
+        remaining <- ni[is.na(zone5[ni])]
+        zone5[remaining] <- "Epithelial"
+      }
+    } else {
+      # Fallback: no zone breaks available
+      zone5[d > 0] <- "Epithelial"
+    }
+
+    obj$zone_5class <- zone5
+
+    # --- Backward-compatible interface_zone for Tiers 3-7 ---
+    legacy_zone <- rep("Other", nrow(md))
+    legacy_zone[zone5 == "Interface"]    <- "Interface"
+    legacy_zone[zone5 == "Proximal_NE"]  <- "NEPC_high"
+    legacy_zone[zone5 == "Distal_NE"]    <- "NEPC_high"
+    legacy_zone[zone5 == "Necrotic_Core"] <- "Other"
+
+    # Epithelial: subdivide by AR score
+    epi_idx <- which(zone5 == "Epithelial")
+    if (length(epi_idx) > 0 && "AR_score" %in% colnames(md)) {
+      ar_med <- median(md$AR_score, na.rm = TRUE)
+      epi_ar_high <- epi_idx[md$AR_score[epi_idx] > ar_med]
+      epi_ar_low  <- setdiff(epi_idx, epi_ar_high)
+      legacy_zone[epi_ar_high] <- "AR_high"
+      legacy_zone[epi_ar_low]  <- "Other"
+
+      # Among close Epithelial spots, check for ASPC signal
+      if ("ASPC_score" %in% colnames(md)) {
+        aspc_med <- median(md$ASPC_score, na.rm = TRUE)
+        epi_aspc_high <- epi_idx[md$ASPC_score[epi_idx] > aspc_med]
+        legacy_zone[epi_aspc_high] <- "ASPC_high"
+      }
+    }
+
+    obj$interface_zone <- legacy_zone
+
+    # --- Zone proportions ---
+    zt5 <- table(zone5)
+    zp <- data.frame(
+      zone      = names(zt5),
+      count     = as.integer(zt5),
+      sample    = sn,
+      condition = extract_condition(sn),
+      stringsAsFactors = FALSE
+    )
+    zone_prop_list[[sn]] <- zp
+
+    cat(paste0("    ", sn, ": ",
+               paste(paste0(names(zt5), "=", zt5), collapse = " | "),
+               "\n"))
+
+    # --- NE decay validation: Proximal vs Distal NE score ---
+    prox_idx <- which(zone5 == "Proximal_NE")
+    dist_idx <- which(zone5 == "Distal_NE")
+    if (length(prox_idx) >= 5 && length(dist_idx) >= 5) {
+      ne_prox <- median(ne[prox_idx], na.rm = TRUE)
+      ne_dist <- median(ne[dist_idx], na.rm = TRUE)
+      decay_confirmed <- ne_prox > ne_dist
+      cat(paste0("      NE decay: Proximal=", round(ne_prox, 4),
+                 " Distal=", round(ne_dist, 4),
+                 ifelse(decay_confirmed,
+                        " ✓ CONFIRMED (Proximal > Distal)",
+                        " ✗ not confirmed"),
+                 "\n"))
+    }
+
+    # --- AR dominance in Epithelial zone ---
+    epi_idx2 <- which(zone5 == "Epithelial")
+    iface_idx2 <- which(zone5 == "Interface")
+    if (length(epi_idx2) >= 5 && length(iface_idx2) >= 5 &&
+        "AR_score" %in% colnames(md)) {
+      ar_epi   <- median(md$AR_score[epi_idx2], na.rm = TRUE)
+      ar_iface <- median(md$AR_score[iface_idx2], na.rm = TRUE)
+      cat(paste0("      AR: Epithelial=", round(ar_epi, 4),
+                 " Interface=", round(ar_iface, 4),
+                 ifelse(ar_epi > ar_iface,
+                        " ✓ AR-dominant in Epithelial",
+                        ""),
+                 "\n"))
+    }
+
+    saveRDS(obj, file.path(rds_dir, paste0(sn, ".rds")))
+    if (exists("seurat_list") && sn %in% names(seurat_list))
+      seurat_list[[sn]] <- obj
+
+    rm(obj); invisible(gc())
+  }
+
+  # ================================================================
+  # Phase 4: Per-sample spatial plots
+  # ================================================================
+  cat("\n  Phase 4: Generating per-sample spatial plots...\n")
+
+  zone5_colors <- c(
+    Interface     = "#E31A1C",   # Red — transitory, peak signal
+    Proximal_NE   = "#FF7F00",   # Orange — emergent NE, committed
+    Distal_NE     = "#FDBF6F",   # Light orange — NE decaying
+    Necrotic_Core = "#6A3D9A",   # Purple — dead zone
+    Epithelial    = "#33A02C"    # Green — AR-dominant
+  )
+
+  zone5_levels <- c("Interface", "Proximal_NE", "Distal_NE",
+                     "Necrotic_Core", "Epithelial")
+
+  for (sn in successfully_loaded) {
+    obj <- load_sample(sn)
+    if (is.null(obj) ||
+        !"zone_5class" %in% colnames(obj@meta.data)) {
+      if (!is.null(obj)) rm(obj); invisible(gc())
+      next
+    }
+    md <- obj@meta.data
+    if (!all(c("col", "row") %in% colnames(md))) {
+      rm(obj); invisible(gc()); next
+    }
+
+    tryCatch({
+      plot_df <- data.frame(
+        x = md$col, y = -md$row,
+        zone = factor(md$zone_5class, levels = zone5_levels),
+        stringsAsFactors = FALSE
+      )
+      spot_sz <- if (exists("compute_spot_size", mode = "function"))
+        compute_spot_size(plot_df[, c("x", "y")]) else 0.8
+
+      # 5-Zone spatial map
+      p_zone5 <- ggplot(plot_df, aes(x = x, y = y, color = zone)) +
+        geom_point(size = spot_sz) +
+        scale_color_manual(values = zone5_colors, drop = FALSE) +
+        labs(title = paste0(sn, " — 5-Zone Paracrine Gradient"),
+             subtitle = paste0(
+               "Interface (red) → Proximal NE (orange) → ",
+               "Distal NE (light) → Epithelial (green) → ",
+               "Necrotic (purple)"),
+             x = "Array Col", y = "Array Row (inv)",
+             color = "Zone") +
+        theme_minimal(base_size = 10) +
+        coord_fixed()
+      ggsave(file.path(tier1_dir,
+                       paste0(sn, "_paracrine_5zone_map.pdf")),
+             plot = p_zone5, width = 10, height = 8)
+
+      # Distance heatmap
+      if ("dist_to_interface" %in% colnames(md)) {
+        plot_df$dist <- md$dist_to_interface
+        p_dist <- ggplot(plot_df, aes(x = x, y = y, color = dist)) +
+          geom_point(size = spot_sz) +
+          scale_color_viridis_c(option = "plasma") +
+          labs(title = paste0(sn, " — Distance to Interface"),
+               x = "Array Col", y = "Array Row (inv)",
+               color = "Distance") +
+          theme_minimal(base_size = 10) +
+          coord_fixed()
+        ggsave(file.path(tier1_dir,
+                         paste0(sn, "_distance_heatmap.pdf")),
+               plot = p_dist, width = 10, height = 8)
+      }
+
+      # NEPC_UP score spatial map
+      if ("NEPC_UP_score" %in% colnames(md)) {
+        plot_df$nepc <- md$NEPC_UP_score
+        p_ne <- ggplot(plot_df, aes(x = x, y = y, color = nepc)) +
+          geom_point(size = spot_sz) +
+          scale_color_gradient2(low = "blue", mid = "white",
+                                high = "red",
+                                midpoint = median(md$NEPC_UP_score,
+                                                  na.rm = TRUE)) +
+          labs(title = paste0(sn, " — NEPC_UP Score"),
+               subtitle = "Should be highest at Interface/Proximal NE",
+               x = "Array Col", y = "Array Row (inv)",
+               color = "NEPC_UP") +
+          theme_minimal(base_size = 10) +
+          coord_fixed()
+        ggsave(file.path(tier1_dir,
+                         paste0(sn, "_spatial_NEPC_UP.pdf")),
+               plot = p_ne, width = 10, height = 8)
+      }
+
+      # Score by zone boxplots
+      score_avail <- intersect(
+        c("ASPC_score", "AR_score", "NEPC_UP_score"),
+        colnames(md))
+      if (length(score_avail) > 0) {
+        score_df <- data.frame(
+          zone = factor(md$zone_5class, levels = zone5_levels))
+        for (sc in score_avail) score_df[[sc]] <- md[[sc]]
+
+        if (requireNamespace("tidyr", quietly = TRUE)) {
+          score_long <- tidyr::pivot_longer(
+            score_df, cols = all_of(score_avail),
+            names_to = "score_type", values_to = "value")
+          p_scores <- ggplot(score_long,
+                             aes(x = zone, y = value, fill = zone)) +
+            geom_boxplot(outlier.size = 0.5) +
+            facet_wrap(~ score_type, scales = "free_y") +
+            scale_fill_manual(values = zone5_colors) +
+            labs(title = paste0(sn, " — Score by Zone"),
+                 x = "", y = "Score") +
+            theme_minimal(base_size = 9) +
+            theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                  legend.position = "none")
+          ggsave(file.path(tier1_dir,
+                           paste0(sn, "_score_by_zone.pdf")),
+                 plot = p_scores, width = 12, height = 5)
+        }
+      }
+
+    }, error = function(e) {
+      cat(paste0("    Plot error: ", sn, ": ",
+                 conditionMessage(e), "\n"))
+    })
+
+    rm(obj); invisible(gc())
+  }
+
+  # ================================================================
+  # Phase 5: Aggregate statistics & summary outputs
+  # ================================================================
+  cat("\n  Phase 5: Aggregating zone statistics...\n")
+
+  # Zone proportions table
   if (length(zone_prop_list) > 0) {
     zone_prop_df <- do.call(rbind, zone_prop_list)
     write.csv(zone_prop_df,
-              file.path(tier1_dir,
-                        "zone_proportions_per_sample.csv"),
+              file.path(tier1_dir, "zone_proportions_per_sample.csv"),
               row.names = FALSE)
 
-    # By condition
-    cond_zone <- zone_prop_df %>%
-      group_by(condition, zone) %>%
-      summarise(total_spots = sum(count), .groups = "drop") %>%
-      group_by(condition) %>%
-      mutate(fraction = total_spots / sum(total_spots)) %>%
-      ungroup()
-    write.csv(cond_zone,
+    if (requireNamespace("dplyr", quietly = TRUE)) {
+      library(dplyr)
+      cond_zone <- zone_prop_df %>%
+        group_by(condition, zone) %>%
+        summarise(total_spots = sum(count), .groups = "drop") %>%
+        group_by(condition) %>%
+        mutate(fraction = total_spots / sum(total_spots)) %>%
+        ungroup()
+      write.csv(cond_zone,
+                file.path(tier1_dir,
+                          "zone_proportions_by_condition.csv"),
+                row.names = FALSE)
+    }
+  }
+
+  # NE decay analysis: Proximal NE vs Distal NE per condition
+  cat("  NE decay analysis (Proximal vs Distal)...\n")
+  ne_decay_results <- list()
+  conditions_t1 <- unique(sapply(successfully_loaded, extract_condition))
+
+  for (cn in conditions_t1) {
+    cond_samples <- successfully_loaded[
+      sapply(successfully_loaded, extract_condition) == cn]
+
+    prox_ne_all <- numeric(0)
+    dist_ne_all <- numeric(0)
+    prox_dist_all <- numeric(0)
+    dist_dist_all <- numeric(0)
+
+    for (sn in cond_samples) {
+      obj <- load_sample(sn)
+      if (is.null(obj) ||
+          !"zone_5class" %in% colnames(obj@meta.data) ||
+          !"NEPC_UP_score" %in% colnames(obj@meta.data)) {
+        if (!is.null(obj)) rm(obj); invisible(gc()); next
+      }
+      pi <- which(obj$zone_5class == "Proximal_NE")
+      di <- which(obj$zone_5class == "Distal_NE")
+      if (length(pi) > 0) {
+        prox_ne_all   <- c(prox_ne_all, obj$NEPC_UP_score[pi])
+        prox_dist_all <- c(prox_dist_all, obj$dist_to_interface[pi])
+      }
+      if (length(di) > 0) {
+        dist_ne_all   <- c(dist_ne_all, obj$NEPC_UP_score[di])
+        dist_dist_all <- c(dist_dist_all, obj$dist_to_interface[di])
+      }
+      rm(obj); invisible(gc())
+    }
+
+    if (length(prox_ne_all) >= 5 && length(dist_ne_all) >= 5) {
+      wt <- tryCatch(
+        wilcox.test(prox_ne_all, dist_ne_all,
+                    alternative = "greater", exact = FALSE),
+        error = function(e) NULL)
+
+      # Spearman correlation across both NE zones combined
+      all_ne_dist  <- c(prox_dist_all, dist_dist_all)
+      all_ne_score <- c(prox_ne_all, dist_ne_all)
+      ct <- tryCatch(
+        cor.test(all_ne_dist, all_ne_score,
+                 method = "spearman", exact = FALSE),
+        error = function(e) NULL)
+
+      ne_decay_results[[cn]] <- data.frame(
+        condition       = cn,
+        n_proximal      = length(prox_ne_all),
+        n_distal        = length(dist_ne_all),
+        median_prox_NE  = median(prox_ne_all, na.rm = TRUE),
+        median_dist_NE  = median(dist_ne_all, na.rm = TRUE),
+        decay_confirmed = median(prox_ne_all, na.rm = TRUE) >
+          median(dist_ne_all, na.rm = TRUE),
+        wilcox_p        = if (!is.null(wt)) wt$p.value else NA,
+        spearman_rho    = if (!is.null(ct)) ct$estimate else NA,
+        spearman_p      = if (!is.null(ct)) ct$p.value else NA,
+        stringsAsFactors = FALSE
+      )
+
+      cat(paste0("    ", cn, ": Prox NE median=",
+                 round(median(prox_ne_all), 4),
+                 " (n=", length(prox_ne_all), ")",
+                 " | Dist NE median=",
+                 round(median(dist_ne_all), 4),
+                 " (n=", length(dist_ne_all), ")",
+                 " | Wilcox p=",
+                 if (!is.null(wt)) formatC(wt$p.value,
+                                           format = "e",
+                                           digits = 2)
+                 else "NA",
+                 " | rho=",
+                 if (!is.null(ct)) round(ct$estimate, 3) else "NA",
+                 "\n"))
+    }
+  }
+
+  if (length(ne_decay_results) > 0) {
+    ne_decay_df <- do.call(rbind, ne_decay_results)
+    write.csv(ne_decay_df,
               file.path(tier1_dir,
-                        "zone_proportions_by_condition.csv"),
+                        "NE_decay_proximal_vs_distal.csv"),
               row.names = FALSE)
+  }
 
-    cat(paste0("  Zone proportions saved (",
-               nrow(zone_prop_df), " rows)\n"))
+  # Per-zone mean score table
+  cat("  Per-zone mean scores...\n")
+  zone_score_results <- list()
 
-    # ================================================================
-    # Summary PDF with all conditions
-    # ================================================================
-    tryCatch({
-      pdf(file.path(tier1_dir, "TIER1_summary.pdf"),
-          width = 12, height = 8)
+  for (cn in conditions_t1) {
+    cond_samples <- successfully_loaded[
+      sapply(successfully_loaded, extract_condition) == cn]
 
-      # --- Page 1: Stacked bar of zone proportions by condition ---
-      tryCatch({
-        p_bar <- ggplot(cond_zone,
-                        aes(x = condition, y = fraction,
-                            fill = zone)) +
-          geom_bar(stat = "identity", position = "stack") +
-          scale_fill_manual(values = c(
-            Interface = "#E31A1C", ASPC_high = "#1F78B4",
-            AR_high = "#33A02C", NEPC_high = "#FF7F00",
-            Other = "#CCCCCC")) +
-          labs(title = "Zone Proportions by Condition",
-               x = "Condition", y = "Fraction of Spots",
-               fill = "Zone") +
-          theme_minimal(base_size = 12)
-        print(p_bar)
-      }, error = function(e) NULL)
+    for (zn in zone5_levels) {
+      scores_accum <- list()
 
-      # --- Page 2: Total spot counts by zone per condition ---
-      tryCatch({
-        p_counts <- ggplot(cond_zone,
-                           aes(x = condition, y = total_spots,
-                               fill = zone)) +
-          geom_bar(stat = "identity", position = "dodge") +
-          scale_fill_manual(values = c(
-            Interface = "#E31A1C", ASPC_high = "#1F78B4",
-            AR_high = "#33A02C", NEPC_high = "#FF7F00",
-            Other = "#CCCCCC")) +
-          labs(title = "Total Spots per Zone by Condition",
-               x = "Condition", y = "Spot Count",
-               fill = "Zone") +
-          theme_minimal(base_size = 12)
-        print(p_counts)
-      }, error = function(e) NULL)
-
-      # --- Page 3: Per-sample zone proportions heatmap ---
-      tryCatch({
-        # Pivot to matrix
-        samp_zone_wide <- zone_prop_df %>%
-          group_by(sample) %>%
-          mutate(frac = count / sum(count)) %>%
-          ungroup() %>%
-          tidyr::pivot_wider(id_cols = sample,
-                             names_from = zone,
-                             values_from = frac,
-                             values_fill = 0)
-        mat <- as.matrix(samp_zone_wide[, -1])
-        rownames(mat) <- samp_zone_wide$sample
-
-        if (have_pheatmap && nrow(mat) >= 2 && ncol(mat) >= 2) {
-          # Condition annotation
-          cond_annot <- data.frame(
-            Condition = sapply(rownames(mat), extract_condition),
-            row.names = rownames(mat))
-          cond_colors <- list(
-            Condition = c(BPH = "#66C2A5", TRNA = "#FC8D62",
-                          NEADT = "#8DA0CB", CRPC = "#E78AC3",
-                          MET = "#A6D854"))
-          pheatmap(mat, cluster_cols = FALSE,
-                   annotation_row = cond_annot,
-                   annotation_colors = cond_colors,
-                   main = "Zone Fraction per Sample",
-                   fontsize_row = 5, fontsize_col = 8,
-                   color = colorRampPalette(
-                     c("white", "steelblue", "darkblue"))(100))
+      for (sn in cond_samples) {
+        obj <- load_sample(sn)
+        if (is.null(obj) ||
+            !"zone_5class" %in% colnames(obj@meta.data)) {
+          if (!is.null(obj)) rm(obj); invisible(gc()); next
         }
-      }, error = function(e) NULL)
+        zi <- which(obj$zone_5class == zn)
+        if (length(zi) < 3) { rm(obj); invisible(gc()); next }
+        md_z <- obj@meta.data[zi, ]
 
-      # --- Page 4: Interface fraction by condition (boxplot) ---
-      tryCatch({
-        iface_frac <- zone_prop_df %>%
-          group_by(sample) %>%
-          mutate(frac = count / sum(count)) %>%
-          ungroup() %>%
-          filter(zone == "Interface")
-        if (nrow(iface_frac) > 0) {
-          p_iface <- ggplot(iface_frac,
-                            aes(x = condition, y = frac,
-                                fill = condition)) +
-            geom_boxplot(outlier.shape = 16) +
-            geom_jitter(width = 0.2, size = 1.5, alpha = 0.6) +
-            labs(title = "Interface Fraction by Condition",
-                 x = "Condition",
-                 y = "Fraction of Spots = Interface") +
-            theme_minimal(base_size = 12) +
-            theme(legend.position = "none")
-          print(p_iface)
+        for (sc in c("ASPC_score", "AR_score", "NEPC_UP_score",
+                     "NEPC_DOWN_score", "NEPC_Beltran_NET")) {
+          if (sc %in% colnames(md_z)) {
+            scores_accum[[paste0(sc, "_", sn)]] <- data.frame(
+              score_name = sc,
+              value      = md_z[[sc]],
+              stringsAsFactors = FALSE
+            )
+          }
         }
-      }, error = function(e) NULL)
-
-      # --- Pages 5+: Score distributions by zone (one per condition) ---
-      for (cond_name in unique(sapply(successfully_loaded,
-                                      extract_condition))) {
-        tryCatch({
-          cond_samps <- successfully_loaded[
-            sapply(successfully_loaded, extract_condition) == cond_name]
-          score_all <- list()
-          for (sn in cond_samps) {
-            obj <- load_sample(sn)
-            if (is.null(obj)) next
-            md <- obj@meta.data
-            if (!all(c("ASPC_score", "AR_score",
-                       "NEPC_UP_score", "interface_zone") %in%
-                     colnames(md))) {
-              rm(obj); next
-            }
-            score_all[[sn]] <- data.frame(
-              ASPC    = md$ASPC_score,
-              AR      = md$AR_score,
-              NEPC_UP = md$NEPC_UP_score,
-              zone    = md$interface_zone,
-              sample  = sn,
-              stringsAsFactors = FALSE)
-            rm(obj); invisible(gc())
-          }
-          if (length(score_all) > 0) {
-            sd_all <- do.call(rbind, score_all)
-            sd_long <- tidyr::pivot_longer(
-              sd_all, cols = c("ASPC", "AR", "NEPC_UP"),
-              names_to = "score_type",
-              values_to = "value")
-            p_sc <- ggplot(sd_long,
-                           aes(x = zone, y = value, fill = zone)) +
-              geom_violin(scale = "width", alpha = 0.7) +
-              geom_boxplot(width = 0.15, outlier.size = 0.3) +
-              facet_wrap(~score_type, scales = "free_y") +
-              scale_fill_manual(values = c(
-                Interface = "#E31A1C", ASPC_high = "#1F78B4",
-                AR_high = "#33A02C", NEPC_high = "#FF7F00",
-                Other = "#CCCCCC")) +
-              labs(title = paste0(cond_name,
-                                  " — Score Distributions by Zone"),
-                   x = "Zone", y = "Score") +
-              theme_minimal(base_size = 10) +
-              theme(axis.text.x = element_text(angle = 45,
-                                               hjust = 1))
-            print(p_sc)
-            rm(sd_all, sd_long, score_all)
-          }
-        }, error = function(e) NULL)
+        rm(obj); invisible(gc())
       }
 
-      dev.off()
-      cat("  TIER1_summary.pdf saved\n")
-    }, error = function(e) {
-      cat(paste0("  Summary PDF error: ",
-                 conditionMessage(e), "\n"))
-      tryCatch(dev.off(), error = function(e2) NULL)
-    })
+      if (length(scores_accum) > 0) {
+        all_sc <- do.call(rbind, scores_accum)
+        if (requireNamespace("dplyr", quietly = TRUE)) {
+          zone_means <- all_sc %>%
+            group_by(score_name) %>%
+            summarise(
+              mean_val   = mean(value, na.rm = TRUE),
+              median_val = median(value, na.rm = TRUE),
+              sd_val     = sd(value, na.rm = TRUE),
+              n          = sum(!is.na(value)),
+              .groups = "drop")
+          zone_means$condition <- cn
+          zone_means$zone      <- zn
+          zone_score_results[[paste0(cn, "_", zn)]] <- zone_means
+        }
+      }
+    }
+  }
+
+  if (length(zone_score_results) > 0) {
+    zone_score_df <- do.call(rbind, zone_score_results)
+    write.csv(zone_score_df,
+              file.path(tier1_dir,
+                        "zone_mean_scores_by_condition.csv"),
+              row.names = FALSE)
+    cat(paste0("  Zone score summary: ",
+               nrow(zone_score_df), " rows\n"))
   }
 
   # ================================================================
-  # Print summary
+  # Phase 6: TIER 1 Summary PDF
   # ================================================================
-  total_iface <- 0
-  total_spots <- 0
+  cat("\n  Phase 6: Generating TIER1 summary PDF...\n")
+
+  tryCatch({
+    pdf(file.path(tier1_dir, "TIER1_summary.pdf"),
+        width = 13, height = 9)
+
+    # ---- Page 1: Zone proportions stacked bar ----
+    if (exists("cond_zone") && nrow(cond_zone) > 0) {
+      tryCatch({
+        cond_zone$zone <- factor(cond_zone$zone,
+                                  levels = zone5_levels)
+        print(ggplot(cond_zone,
+                     aes(x = condition, y = fraction, fill = zone)) +
+          geom_bar(stat = "identity", position = "stack") +
+          scale_fill_manual(values = zone5_colors) +
+          labs(title = "5-Zone Paracrine Gradient: Proportions by Condition",
+               subtitle = paste0(
+                 "Interface (transitory) → Proximal NE (committed) → ",
+                 "Distal NE (decaying) → Epithelial (AR+) → ",
+                 "Necrotic Core (dead)"),
+               x = "Condition", y = "Fraction", fill = "Zone") +
+          theme_minimal(base_size = 12))
+      }, error = function(e) NULL)
+    }
+
+    # ---- Page 2: NE score by zone (violin + boxplot) ----
+    for (cn in conditions_t1) {
+      tryCatch({
+        cond_samples <- successfully_loaded[
+          sapply(successfully_loaded, extract_condition) == cn]
+        score_all <- list()
+        for (sn in cond_samples) {
+          obj <- load_sample(sn)
+          if (is.null(obj) ||
+              !"zone_5class" %in% colnames(obj@meta.data)) {
+            if (!is.null(obj)) rm(obj); invisible(gc()); next
+          }
+          md_s <- obj@meta.data
+          sc_avail <- intersect(
+            c("ASPC_score", "AR_score", "NEPC_UP_score"),
+            colnames(md_s))
+          if (length(sc_avail) == 0) { rm(obj); invisible(gc()); next }
+          df_s <- data.frame(zone = md_s$zone_5class)
+          for (sc in sc_avail) df_s[[sc]] <- md_s[[sc]]
+          score_all[[sn]] <- df_s
+          rm(obj); invisible(gc())
+        }
+        if (length(score_all) > 0) {
+          sd_all <- do.call(rbind, score_all)
+          sd_all$zone <- factor(sd_all$zone, levels = zone5_levels)
+          sc_avail <- intersect(
+            c("ASPC_score", "AR_score", "NEPC_UP_score"),
+            colnames(sd_all))
+          if (requireNamespace("tidyr", quietly = TRUE)) {
+            sd_long <- tidyr::pivot_longer(
+              sd_all, cols = all_of(sc_avail),
+              names_to = "score_type", values_to = "value")
+            print(ggplot(sd_long,
+                         aes(x = zone, y = value, fill = zone)) +
+              geom_violin(scale = "width", alpha = 0.7) +
+              geom_boxplot(width = 0.15, outlier.size = 0.3) +
+              facet_wrap(~ score_type, scales = "free_y") +
+              scale_fill_manual(values = zone5_colors) +
+              labs(title = paste0(cn, " — Scores by 5 Zones"),
+                   subtitle = paste0(
+                     "KEY: NEPC_UP should be ",
+                     "Interface > Proximal_NE > Distal_NE"),
+                   x = "", y = "Score") +
+              theme_minimal(base_size = 10) +
+              theme(axis.text.x = element_text(angle = 45,
+                                                hjust = 1),
+                    legend.position = "none"))
+          }
+          rm(sd_all, score_all)
+        }
+      }, error = function(e) NULL)
+    }
+
+    # ---- Page 3: NE decay plot (NEPC_UP vs distance) ----
+    tryCatch({
+      decay_data_all <- list()
+      for (cn in conditions_t1) {
+        cond_samples <- successfully_loaded[
+          sapply(successfully_loaded, extract_condition) == cn]
+        for (sn in cond_samples) {
+          obj <- load_sample(sn)
+          if (is.null(obj) ||
+              !"NEPC_UP_score" %in% colnames(obj@meta.data) ||
+              !"zone_5class" %in% colnames(obj@meta.data) ||
+              !"dist_to_interface" %in% colnames(obj@meta.data)) {
+            if (!is.null(obj)) rm(obj); invisible(gc()); next
+          }
+          # NE zones only
+          ne_idx <- which(obj$zone_5class %in%
+                            c("Interface", "Proximal_NE", "Distal_NE"))
+          if (length(ne_idx) > 0) {
+            ne_sub <- if (length(ne_idx) > 2000)
+              sample(ne_idx, 2000) else ne_idx
+            decay_data_all[[paste0(cn, "_", sn)]] <- data.frame(
+              dist      = obj$dist_to_interface[ne_sub],
+              nepc_up   = obj$NEPC_UP_score[ne_sub],
+              zone      = obj$zone_5class[ne_sub],
+              condition = cn,
+              stringsAsFactors = FALSE
+            )
+          }
+          rm(obj); invisible(gc())
+        }
+      }
+      if (length(decay_data_all) > 0) {
+        dd_all <- do.call(rbind, decay_data_all)
+        dd_all$zone <- factor(dd_all$zone,
+                              levels = c("Interface", "Proximal_NE",
+                                         "Distal_NE"))
+        print(ggplot(dd_all,
+                     aes(x = dist, y = nepc_up, color = zone)) +
+          geom_point(size = 0.3, alpha = 0.15) +
+          geom_smooth(aes(group = condition),
+                      method = "loess", linewidth = 1.2,
+                      se = TRUE, color = "black") +
+          scale_color_manual(values = zone5_colors) +
+          facet_wrap(~ condition, scales = "free_x") +
+          labs(title = "NE Score Decay Along Paracrine Gradient",
+               subtitle = paste0(
+                 "KEY PREDICTION: NEPC_UP decreases from ",
+                 "Interface → Proximal NE → Distal NE"),
+               x = "Distance to Interface",
+               y = "NEPC_UP Score",
+               color = "Zone") +
+          theme_minimal(base_size = 10))
+        rm(dd_all, decay_data_all)
+      }
+    }, error = function(e) NULL)
+
+    # ---- Page 4: AR score vs distance ----
+    tryCatch({
+      ar_data_all <- list()
+      for (cn in conditions_t1) {
+        cond_samples <- successfully_loaded[
+          sapply(successfully_loaded, extract_condition) == cn]
+        for (sn in cond_samples) {
+          obj <- load_sample(sn)
+          if (is.null(obj) ||
+              !"AR_score" %in% colnames(obj@meta.data) ||
+              !"dist_to_interface" %in% colnames(obj@meta.data)) {
+            if (!is.null(obj)) rm(obj); invisible(gc()); next
+          }
+          ni <- which(obj$dist_to_interface > 0)
+          if (length(ni) > 0) {
+            ni_sub <- if (length(ni) > 2000) sample(ni, 2000) else ni
+            ar_data_all[[paste0(cn, "_", sn)]] <- data.frame(
+              dist     = obj$dist_to_interface[ni_sub],
+              ar_score = obj$AR_score[ni_sub],
+              condition = cn)
+          }
+          rm(obj); invisible(gc())
+        }
+      }
+      if (length(ar_data_all) > 0) {
+        ar_all <- do.call(rbind, ar_data_all)
+        print(ggplot(ar_all,
+                     aes(x = dist, y = ar_score, color = condition)) +
+          geom_point(size = 0.3, alpha = 0.1) +
+          geom_smooth(method = "loess", linewidth = 1.2, se = TRUE) +
+          labs(title = "AR Score vs Distance from Interface",
+               subtitle = "Epithelial zone should be AR-dominant",
+               x = "Distance to Interface",
+               y = "AR Score", color = "Condition") +
+          theme_minimal(base_size = 11))
+        rm(ar_all, ar_data_all)
+      }
+    }, error = function(e) NULL)
+
+    # ---- Page 5: NE decay bar (Proximal vs Distal median) ----
+    if (exists("ne_decay_df") && nrow(ne_decay_df) > 0) {
+      tryCatch({
+        bar_df <- data.frame(
+          condition = rep(ne_decay_df$condition, 2),
+          zone = rep(c("Proximal_NE", "Distal_NE"),
+                     each = nrow(ne_decay_df)),
+          median_NE = c(ne_decay_df$median_prox_NE,
+                        ne_decay_df$median_dist_NE),
+          stringsAsFactors = FALSE
+        )
+        bar_df$zone <- factor(bar_df$zone,
+                              levels = c("Proximal_NE", "Distal_NE"))
+        print(ggplot(bar_df,
+                     aes(x = condition, y = median_NE, fill = zone)) +
+          geom_bar(stat = "identity", position = "dodge") +
+          scale_fill_manual(values = zone5_colors) +
+          labs(title = "NE Score Decay: Proximal NE vs Distal NE",
+               subtitle = paste0(
+                 "KEY: Proximal bar should be TALLER than ",
+                 "Distal in each condition"),
+               x = "Condition", y = "Median NEPC_UP Score",
+               fill = "Zone") +
+          theme_minimal(base_size = 12))
+      }, error = function(e) NULL)
+    }
+
+    # ---- Page 6: Spatial maps per condition (first 6 samples) ----
+    for (cn in conditions_t1) {
+      tryCatch({
+        cond_samples <- successfully_loaded[
+          sapply(successfully_loaded, extract_condition) == cn]
+        zpd_list <- list()
+        for (sn in head(cond_samples, 6)) {
+          obj <- load_sample(sn)
+          if (is.null(obj) ||
+              !"zone_5class" %in% colnames(obj@meta.data)) {
+            if (!is.null(obj)) rm(obj); invisible(gc()); next
+          }
+          md_s <- obj@meta.data
+          if (all(c("col", "row") %in% colnames(md_s))) {
+            zpd_list[[sn]] <- data.frame(
+              x = md_s$col, y = -md_s$row,
+              zone = md_s$zone_5class,
+              sample = sn)
+          }
+          rm(obj); invisible(gc())
+        }
+        if (length(zpd_list) > 0) {
+          zpd <- do.call(rbind, zpd_list)
+          zpd$zone <- factor(zpd$zone, levels = zone5_levels)
+          print(ggplot(zpd, aes(x = x, y = y, color = zone)) +
+            geom_point(size = 0.8) +
+            scale_color_manual(values = zone5_colors) +
+            facet_wrap(~ sample, scales = "free") +
+            labs(title = paste0(cn, " — 5-Zone Spatial Maps"),
+                 x = "Col", y = "Row (inv)", color = "Zone") +
+            theme_minimal(base_size = 9) +
+            coord_fixed())
+          rm(zpd, zpd_list)
+        }
+      }, error = function(e) NULL)
+    }
+
+    # ---- Page 7: Distance histogram with zone boundaries ----
+    for (cn in conditions_t1) {
+      tryCatch({
+        cond_samples <- successfully_loaded[
+          sapply(successfully_loaded, extract_condition) == cn]
+        dv <- list()
+        for (sn in cond_samples) {
+          obj <- load_sample(sn)
+          if (!is.null(obj) &&
+              "dist_to_interface" %in% colnames(obj@meta.data)) {
+            dv[[sn]] <- data.frame(d = obj$dist_to_interface)
+          }
+          if (!is.null(obj)) rm(obj); invisible(gc())
+        }
+        if (length(dv) > 0) {
+          dd <- do.call(rbind, dv)
+          zb <- cond_zone_breaks[[cn]]
+          p_hist <- ggplot(dd, aes(x = d)) +
+            geom_histogram(bins = 60, fill = "steelblue",
+                           color = "white", alpha = 0.8)
+          if (!is.null(zb)) {
+            p_hist <- p_hist +
+              geom_vline(xintercept = 0, color = "#E31A1C",
+                         linewidth = 1.2) +
+              geom_vline(xintercept = zb$proximal_max,
+                         linetype = "dashed", color = "#FF7F00",
+                         linewidth = 1) +
+              geom_vline(xintercept = zb$distal_ne_max,
+                         linetype = "dashed", color = "#FDBF6F",
+                         linewidth = 1) +
+              geom_vline(xintercept = zb$necrotic_min,
+                         linetype = "dashed", color = "#6A3D9A",
+                         linewidth = 1) +
+              annotate("text", x = 0.3, y = Inf,
+                       label = "Interface", vjust = 2,
+                       color = "#E31A1C", size = 3,
+                       fontface = "bold") +
+              annotate("text", x = zb$proximal_max, y = Inf,
+                       label = "Prox|Dist NE", vjust = 3.5,
+                       hjust = -0.1, color = "#FF7F00", size = 2.5) +
+              annotate("text", x = zb$distal_ne_max, y = Inf,
+                       label = "Dist NE|Epi", vjust = 3.5,
+                       hjust = -0.1, color = "#FDBF6F", size = 2.5) +
+              annotate("text", x = zb$necrotic_min, y = Inf,
+                       label = "Epi|Necrotic", vjust = 3.5,
+                       hjust = -0.1, color = "#6A3D9A", size = 2.5)
+          }
+          p_hist <- p_hist +
+            labs(title = paste0(cn, " — Distance with 5-Zone Boundaries"),
+                 subtitle = paste0(
+                   "Interface (d=0) | Proximal NE (≤Q15) | ",
+                   "Distal NE (Q15-Q35) | Epithelial (Q35-Q70) | ",
+                   "Necrotic (>Q70)"),
+                 x = "Distance to Interface", y = "Spot Count") +
+            theme_minimal(base_size = 10)
+          print(p_hist)
+          rm(dd, dv)
+        }
+      }, error = function(e) NULL)
+    }
+
+    dev.off()
+    cat("  TIER1_summary.pdf saved\n")
+
+  }, error = function(e) {
+    cat(paste0("  Summary PDF error: ", conditionMessage(e), "\n"))
+    tryCatch(dev.off(), error = function(e2) NULL)
+  })
+
+  # ================================================================
+  # Phase 7: Final summary
+  # ================================================================
+  total_iface  <- 0; total_prox_ne <- 0; total_dist_ne <- 0
+  total_necro  <- 0; total_epi <- 0; total_spots <- 0
+
   for (sn in successfully_loaded) {
     obj <- load_sample(sn)
     if (!is.null(obj) &&
-        "interface_zone" %in% colnames(obj@meta.data)) {
-      total_iface <- total_iface +
-        sum(obj$interface_zone == "Interface", na.rm = TRUE)
-      total_spots <- total_spots + ncol(obj)
+        "zone_5class" %in% colnames(obj@meta.data)) {
+      zt <- table(obj$zone_5class)
+      total_iface   <- total_iface   + (zt["Interface"]     %||% 0)
+      total_prox_ne <- total_prox_ne + (zt["Proximal_NE"]   %||% 0)
+      total_dist_ne <- total_dist_ne + (zt["Distal_NE"]     %||% 0)
+      total_necro   <- total_necro   + (zt["Necrotic_Core"] %||% 0)
+      total_epi     <- total_epi     + (zt["Epithelial"]    %||% 0)
+      total_spots   <- total_spots   + ncol(obj)
     }
     rm(obj); invisible(gc())
   }
-  cat(paste0("  Total spots: ", total_spots,
-             " | Interface spots: ", total_iface,
-             " (", round(100 * total_iface / max(total_spots, 1), 1),
-             "%)\n"))
+
+  pct <- function(n) round(100 * n / max(total_spots, 1), 1)
+
+  cat(paste0("\n  ====== TIER 1 FINAL SUMMARY (5-Zone) ======\n"))
+  cat(paste0("  Samples processed:     ", length(successfully_loaded), "\n"))
+  cat(paste0("  Total spots:           ", total_spots, "\n"))
+  cat(paste0("  Interface:             ", total_iface, " (", pct(total_iface), "%)\n"))
+  cat(paste0("  Proximal NE:           ", total_prox_ne, " (", pct(total_prox_ne), "%)\n"))
+  cat(paste0("  Distal NE:             ", total_dist_ne, " (", pct(total_dist_ne), "%)\n"))
+  cat(paste0("  Epithelial (AR+):      ", total_epi, " (", pct(total_epi), "%)\n"))
+  cat(paste0("  Necrotic Core:         ", total_necro, " (", pct(total_necro), "%)\n"))
+  cat(paste0("  ===========================================\n"))
 
   tier1_status <- "COMPLETE"
-  cat("TIER 1 complete.\n")
+  cat("TIER 1 (5-Zone Paracrine Gradient Model) complete.\n")
 
 }, error = function(e) {
   cat(paste0("TIER 1 ERROR: ", conditionMessage(e), "\n"))
   tier1_status <<- paste0("ERROR: ", conditionMessage(e))
+  tryCatch(dev.off(), error = function(e2) NULL)
 })
 
 # ==============================================================================
