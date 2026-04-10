@@ -1610,10 +1610,25 @@ cat(paste0("\n  TIER 1 status: ", tier1_status, "\n"))
 
                 
 # ==============================================================================
-# TIER 2 PART 1 — Setup, Gene Sets, Distance Computation, Bin Assignment
-# Source this file first, then source TIER2_Part2.R in the same session.
+# TIER 2 — REVISED 5-ZONE MODEL WITH 4 INTERFACE-CENTRIC GSEA
 # ==============================================================================
-cat("\n=== TIER 2: Distance-Binned Pseudo-Bulk DE + GSEA ===\n")
+# Uses zone_5class from TIER 1 (rank-based distance-only assignment):
+#   1. Interface       — dist == 0 (ASPC-adjacent, active NE transition)
+#   2. Proximal NE     — closest 20% (committed NE, paracrine signaling)
+#   3. Distal NE       — next 25% (NE signal decaying)
+#   4. Epithelial      — next 30% (AR+, luminal identity)
+#   5. Necrotic Core   — farthest 25% (ghost mRNA, necrotic valley)
+#
+# 4 GSEA Comparisons (all Interface as reference):
+#   A. Interface vs Proximal NE    — active transition vs committed NE
+#   B. Interface vs Distal NE      — viable NE vs decaying NE signal
+#   C. Interface vs Epithelial     — NE transition vs luminal cancer
+#   D. Interface vs Necrotic Core  — viable cells vs dead zone
+#
+# log2FC convention: positive = enriched in Interface (reference)
+# ==============================================================================
+
+cat("\n=== TIER 2 REVISED: 5-Zone Model + 4 Interface-Centric GSEA ===\n")
 tier2_status <- "SKIPPED"
 
 tryCatch({
@@ -1656,6 +1671,30 @@ tryCatch({
     }
   }
 
+  if (!exists("extract_condition", mode = "function")) {
+    extract_condition <- function(sample_name) {
+      if (grepl("BPH",   sample_name)) return("BPH")
+      if (grepl("TRNA",  sample_name)) return("TRNA")
+      if (grepl("NEADT", sample_name)) return("NEADT")
+      if (grepl("CRPC",  sample_name)) return("CRPC")
+      if (grepl("MET",   sample_name)) return("MET")
+      return("Unknown")
+    }
+  }
+
+  if (!exists("compute_spot_size", mode = "function")) {
+    compute_spot_size <- function(coords) {
+      if (nrow(coords) < 2) return(1.5)
+      x_range <- diff(range(coords[, 1], na.rm = TRUE))
+      y_range <- diff(range(coords[, 2], na.rm = TRUE))
+      area <- x_range * y_range
+      if (area <= 0) return(1.5)
+      density <- nrow(coords) / area
+      size <- max(0.3, min(3.0, 1 / sqrt(density) * 10))
+      return(size)
+    }
+  }
+
   # ================================================================
   # Determine sample list
   # ================================================================
@@ -1682,22 +1721,22 @@ tryCatch({
     }
   }
 
-  cat("  Validating samples...\n")
+  cat("  Validating samples (require zone_5class)...\n")
   valid_samples <- character(0)
   for (sn in successfully_loaded) {
     obj <- load_sample(sn)
     if (is.null(obj)) next
     md <- obj@meta.data
-    ok <- "interface_zone" %in% colnames(md) &&
+    ok <- "zone_5class" %in% colnames(md) &&
       all(c("row", "col") %in% colnames(md)) &&
-      sum(md$interface_zone == "Interface", na.rm = TRUE) > 0
+      sum(md$zone_5class == "Interface", na.rm = TRUE) > 0
     if (ok) valid_samples <- c(valid_samples, sn)
-    else cat(paste0("    ", sn, ": skipped\n"))
+    else cat(paste0("    ", sn, ": skipped (no zone_5class or no Interface)\n"))
     rm(obj); invisible(gc())
   }
   cat(paste0("  Valid: ", length(valid_samples), "\n"))
   if (length(valid_samples) == 0)
-    stop("No valid samples with interface_zone")
+    stop("No valid samples with zone_5class")
 
   # ================================================================
   # Install/load enrichment packages
@@ -1813,7 +1852,7 @@ tryCatch({
   gene_set_list <- list()
 
   # ==============================================================
-  # A) CUSTOM SIGNATURES — 7 original + 7 cell death + 4 mito
+  # A) CUSTOM SIGNATURES — 22 total
   # ==============================================================
   cat("    Custom signatures:\n")
 
@@ -1849,156 +1888,180 @@ tryCatch({
       "AQP7","SLC2A4","GYK","ACSL1","ACSL5",
       "ELOVL6","MGLL","AKR1B1","SCD5","THRSP")
 
+  if (!exists("ESTROGEN_RESPONSE_SIG"))
+    ESTROGEN_RESPONSE_SIG <- c(
+      "ESR1","ESR2","GREB1","TFF1","TFF3",
+      "PGR","CCND1","MYC","VEGFA","STC2",
+      "IGFBP4","PDZK1","CA12","XBP1","FOXA1",
+      "AGR2","SLC7A2","RARA","CTSD","KRT13",
+      "EGR3","NRIP1","ABCA3","OLFM1","HSPB8",
+      "CYP19A1","HSD17B1","HSD17B2","STS","SULT1E1",
+      "AREG","EREG","FGF2","MMP2","TIMP3",
+      "SOX9","ID2","BMP7","FOXC1","WNT4")
+
   # --- Cell death signatures ---
-  NECROPTOSIS_SIG <- c(
-    "RIPK1","RIPK3","MLKL","TNFRSF1A","TNF",
-    "TRADD","FADD","CASP8","CFLAR","CYLD",
-    "BIRC2","BIRC3","XIAP","TRAF2","TRAF5",
-    "TAB2","TAB3","MAP3K7","CHUK","IKBKB",
-    "NFKBIA","ZBP1","DAI","ADAR","IFNAR1",
-    "IFNAR2","JAK1","TYK2","STAT1","STAT2",
-    "IRF9","USP21","SPATA2","HOIP","SHARPIN",
-    "OTULIN","A20","TNFAIP3","LUBAC","RNF31")
+  if (!exists("NECROPTOSIS_SIG"))
+    NECROPTOSIS_SIG <- c(
+      "RIPK1","RIPK3","MLKL","TNFRSF1A","TNF",
+      "TRADD","FADD","CASP8","CFLAR","CYLD",
+      "BIRC2","BIRC3","XIAP","TRAF2","TRAF5",
+      "TAB2","TAB3","MAP3K7","CHUK","IKBKB",
+      "NFKBIA","ZBP1","DAI","ADAR","IFNAR1",
+      "IFNAR2","JAK1","TYK2","STAT1","STAT2",
+      "IRF9","USP21","SPATA2","HOIP","SHARPIN",
+      "OTULIN","A20","TNFAIP3","LUBAC","RNF31")
 
-  FERROPTOSIS_SIG <- c(
-    "GPX4","SLC7A11","SLC3A2","ACSL4","LPCAT3",
-    "TFRC","FTH1","FTL","HMOX1","NRF2","NFE2L2",
-    "SLC40A1","NCOA4","IREB2","CISD1","VDAC2",
-    "VDAC3","RSL3","ALOX15","ALOX12","ALOX5",
-    "POR","CBS","FSP1","AIFM2","DHODH",
-    "GCH1","BH4","GCLC","GCLM","GSS",
-    "GSR","SLC11A2","DMT1","STEAP3","PCBP1",
-    "PCBP2","PROM2","ATG5","ATG7","BECN1",
-    "HSPA5","HSPB1","FANCD2","TP53","SAT1")
+  if (!exists("FERROPTOSIS_SIG"))
+    FERROPTOSIS_SIG <- c(
+      "GPX4","SLC7A11","SLC3A2","ACSL4","LPCAT3",
+      "TFRC","FTH1","FTL","HMOX1","NRF2","NFE2L2",
+      "SLC40A1","NCOA4","IREB2","CISD1","VDAC2",
+      "VDAC3","RSL3","ALOX15","ALOX12","ALOX5",
+      "POR","CBS","FSP1","AIFM2","DHODH",
+      "GCH1","BH4","GCLC","GCLM","GSS",
+      "GSR","SLC11A2","DMT1","STEAP3","PCBP1",
+      "PCBP2","PROM2","ATG5","ATG7","BECN1",
+      "HSPA5","HSPB1","FANCD2","TP53","SAT1")
 
-  PYROPTOSIS_SIG <- c(
-    "NLRP3","NLRC4","NLRP1","AIM2","PYCARD",
-    "CASP1","CASP4","CASP5","CASP11","GSDMD",
-    "GSDME","GSDMA","GSDMB","GSDMC","IL1B",
-    "IL18","IL33","HMGB1","P2RX7","PANX1",
-    "NEK7","TXNIP","BRCC3","TLR4","MYD88",
-    "IRAK1","IRAK4","TRAF6","NFKB1","RELA",
-    "NLRP6","NLRP7","MEFV","CARD8","NAIP")
+  if (!exists("PYROPTOSIS_SIG"))
+    PYROPTOSIS_SIG <- c(
+      "NLRP3","NLRC4","NLRP1","AIM2","PYCARD",
+      "CASP1","CASP4","CASP5","CASP11","GSDMD",
+      "GSDME","GSDMA","GSDMB","GSDMC","IL1B",
+      "IL18","IL33","HMGB1","P2RX7","PANX1",
+      "NEK7","TXNIP","BRCC3","TLR4","MYD88",
+      "IRAK1","IRAK4","TRAF6","NFKB1","RELA",
+      "NLRP6","NLRP7","MEFV","CARD8","NAIP")
 
-  CUPROPTOSIS_SIG <- c(
-    "FDX1","LIAS","LIPT1","DLD","DLAT",
-    "PDHA1","PDHB","MTF1","GLS","CDKN2A",
-    "SLC31A1","ATP7A","ATP7B","SOD1","CCS",
-    "MT1A","MT1B","MT1E","MT1F","MT1G",
-    "MT1H","MT1M","MT1X","MT2A","COX11",
-    "COX17","SCO1","SCO2","COA6","ATOX1",
-    "COMMD1","XIAP","PARK7","CP","STEAP4",
-    "LOX","LOXL2","SLC25A3","DBT","GCSH")
+  if (!exists("CUPROPTOSIS_SIG"))
+    CUPROPTOSIS_SIG <- c(
+      "FDX1","LIAS","LIPT1","DLD","DLAT",
+      "PDHA1","PDHB","MTF1","GLS","CDKN2A",
+      "SLC31A1","ATP7A","ATP7B","SOD1","CCS",
+      "MT1A","MT1B","MT1E","MT1F","MT1G",
+      "MT1H","MT1M","MT1X","MT2A","COX11",
+      "COX17","SCO1","SCO2","COA6","ATOX1",
+      "COMMD1","XIAP","PARK7","CP","STEAP4",
+      "LOX","LOXL2","SLC25A3","DBT","GCSH")
 
-  APOPTOSIS_INTRINSIC_SIG <- c(
-    "BAX","BAK1","BCL2","BCL2L1","MCL1",
-    "BID","BIM","BCL2L11","BAD","PUMA",
-    "BBC3","NOXA","PMAIP1","CYCS","APAF1",
-    "CASP9","CASP3","CASP7","SMAC","DIABLO",
-    "XIAP","BIRC5","AIF","AIFM1","ENDOG",
-    "TP53","MDM2","CDKN1A","FAS","FASLG",
-    "CASP8","CASP10","TRADD","RIPK1","CFLAR",
-    "PARP1","PARP2","DFFA","DFFB","ICAD")
+  if (!exists("APOPTOSIS_INTRINSIC_SIG"))
+    APOPTOSIS_INTRINSIC_SIG <- c(
+      "BAX","BAK1","BCL2","BCL2L1","MCL1",
+      "BID","BIM","BCL2L11","BAD","PUMA",
+      "BBC3","NOXA","PMAIP1","CYCS","APAF1",
+      "CASP9","CASP3","CASP7","SMAC","DIABLO",
+      "XIAP","BIRC5","AIF","AIFM1","ENDOG",
+      "TP53","MDM2","CDKN1A","FAS","FASLG",
+      "CASP8","CASP10","TRADD","RIPK1","CFLAR",
+      "PARP1","PARP2","DFFA","DFFB","ICAD")
 
-  APOPTOSIS_EXTRINSIC_SIG <- c(
-    "FAS","FASLG","TNFRSF10A","TNFRSF10B","TRAIL",
-    "TNFSF10","TNF","TNFRSF1A","TNFRSF1B","TRADD",
-    "FADD","CASP8","CASP10","CFLAR","BID",
-    "RIPK1","TRAF2","CASP3","CASP7","XIAP",
-    "BIRC2","BIRC3","DIABLO","SMAC","CYCS",
-    "APAF1","CASP9","BCL2","BCL2L1","MCL1")
+  if (!exists("APOPTOSIS_EXTRINSIC_SIG"))
+    APOPTOSIS_EXTRINSIC_SIG <- c(
+      "FAS","FASLG","TNFRSF10A","TNFRSF10B","TRAIL",
+      "TNFSF10","TNF","TNFRSF1A","TNFRSF1B","TRADD",
+      "FADD","CASP8","CASP10","CFLAR","BID",
+      "RIPK1","TRAF2","CASP3","CASP7","XIAP",
+      "BIRC2","BIRC3","DIABLO","SMAC","CYCS",
+      "APAF1","CASP9","BCL2","BCL2L1","MCL1")
 
-  AUTOPHAGY_SIG <- c(
-    "BECN1","ATG5","ATG7","ATG12","ATG16L1",
-    "ATG3","ATG4B","ATG9A","ATG14","ATG101",
-    "ULK1","ULK2","FIP200","RB1CC1","PIK3C3",
-    "VPS34","PIK3R4","AMBRA1","UVRAG","LC3B",
-    "MAP1LC3B","MAP1LC3A","GABARAP","GABARAPL1",
-    "GABARAPL2","SQSTM1","NBR1","OPTN","NDP52",
-    "CALCOCO2","BNIP3","BNIP3L","FUNDC1","PINK1",
-    "PRKN","PARKIN","LAMP1","LAMP2","CTSD","TFEB")
+  if (!exists("AUTOPHAGY_SIG"))
+    AUTOPHAGY_SIG <- c(
+      "BECN1","ATG5","ATG7","ATG12","ATG16L1",
+      "ATG3","ATG4B","ATG9A","ATG14","ATG101",
+      "ULK1","ULK2","FIP200","RB1CC1","PIK3C3",
+      "VPS34","PIK3R4","AMBRA1","UVRAG","LC3B",
+      "MAP1LC3B","MAP1LC3A","GABARAP","GABARAPL1",
+      "GABARAPL2","SQSTM1","NBR1","OPTN","NDP52",
+      "CALCOCO2","BNIP3","BNIP3L","FUNDC1","PINK1",
+      "PRKN","PARKIN","LAMP1","LAMP2","CTSD","TFEB")
 
   # --- Mitochondrial function signatures ---
-  MITO_OXPHOS_SIG <- c(
-    "MT-ND1","MT-ND2","MT-ND3","MT-ND4","MT-ND4L",
-    "MT-ND5","MT-ND6","NDUFA1","NDUFA2","NDUFA4",
-    "NDUFA5","NDUFA9","NDUFA10","NDUFA13","NDUFB3",
-    "NDUFB5","NDUFB8","NDUFB10","NDUFC2","NDUFS1",
-    "NDUFS2","NDUFS3","NDUFS4","NDUFS6","NDUFS7",
-    "NDUFS8","NDUFV1","NDUFV2","SDHA","SDHB",
-    "SDHC","SDHD","MT-CYB","UQCRC1","UQCRC2",
-    "UQCRFS1","UQCRB","UQCRQ","MT-CO1","MT-CO2",
-    "MT-CO3","COX4I1","COX5A","COX5B","COX6A1",
-    "COX6B1","COX6C","COX7A2","COX7C","COX8A",
-    "MT-ATP6","MT-ATP8","ATP5F1A","ATP5F1B","ATP5F1C",
-    "ATP5F1D","ATP5F1E","ATP5MC1","ATP5MC2","ATP5MC3",
-    "ATP5ME","ATP5MF","ATP5PB","ATP5PD","ATP5PO")
+  if (!exists("MITO_OXPHOS_SIG"))
+    MITO_OXPHOS_SIG <- c(
+      "MT-ND1","MT-ND2","MT-ND3","MT-ND4","MT-ND4L",
+      "MT-ND5","MT-ND6","NDUFA1","NDUFA2","NDUFA4",
+      "NDUFA5","NDUFA9","NDUFA10","NDUFA13","NDUFB3",
+      "NDUFB5","NDUFB8","NDUFB10","NDUFC2","NDUFS1",
+      "NDUFS2","NDUFS3","NDUFS4","NDUFS6","NDUFS7",
+      "NDUFS8","NDUFV1","NDUFV2","SDHA","SDHB",
+      "SDHC","SDHD","MT-CYB","UQCRC1","UQCRC2",
+      "UQCRFS1","UQCRB","UQCRQ","MT-CO1","MT-CO2",
+      "MT-CO3","COX4I1","COX5A","COX5B","COX6A1",
+      "COX6B1","COX6C","COX7A2","COX7C","COX8A",
+      "MT-ATP6","MT-ATP8","ATP5F1A","ATP5F1B","ATP5F1C",
+      "ATP5F1D","ATP5F1E","ATP5MC1","ATP5MC2","ATP5MC3",
+      "ATP5ME","ATP5MF","ATP5PB","ATP5PD","ATP5PO")
 
-  MITO_DYNAMICS_SIG <- c(
-    "MFN1","MFN2","OPA1","DRP1","DNM1L",
-    "FIS1","MFF","MIEF1","MIEF2","MID49",
-    "MID51","PINK1","PRKN","PARKIN","BNIP3",
-    "BNIP3L","FUNDC1","PHB","PHB2","RHOT1",
-    "RHOT2","TRAK1","TRAK2","KIF5B","MIRO1",
-    "MIRO2","TOMM20","TOMM40","TOMM70","TIMM23",
-    "TIMM44","TIMM50","TIMM13","SAMM50","MTX1",
-    "MTX2","VDAC1","VDAC2","VDAC3","SLC25A4")
+  if (!exists("MITO_DYNAMICS_SIG"))
+    MITO_DYNAMICS_SIG <- c(
+      "MFN1","MFN2","OPA1","DRP1","DNM1L",
+      "FIS1","MFF","MIEF1","MIEF2","MID49",
+      "MID51","PINK1","PRKN","PARKIN","BNIP3",
+      "BNIP3L","FUNDC1","PHB","PHB2","RHOT1",
+      "RHOT2","TRAK1","TRAK2","KIF5B","MIRO1",
+      "MIRO2","TOMM20","TOMM40","TOMM70","TIMM23",
+      "TIMM44","TIMM50","TIMM13","SAMM50","MTX1",
+      "MTX2","VDAC1","VDAC2","VDAC3","SLC25A4")
 
-  MITO_BIOGENESIS_SIG <- c(
-    "PPARGC1A","PGC1A","PPARGC1B","NRF1","GABPA",
-    "TFAM","TFB1M","TFB2M","POLG","POLG2",
-    "TWNK","SSBP1","MTERF1","MTERF2","MTERF3",
-    "MTERF4","MRPL11","MRPL12","MRPL15","MRPL16",
-    "MRPS12","MRPS15","MRPS22","MRPS25","MRPS27",
-    "COX10","COX15","SURF1","SCO1","SCO2",
-    "COA3","COA5","COA6","COA7","BCS1L",
-    "UQCC1","UQCC2","NDUFAF1","NDUFAF2","ACAD9")
+  if (!exists("MITO_BIOGENESIS_SIG"))
+    MITO_BIOGENESIS_SIG <- c(
+      "PPARGC1A","PGC1A","PPARGC1B","NRF1","GABPA",
+      "TFAM","TFB1M","TFB2M","POLG","POLG2",
+      "TWNK","SSBP1","MTERF1","MTERF2","MTERF3",
+      "MTERF4","MRPL11","MRPL12","MRPL15","MRPL16",
+      "MRPS12","MRPS15","MRPS22","MRPS25","MRPS27",
+      "COX10","COX15","SURF1","SCO1","SCO2",
+      "COA3","COA5","COA6","COA7","BCS1L",
+      "UQCC1","UQCC2","NDUFAF1","NDUFAF2","ACAD9")
 
-  MITO_APOPTOSIS_SIG <- c(
-    "BAX","BAK1","BCL2","BCL2L1","MCL1",
-    "BID","BIM","BCL2L11","BAD","PUMA",
-    "BBC3","NOXA","PMAIP1","CYCS","APAF1",
-    "CASP9","CASP3","DIABLO","SMAC","HTRA2",
-    "AIF","AIFM1","ENDOG","VDAC1","VDAC2",
-    "ANT1","SLC25A4","ANT2","SLC25A5","TSPO",
-    "PPIF","CYPD","MOMP","BOK","BMF",
-    "HRK","BIK","BNIP3","BNIP3L","AIFM2")
+  if (!exists("MITO_APOPTOSIS_SIG"))
+    MITO_APOPTOSIS_SIG <- c(
+      "BAX","BAK1","BCL2","BCL2L1","MCL1",
+      "BID","BIM","BCL2L11","BAD","PUMA",
+      "BBC3","NOXA","PMAIP1","CYCS","APAF1",
+      "CASP9","CASP3","DIABLO","SMAC","HTRA2",
+      "AIF","AIFM1","ENDOG","VDAC1","VDAC2",
+      "ANT1","SLC25A4","ANT2","SLC25A5","TSPO",
+      "PPIF","CYPD","MOMP","BOK","BMF",
+      "HRK","BIK","BNIP3","BNIP3L","AIFM2")
 
   # --- Additional biology ---
-  SENESCENCE_SIG <- c(
-    "CDKN1A","CDKN2A","CDKN2B","TP53","RB1",
-    "SERPINE1","IGFBP3","IGFBP5","IGFBP7","MMP1",
-    "MMP3","MMP10","IL1A","IL1B","IL6",
-    "IL8","CXCL8","CXCL1","CXCL2","CXCL3",
-    "CCL2","CCL3","CCL5","CCL20","VEGFA",
-    "FGF2","HGF","AREG","EREG","MIF",
-    "HMGA1","HMGA2","LMNB1","H2AFX","GLB1",
-    "SA_BGAL","GADD45A","GADD45B","MDM2","BCL2L1")
+  if (!exists("SENESCENCE_SIG"))
+    SENESCENCE_SIG <- c(
+      "CDKN1A","CDKN2A","CDKN2B","TP53","RB1",
+      "SERPINE1","IGFBP3","IGFBP5","IGFBP7","MMP1",
+      "MMP3","MMP10","IL1A","IL1B","IL6",
+      "IL8","CXCL8","CXCL1","CXCL2","CXCL3",
+      "CCL2","CCL3","CCL5","CCL20","VEGFA",
+      "FGF2","HGF","AREG","EREG","MIF",
+      "HMGA1","HMGA2","LMNB1","H2AFX","GLB1",
+      "SA_BGAL","GADD45A","GADD45B","MDM2","BCL2L1")
 
-  LIPID_METABOLISM_SIG <- c(
-    "FASN","ACACA","ACACB","ACLY","SCD",
-    "ELOVL5","ELOVL6","FADS1","FADS2","ACSL1",
-    "ACSL3","ACSL4","ACSL5","CPT1A","CPT1B",
-    "CPT2","HADHA","HADHB","ACADM","ACADL",
-    "ACADVL","ECHS1","EHHADH","HSD17B4","ABCA1",
-    "ABCG1","NPC1","NPC2","LIPA","LIPG",
-    "DGAT1","DGAT2","AGPAT1","GPAT4","PLIN1",
-    "PLIN2","PLIN3","CD36","FABP4","FABP5",
-    "LPL","HMGCR","HMGCS1","SQLE","LDLR")
+  if (!exists("LIPID_METABOLISM_SIG"))
+    LIPID_METABOLISM_SIG <- c(
+      "FASN","ACACA","ACACB","ACLY","SCD",
+      "ELOVL5","ELOVL6","FADS1","FADS2","ACSL1",
+      "ACSL3","ACSL4","ACSL5","CPT1A","CPT1B",
+      "CPT2","HADHA","HADHB","ACADM","ACADL",
+      "ACADVL","ECHS1","EHHADH","HSD17B4","ABCA1",
+      "ABCG1","NPC1","NPC2","LIPA","LIPG",
+      "DGAT1","DGAT2","AGPAT1","GPAT4","PLIN1",
+      "PLIN2","PLIN3","CD36","FABP4","FABP5",
+      "LPL","HMGCR","HMGCS1","SQLE","LDLR")
 
-  NEURO_DIFF_SIG <- c(
-    "SYP","SYN1","SNAP25","VAMP2","STX1A",
-    "CHGA","CHGB","ENO2","NCAM1","TUBB3",
-    "MAP2","MAPT","NEFH","NEFL","NEFM",
-    "RBFOX3","NEUROD1","NEUROD2","NEUROG1","NEUROG2",
-    "ASCL1","INSM1","POU3F2","SOX2","SOX11",
-    "DLL3","HES6","SRRM4","REST","RCOR2",
-    "EZH2","BRN2","AURKA","MYCN","DLG4",
-    "GRIA2","GRIN1","SCG3","PCSK1","DNER")
+  if (!exists("NEURO_DIFF_SIG"))
+    NEURO_DIFF_SIG <- c(
+      "SYP","SYN1","SNAP25","VAMP2","STX1A",
+      "CHGA","CHGB","ENO2","NCAM1","TUBB3",
+      "MAP2","MAPT","NEFH","NEFL","NEFM",
+      "RBFOX3","NEUROD1","NEUROD2","NEUROG1","NEUROG2",
+      "ASCL1","INSM1","POU3F2","SOX2","SOX11",
+      "DLL3","HES6","SRRM4","REST","RCOR2",
+      "EZH2","BRN2","AURKA","MYCN","DLG4",
+      "GRIA2","GRIN1","SCG3","PCSK1","DNER")
 
-  # === Assemble custom_sigs ===
+  # === Assemble custom_sigs (22 total with estrogen) ===
   custom_sigs <- list(
-    # Original 7
     "CUSTOM_ASPC_SIGNATURE"             = ASPC_SIGNATURE,
     "CUSTOM_NEPC_BELTRAN_UP"            = NEPC_BELTRAN_UP,
     "CUSTOM_NEPC_BELTRAN_DOWN"          = NEPC_BELTRAN_DOWN,
@@ -2006,7 +2069,7 @@ tryCatch({
     "CUSTOM_MDK_SIGNATURE"              = MDK_SIGNATURE,
     "CUSTOM_HALLMARK_ADIPOGENESIS"      = HALLMARK_ADIPOGENESIS_CUSTOM,
     "CUSTOM_HALLMARK_ANDROGEN_RESPONSE" = HALLMARK_AR_SIGNATURE,
-    # Cell death (7)
+    "CUSTOM_ESTROGEN_RESPONSE"          = ESTROGEN_RESPONSE_SIG,
     "CUSTOM_NECROPTOSIS"                = NECROPTOSIS_SIG,
     "CUSTOM_FERROPTOSIS"                = FERROPTOSIS_SIG,
     "CUSTOM_PYROPTOSIS"                 = PYROPTOSIS_SIG,
@@ -2014,12 +2077,10 @@ tryCatch({
     "CUSTOM_APOPTOSIS_INTRINSIC"        = APOPTOSIS_INTRINSIC_SIG,
     "CUSTOM_APOPTOSIS_EXTRINSIC"        = APOPTOSIS_EXTRINSIC_SIG,
     "CUSTOM_AUTOPHAGY"                  = AUTOPHAGY_SIG,
-    # Mitochondrial (4)
     "CUSTOM_MITO_OXPHOS"                = MITO_OXPHOS_SIG,
     "CUSTOM_MITO_DYNAMICS"              = MITO_DYNAMICS_SIG,
     "CUSTOM_MITO_BIOGENESIS"            = MITO_BIOGENESIS_SIG,
     "CUSTOM_MITO_APOPTOSIS"             = MITO_APOPTOSIS_SIG,
-    # Additional biology (3)
     "CUSTOM_SENESCENCE"                 = SENESCENCE_SIG,
     "CUSTOM_LIPID_METABOLISM"           = LIPID_METABOLISM_SIG,
     "CUSTOM_NEURO_DIFFERENTIATION"      = NEURO_DIFF_SIG
@@ -2040,6 +2101,7 @@ tryCatch({
                        "CUSTOM_MDK_SIGNATURE",
                        "CUSTOM_HALLMARK_ADIPOGENESIS",
                        "CUSTOM_HALLMARK_ANDROGEN_RESPONSE"),
+    "Estrogen"     = c("CUSTOM_ESTROGEN_RESPONSE"),
     "Cell_Death"   = c("CUSTOM_NECROPTOSIS",
                        "CUSTOM_FERROPTOSIS",
                        "CUSTOM_PYROPTOSIS",
@@ -2114,784 +2176,936 @@ tryCatch({
   invisible(gc())
 
   # ================================================================
-  # Phase 1: Compute distances
+  # CORE HELPER FUNCTIONS
   # ================================================================
-  cat("\n  Phase 1: Distances...\n")
-  samples_with_dist <- character(0)
-  all_distances <- list()
 
-  for (sn in valid_samples) {
-    obj <- load_sample(sn)
-    if (is.null(obj)) next
-    md <- obj@meta.data
-    if (!"dist_to_interface" %in% colnames(md)) {
-      iface_idx <- which(md$interface_zone == "Interface")
-      if (length(iface_idx) == 0) {
-        rm(obj); invisible(gc()); next
-      }
-      coords <- as.matrix(md[, c("row", "col")])
-      ic <- coords[iface_idx, , drop = FALSE]
-      ns <- nrow(coords); dti <- numeric(ns)
-      for (ci in seq(1, ns, by = 1000)) {
-        ce <- min(ci + 999, ns)
-        ch <- coords[ci:ce, , drop = FALSE]
-        if (nrow(ic) <= 5000) {
-          rd <- outer(ch[,1], ic[,1], "-")
-          cd <- outer(ch[,2], ic[,2], "-")
-          dti[ci:ce] <- apply(sqrt(rd^2+cd^2), 1, min)
-          rm(rd, cd)
-        } else {
-          for (j in seq_len(nrow(ch))) {
-            dd <- sweep(ic, 2, ch[j,])
-            dti[ci+j-1] <- min(sqrt(rowSums(dd^2)))
-          }
-        }
-      }
-      dti[iface_idx] <- 0
-      obj$dist_to_interface <- dti
-      saveRDS(obj, file.path(rds_dir, paste0(sn, ".rds")))
-      cat(paste0("    ", sn, ": computed (",
-                 sum(dti==0), " iface)\n"))
-      rm(coords, ic)
-    } else {
-      cat(paste0("    ", sn, ": present\n"))
-    }
-    cn <- extract_condition(sn)
-    if (is.null(all_distances[[cn]]))
-      all_distances[[cn]] <- numeric(0)
-    all_distances[[cn]] <- c(all_distances[[cn]],
-                              obj$dist_to_interface)
-    samples_with_dist <- c(samples_with_dist, sn)
-    rm(obj); invisible(gc())
-  }
-  cat(paste0("  With dist: ",length(samples_with_dist),"\n"))
-  if (length(samples_with_dist) == 0)
-    stop("No samples with distance data")
-
-  # Adaptive bins
-  cat("\n  Adaptive bins:\n")
-  cond_bin_info <- list()
-  for (cn in names(all_distances)) {
-    d <- all_distances[[cn]]; d_ni <- d[d > 0]
-    if (length(d_ni)==0) { cond_bin_info[[cn]] <- NULL; next }
-    d_max <- max(d_ni); d_med <- median(d_ni)
-    d_q75 <- quantile(d_ni, 0.75)
-    cb <- sort(unique(c(0, 1.5, 3, d_q75, d_max)))
-    fb <- cb[1]
-    for (i in 2:length(cb))
-      if (cb[i]-fb[length(fb)] >= 0.3) fb <- c(fb, cb[i])
-    if (length(fb)<3) fb <- sort(unique(c(0, d_med, d_max)))
-    if (length(fb)<3) fb <- c(0, d_max)
-    bl <- character(length(fb)-1)
-    for (i in seq_along(bl))
-      bl[i] <- paste0("dist_",round(fb[i],1),"_to_",round(fb[i+1],1))
-    cond_bin_info[[cn]] <- list(breaks=fb, labels=bl)
-    cat(paste0("    ",cn,": ",paste(bl,collapse=" | "),"\n"))
-  }
-  rm(all_distances); invisible(gc())
-
-  # Assign bins
-  cat("  Assigning bins...\n")
-  for (sn in samples_with_dist) {
-    obj <- load_sample(sn)
-    if (is.null(obj)) next
-    cn <- extract_condition(sn)
-    bi <- cond_bin_info[[cn]]
-    d <- obj$dist_to_interface
-    res <- rep(NA_character_, length(d))
-    res[d==0] <- "bin_0_interface"
-    if (!is.null(bi) && length(bi$breaks)>=2) {
-      ni <- which(d>0)
-      if (length(ni)>0) {
-        dn <- pmin(d[ni], max(bi$breaks))
-        dn <- pmax(dn, min(bi$breaks[bi$breaks>0]))
-        ct <- cut(dn, breaks=bi$breaks, include.lowest=TRUE,
-                  labels=bi$labels, right=TRUE)
-        res[ni] <- as.character(ct)
-        na_i <- ni[is.na(res[ni])]
-        if (length(na_i)>0) res[na_i] <- bi$labels[length(bi$labels)]
-      }
-    } else res[d>0] <- "bin_noninterface"
-    obj$dist_bin_adaptive <- res
-    saveRDS(obj, file.path(rds_dir, paste0(sn, ".rds")))
-    rm(obj); invisible(gc())
-  }
-
-  cat("\n  Part 1 complete. Source TIER2_Part2.R now.\n")
-
-    # ================================================================
-  # TIER 2 PART 2 — DE + GSEA + Plots + PDFs
-  # Continues the tryCatch from Part 1.
-  # ================================================================
-  cat("\n  Phase 2: Per-condition DE + GSEA...\n")
-  conditions <- unique(sapply(samples_with_dist, extract_condition))
-
-  for (cond in conditions) {
-    cat(paste0("\n  ===== ", cond, " =====\n"))
-    cond_samples <- samples_with_dist[
-      sapply(samples_with_dist, extract_condition) == cond]
-    if (length(cond_samples)==0) next
-
-    bi <- cond_bin_info[[cond]]
-    if (is.null(bi)) { cat("    No bins\n"); next }
-    abl <- c("bin_0_interface", bi$labels)
-    dbin <- bi$labels[length(bi$labels)]
-    cat(paste0("    DE: bin_0_interface vs ", dbin, "\n"))
-
-    # --- Pseudo-bulk ---
+  # --- run_zone_de: Pseudo-bulk DE between two zone_5class groups ---
+  # Returns data.frame with gene, log2FC (+ = Interface-enriched),
+  # pvalue, padj, mean_ref, mean_comp, comparison, cscore, sig
+  run_zone_de <- function(cond_samples, zone_ref, zone_comp,
+                          ref_label, comp_label) {
     bel <- list(); sgl <- list(); sok <- character(0)
+
     for (sn in cond_samples) {
       obj <- load_sample(sn)
       if (is.null(obj) ||
-          !"dist_bin_adaptive" %in% colnames(obj@meta.data)) {
+          !"zone_5class" %in% colnames(obj@meta.data)) {
         if (!is.null(obj)) rm(obj); invisible(gc()); next
       }
-      em <- safe_GetAssayData(obj, layer="data")
+      em <- safe_GetAssayData(obj, layer = "data")
       if (is.null(em)) { rm(obj); invisible(gc()); next }
       sgl[[sn]] <- rownames(em); hd <- FALSE
-      for (bn in abl) {
-        cc <- colnames(obj)[!is.na(obj$dist_bin_adaptive) &
-                              obj$dist_bin_adaptive==bn]
-        cc <- cc[cc %in% colnames(em)]
-        if (length(cc)==0) next
-        if (is.null(bel[[bn]])) bel[[bn]] <- list()
-        bel[[bn]][[sn]] <- rowMeans(em[,cc,drop=FALSE])
+
+      # Reference zone
+      cc_ref <- colnames(obj)[!is.na(obj$zone_5class) &
+                                obj$zone_5class == zone_ref]
+      cc_ref <- cc_ref[cc_ref %in% colnames(em)]
+      if (length(cc_ref) > 0) {
+        if (is.null(bel[["ref"]])) bel[["ref"]] <- list()
+        bel[["ref"]][[sn]] <- rowMeans(em[, cc_ref, drop = FALSE])
         hd <- TRUE
       }
+
+      # Comparison zone
+      cc_comp <- colnames(obj)[!is.na(obj$zone_5class) &
+                                 obj$zone_5class == zone_comp]
+      cc_comp <- cc_comp[cc_comp %in% colnames(em)]
+      if (length(cc_comp) > 0) {
+        if (is.null(bel[["comp"]])) bel[["comp"]] <- list()
+        bel[["comp"]][[sn]] <- rowMeans(em[, cc_comp, drop = FALSE])
+        hd <- TRUE
+      }
+
       if (hd) sok <- c(sok, sn)
       rm(obj, em); invisible(gc())
     }
-    if (length(sok)==0) next
 
-    ug <- if (length(sgl)>=2) Reduce(intersect, sgl) else sgl[[1]]
-    if (length(ug)<100) { rm(bel,sgl); invisible(gc()); next }
+    if (length(sok) == 0 ||
+        is.null(bel[["ref"]]) || is.null(bel[["comp"]])) {
+      return(NULL)
+    }
+
+    # Universe of common genes
+    ug <- if (length(sgl) >= 2) Reduce(intersect, sgl) else sgl[[1]]
+    if (length(ug) < 100) return(NULL)
 
     col_b <- function(l, g) {
-      if (length(l)==0) return(NULL)
+      if (length(l) == 0) return(NULL)
       m <- do.call(cbind, lapply(l, function(v) v[g]))
-      if (is.matrix(m)) rowMeans(m,na.rm=TRUE) else m
+      if (is.matrix(m)) rowMeans(m, na.rm = TRUE) else m
     }
-    bm <- lapply(bel, function(l) col_b(l, ug))
 
-    b0 <- bm[["bin_0_interface"]]; bf <- bm[[dbin]]
-    if (is.null(bf))
-      for (a in rev(bi$labels))
-        if (!is.null(bm[[a]])) { dbin <- a; bf <- bm[[a]]; break }
-    if (is.null(b0)||is.null(bf)) {
-      rm(bel,bm,sgl); invisible(gc()); next
-    }
-    cg <- intersect(names(b0),names(bf))
+    b_ref  <- col_b(bel[["ref"]], ug)
+    b_comp <- col_b(bel[["comp"]], ug)
+    if (is.null(b_ref) || is.null(b_comp)) return(NULL)
+
+    cg <- intersect(names(b_ref), names(b_comp))
     cg <- cg[!is.na(cg)]
-    if (length(cg)<10) { rm(bel,bm,sgl); invisible(gc()); next }
+    if (length(cg) < 10) return(NULL)
 
-    # --- DE ---
-    de <- tryCatch({
-      fc <- log2((b0[cg]+0.01)/(bf[cg]+0.01))
-      v0L <- list(); vFL <- list()
-      for (sn in sok) {
-        obj <- load_sample(sn)
-        if (is.null(obj) ||
-            !"dist_bin_adaptive" %in% colnames(obj@meta.data)) {
-          if (!is.null(obj)) rm(obj); invisible(gc()); next
-        }
-        em <- safe_GetAssayData(obj,layer="data")
-        if (is.null(em)) { rm(obj); invisible(gc()); next }
-        gh <- intersect(cg,rownames(em))
-        if (length(gh)<10) { rm(obj,em); invisible(gc()); next }
-        c0 <- colnames(obj)[!is.na(obj$dist_bin_adaptive) &
-                              obj$dist_bin_adaptive=="bin_0_interface"]
-        c0 <- c0[c0 %in% colnames(em)]
-        cF <- colnames(obj)[!is.na(obj$dist_bin_adaptive) &
-                              obj$dist_bin_adaptive==dbin]
-        cF <- cF[cF %in% colnames(em)]
-        if (length(c0)>0) {
-          v <- rowMeans(em[gh,c0,drop=FALSE])
-          fv <- setNames(rep(NA_real_,length(cg)),cg)
-          fv[gh] <- v[gh]; v0L[[sn]] <- fv
-        }
-        if (length(cF)>0) {
-          v <- rowMeans(em[gh,cF,drop=FALSE])
-          fv <- setNames(rep(NA_real_,length(cg)),cg)
-          fv[gh] <- v[gh]; vFL[[sn]] <- fv
-        }
-        rm(obj,em); invisible(gc())
+    # log2FC: positive = enriched in Interface (reference)
+    fc <- log2((b_ref[cg] + 0.01) / (b_comp[cg] + 0.01))
+
+    # Per-sample Wilcoxon test
+    v_ref_L <- list(); v_comp_L <- list()
+    for (sn in sok) {
+      obj <- load_sample(sn)
+      if (is.null(obj) ||
+          !"zone_5class" %in% colnames(obj@meta.data)) {
+        if (!is.null(obj)) rm(obj); invisible(gc()); next
       }
-      v0 <- if(length(v0L)>0) do.call(cbind,v0L) else NULL
-      vF <- if(length(vFL)>0) do.call(cbind,vFL) else NULL
-      pv <- sapply(cg, function(g) {
-        a2 <- if(!is.null(v0)){if(is.matrix(v0))as.numeric(v0[g,])
-          else as.numeric(v0[g])} else numeric(0)
-        b2 <- if(!is.null(vF)){if(is.matrix(vF))as.numeric(vF[g,])
-          else as.numeric(vF[g])} else numeric(0)
-        a2 <- a2[!is.na(a2)]; b2 <- b2[!is.na(b2)]
-        if(length(a2)<2||length(b2)<2) return(1)
-        tryCatch(wilcox.test(a2,b2,exact=FALSE)$p.value,
-                 error=function(e)1)
-      })
-      rm(v0L,vFL,v0,vF); invisible(gc())
-      data.frame(gene=cg, log2FC=fc[cg], pvalue=pv,
-                 padj=p.adjust(pv,"BH"),
-                 mean_iface=b0[cg], mean_distal=bf[cg],
-                 stringsAsFactors=FALSE)
-    }, error=function(e) {
-      cat(paste0("    DE error: ",conditionMessage(e),"\n")); NULL
+      em <- safe_GetAssayData(obj, layer = "data")
+      if (is.null(em)) { rm(obj); invisible(gc()); next }
+      gh <- intersect(cg, rownames(em))
+      if (length(gh) < 10) { rm(obj, em); invisible(gc()); next }
+
+      c_ref <- colnames(obj)[!is.na(obj$zone_5class) &
+                                obj$zone_5class == zone_ref]
+      c_ref <- c_ref[c_ref %in% colnames(em)]
+      c_comp <- colnames(obj)[!is.na(obj$zone_5class) &
+                                 obj$zone_5class == zone_comp]
+      c_comp <- c_comp[c_comp %in% colnames(em)]
+
+      if (length(c_ref) > 0) {
+        v <- rowMeans(em[gh, c_ref, drop = FALSE])
+        fv <- setNames(rep(NA_real_, length(cg)), cg)
+        fv[gh] <- v[gh]; v_ref_L[[sn]] <- fv
+      }
+      if (length(c_comp) > 0) {
+        v <- rowMeans(em[gh, c_comp, drop = FALSE])
+        fv <- setNames(rep(NA_real_, length(cg)), cg)
+        fv[gh] <- v[gh]; v_comp_L[[sn]] <- fv
+      }
+      rm(obj, em); invisible(gc())
+    }
+
+    v_ref  <- if (length(v_ref_L) > 0)  do.call(cbind, v_ref_L) else NULL
+    v_comp <- if (length(v_comp_L) > 0) do.call(cbind, v_comp_L) else NULL
+
+    pv <- sapply(cg, function(g) {
+      a2 <- if (!is.null(v_ref)) {
+        if (is.matrix(v_ref)) as.numeric(v_ref[g, ])
+        else as.numeric(v_ref[g])
+      } else numeric(0)
+      b2 <- if (!is.null(v_comp)) {
+        if (is.matrix(v_comp)) as.numeric(v_comp[g, ])
+        else as.numeric(v_comp[g])
+      } else numeric(0)
+      a2 <- a2[!is.na(a2)]; b2 <- b2[!is.na(b2)]
+      if (length(a2) < 2 || length(b2) < 2) return(1)
+      tryCatch(wilcox.test(a2, b2, exact = FALSE)$p.value,
+               error = function(e) 1)
     })
 
-    if (is.null(de)||nrow(de)==0) {
-      rm(bel,bm,sgl); invisible(gc()); next
-    }
-    de$cscore <- -log10(de$padj+1e-300)*abs(de$log2FC)
-    de$sig <- !is.na(de$padj) & de$padj<0.05 & abs(de$log2FC)>0.5
-    de <- de[order(de$cscore,decreasing=TRUE),]
-    tryCatch(write.csv(de,
-      file.path(tier2_dir,paste0(cond,"_DE_interface_vs_distal.csv")),
-      row.names=FALSE), error=function(e) NULL)
-    nsig <- sum(de$sig,na.rm=TRUE)
-    cat(paste0("    DE: ",nrow(de)," genes, ",nsig," sig\n"))
-    sgr <- de[de$sig,]
-    t15 <- head(sgr$gene,15)
-    t50 <- head(sgr$gene,50)
-    if(length(t50)<50)
-      t50 <- c(t50,head(setdiff(de$gene,t50),50-length(t50)))
-    t10 <- head(if(nrow(sgr)>=10) sgr$gene else de$gene, 10)
+    rm(v_ref_L, v_comp_L, v_ref, v_comp); invisible(gc())
 
-    # ================================================================
-    # fgsea — all collections
-    # ================================================================
-    cat("    fgsea...\n")
-    fres <- NULL
-    if (have_fgsea && length(gene_set_list)>0) {
-      rnk <- setNames(de$log2FC, de$gene)
-      rnk <- sort(rnk[!is.na(rnk)&is.finite(rnk)], decreasing=TRUE)
-      gsf <- lapply(gene_set_list, function(gs)
-        intersect(gs,names(rnk)))
-      gsf <- gsf[sapply(gsf,length)>=5]
-      cat(paste0("      Sets >=5: ",length(gsf),"\n"))
-      if (length(gsf)>0) {
-        fres <- tryCatch(
-          fgsea(pathways=gsf, stats=rnk,
-                minSize=5, maxSize=500, nPermSimple=10000),
-          error=function(e) {
-            cat(paste0("      fgsea error: ",
-                       conditionMessage(e),"\n")); NULL })
-        if (!is.null(fres) && nrow(fres)>0) {
-          fres <- fres[order(fres$pval),]
-          fres$source <- gs_source[fres$pathway]
-          fres$source[is.na(fres$source)] <- "OTHER"
-          fsv <- as.data.frame(fres)
-          fsv$leadingEdge <- vapply(fsv$leadingEdge,
-            function(x) paste(head(x,50),collapse=";"),
-            character(1))
-          tryCatch(write.csv(
-            fsv[!is.na(fsv$padj)&fsv$padj<0.25,],
-            file.path(tier2_dir,
-                      paste0(cond,"_fgsea_all_padj025.csv")),
-            row.names=FALSE), error=function(e) NULL)
-          for (src in unique(fsv$source)) {
-            sr <- fsv[fsv$source==src &
-                        !is.na(fsv$padj) & fsv$padj<0.25,]
-            if(nrow(sr)>0) tryCatch(write.csv(sr,
-              file.path(tier2_dir,
-                        paste0(cond,"_fgsea_",src,".csv")),
-              row.names=FALSE), error=function(e) NULL)
-          }
-          cat("      Per source:\n")
-          for (src in c("CUSTOM","HALLMARK","C2_CP","C5_GO",
-                        "C6_ONCO","C7_IMMUNO")) {
-            nt <- sum(fres$source==src,na.rm=TRUE)
-            ns2 <- sum(fres$source==src & !is.na(fres$padj) &
-                         fres$padj<0.05, na.rm=TRUE)
-            if(nt>0) cat(paste0("        ",src,": ",nt,
-                                " tested, ",ns2," sig\n"))
-          }
-          rm(fsv)
-        }
-      }
-      rm(rnk,gsf); invisible(gc())
-    }
+    de <- data.frame(
+      gene       = cg,
+      log2FC     = fc[cg],
+      pvalue     = pv,
+      padj       = p.adjust(pv, "BH"),
+      mean_ref   = b_ref[cg],
+      mean_comp  = b_comp[cg],
+      comparison = paste0(ref_label, "_vs_", comp_label),
+      stringsAsFactors = FALSE
+    )
+    de$cscore <- -log10(de$padj + 1e-300) * abs(de$log2FC)
+    de$sig    <- !is.na(de$padj) & de$padj < 0.05 & abs(de$log2FC) > 0.5
+    de <- de[order(de$cscore, decreasing = TRUE), ]
+    return(de)
+  }
 
-    # ================================================================
-    # Custom enrichment (Fisher + NES)
-    # ================================================================
-    cat("    Custom enrichment...\n")
+  # --- run_fgsea_on_de: Run fgsea on a DE result ---
+  run_fgsea_on_de <- function(de, gene_set_list, gs_source) {
+    if (!have_fgsea || is.null(de) || nrow(de) == 0) return(NULL)
+    rnk <- setNames(de$log2FC, de$gene)
+    rnk <- sort(rnk[!is.na(rnk) & is.finite(rnk)], decreasing = TRUE)
+    gsf <- lapply(gene_set_list, function(gs)
+      intersect(gs, names(rnk)))
+    gsf <- gsf[sapply(gsf, length) >= 5]
+    if (length(gsf) == 0) return(NULL)
+    fres <- tryCatch(
+      fgsea(pathways = gsf, stats = rnk,
+            minSize = 5, maxSize = 500, nPermSimple = 10000),
+      error = function(e) NULL)
+    if (!is.null(fres) && nrow(fres) > 0) {
+      fres <- fres[order(fres$pval), ]
+      fres$source <- gs_source[fres$pathway]
+      fres$source[is.na(fres$source)] <- "OTHER"
+    }
+    return(fres)
+  }
+
+  # --- compute_custom_enrichment: Fisher + NES table for custom sigs ---
+  compute_custom_enrichment <- function(de, custom_sigs, fres,
+                                         cond, comp_label) {
+    sgr <- de[de$sig, ]
     ce_rows <- lapply(names(custom_sigs), function(sn) {
       sg <- custom_sigs[[sn]]
-      it <- intersect(sg,de$gene)
+      it <- intersect(sg, de$gene)
       di <- sgr$gene[sgr$gene %in% sg]
-      up <- di[sgr$log2FC[match(di,sgr$gene)]>0]
-      dn <- di[sgr$log2FC[match(di,sgr$gene)]<0]
-      a <- length(di); b <- nrow(sgr)-a
-      cc2 <- length(it)-a; dd <- nrow(de)-nrow(sgr)-cc2
+      up <- di[sgr$log2FC[match(di, sgr$gene)] > 0]
+      dn <- di[sgr$log2FC[match(di, sgr$gene)] < 0]
+      a <- length(di); b <- nrow(sgr) - a
+      cc2 <- length(it) - a; dd <- nrow(de) - nrow(sgr) - cc2
       fp <- tryCatch(fisher.test(
-        matrix(c(max(a,0),max(b,0),max(cc2,0),max(dd,0)),nrow=2),
-        alternative="greater")$p.value, error=function(e)NA)
-      mfc <- mean(de$log2FC[de$gene %in% it], na.rm=TRUE)
+        matrix(c(max(a, 0), max(b, 0),
+                 max(cc2, 0), max(dd, 0)), nrow = 2),
+        alternative = "greater")$p.value, error = function(e) NA)
+      mfc <- mean(de$log2FC[de$gene %in% it], na.rm = TRUE)
       nes <- NA_real_; fpa <- NA_real_
       if (!is.null(fres)) {
-        idx <- which(fres$pathway==sn)
-        if (length(idx)>0) {
+        idx <- which(fres$pathway == sn)
+        if (length(idx) > 0) {
           nes <- fres$NES[idx[1]]; fpa <- fres$padj[idx[1]]
         }
       }
-      data.frame(condition=cond, signature=sn,
-                 n_in=length(it), n_sig=a,
-                 n_up=length(up), n_down=length(dn),
-                 fisher_p=fp, mean_FC=mfc,
-                 NES=nes, fgsea_padj=fpa,
-                 stringsAsFactors=FALSE)
+      data.frame(condition = cond, comparison = comp_label,
+                 signature = sn,
+                 n_in = length(it), n_sig = a,
+                 n_up = length(up), n_down = length(dn),
+                 fisher_p = fp, mean_FC = mfc,
+                 NES = nes, fgsea_padj = fpa,
+                 stringsAsFactors = FALSE)
     })
-    cedf <- do.call(rbind, ce_rows)
-    tryCatch(write.csv(cedf,
-      file.path(tier2_dir,paste0(cond,"_custom_enrichment.csv")),
-      row.names=FALSE), error=function(e) NULL)
-    for (i in seq_len(nrow(cedf))) {
-      r <- cedf[i,]
-      cat(paste0("      ",sub("^CUSTOM_","",r$signature),": ",
-                 r$n_sig,"/",r$n_in,
-                 ifelse(!is.na(r$NES),
-                        paste0(" NES=",round(r$NES,2)),""),"\n"))
+    do.call(rbind, ce_rows)
+  }
+
+  # --- make_volcano: Volcano plot — labels top 10 sig gene dots ---
+  make_volcano <- function(de, title_str) {
+    nsig <- sum(de$sig, na.rm = TRUE)
+    # Select top 10 significant genes ranked by combined score
+    sig_genes <- de$gene[de$sig]
+    top10_sig <- head(sig_genes, 10)
+    de$label <- ifelse(de$gene %in% top10_sig, de$gene, "")
+    p <- ggplot(de, aes(x = log2FC, y = -log10(pvalue + 1e-300),
+                        color = sig)) +
+      geom_point(size = 0.8, alpha = 0.6) +
+      scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = "red")) +
+      geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+      geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+      labs(title = title_str,
+           subtitle = paste0(nsig, " sig genes (padj<0.05, |FC|>0.5); top 10 labeled"),
+           x = "log2FC (+ = Interface-enriched)",
+           y = "-log10(p)") +
+      theme_minimal(base_size = 10)
+    if (requireNamespace("ggrepel", quietly = TRUE) &&
+        any(nchar(de$label) > 0))
+      p <- p + ggrepel::geom_text_repel(
+        aes(label = label), size = 2.5,
+        max.overlaps = 20, color = "black",
+        segment.color = "grey50", segment.size = 0.3,
+        min.segment.length = 0)
+    return(p)
+  }
+
+  # --- make_nes_bar: NES bar plot for custom sigs ---
+  make_nes_bar <- function(fres, sig_names, title_str, comp_label) {
+    cf <- as.data.frame(fres[fres$pathway %in% sig_names, ])
+    if (nrow(cf) == 0) return(NULL)
+    cf$pw <- sub("^CUSTOM_", "", cf$pathway)
+    cf$sl <- ifelse(!is.na(cf$padj) & cf$padj < 0.05, "*", "")
+    cf$d  <- ifelse(cf$NES > 0, "Interface", comp_label)
+    ggplot(cf, aes(x = reorder(pw, NES), y = NES, fill = d)) +
+      geom_bar(stat = "identity") + coord_flip() +
+      scale_fill_manual(values = c(Interface = "firebrick",
+                                    setNames("steelblue", comp_label))) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_text(aes(label = sl), hjust = -0.3, size = 5) +
+      labs(title = title_str, subtitle = "* = padj<0.05",
+           x = "", y = "NES (+ = Interface-enriched)", fill = "") +
+      theme_minimal(base_size = 11)
+  }
+
+  # --- make_source_bar: MSigDB source NES bar ---
+  make_source_bar <- function(fres, src, title_str, comp_label) {
+    sf <- as.data.frame(fres[fres$source == src, ])
+    ms <- sf[!is.na(sf$padj) & sf$padj < 0.05, ]
+    if (nrow(ms) == 0) return(NULL)
+    tp <- head(ms[ms$NES > 0, ][order(-ms$NES[ms$NES > 0]), ], 15)
+    tn <- head(ms[ms$NES < 0, ][order(ms$NES[ms$NES < 0]), ], 15)
+    tb <- rbind(tp, tn)
+    if (nrow(tb) == 0) return(NULL)
+    tb$pw <- substring(gsub(
+      paste0("^HALLMARK_|^GOBP_|^GOCC_|^GOMF_|",
+             "^REACTOME_|^KEGG_|^WP_|^PID_|^BIOCARTA_"),
+      "", tb$pathway), 1, 50)
+    tb$d <- ifelse(tb$NES > 0, "Interface", comp_label)
+    ggplot(tb, aes(x = reorder(pw, NES), y = NES, fill = d)) +
+      geom_bar(stat = "identity") + coord_flip() +
+      scale_fill_manual(values = c(Interface = "firebrick",
+                                    setNames("steelblue", comp_label))) +
+      geom_hline(yintercept = 0) +
+      labs(title = title_str,
+           subtitle = paste0(nrow(ms), " sig (padj<0.05)"),
+           x = "", y = "NES") +
+      theme_minimal(base_size = 9) +
+      theme(axis.text.y = element_text(size = 6))
+  }
+
+  # ================================================================
+  # MAIN LOOP: Per condition, run 4 Interface-centric comparisons
+  # ================================================================
+  cat("\n  Phase 2: Per-condition DE + 4 Interface-Centric GSEA...\n")
+  conditions <- unique(sapply(valid_samples, extract_condition))
+
+  # Define the 4 comparisons
+  comparison_defs <- list(
+    list(zone_ref  = "Interface",  zone_comp = "Proximal_NE",
+         ref_label = "Interface",  comp_label = "Proximal_NE",
+         description = "Interface (Active NE Transition) vs Proximal NE (Committed NE)"),
+    list(zone_ref  = "Interface",  zone_comp = "Distal_NE",
+         ref_label = "Interface",  comp_label = "Distal_NE",
+         description = "Interface (Active NE Transition) vs Distal NE (Decaying NE)"),
+    list(zone_ref  = "Interface",  zone_comp = "Epithelial",
+         ref_label = "Interface",  comp_label = "Epithelial",
+         description = "Interface (NE Transition) vs Epithelial (Luminal Cancer)"),
+    list(zone_ref  = "Interface",  zone_comp = "Necrotic_Core",
+         ref_label = "Interface",  comp_label = "Necrotic_Core",
+         description = "Interface (Viable Cells) vs Necrotic Core (Dead Zone)")
+  )
+
+  # Accumulate cross-condition results
+  all_cond_ce  <- list()   # custom enrichment tables
+  all_cond_de  <- list()   # DE result summaries
+
+  for (cond in conditions) {
+    cat(paste0("\n  =============================================\n"))
+    cat(paste0("  ===== ", cond, " =====\n"))
+    cat(paste0("  =============================================\n"))
+
+    cond_samples <- valid_samples[
+      sapply(valid_samples, extract_condition) == cond]
+    if (length(cond_samples) == 0) {
+      cat("    No samples — skipping\n"); next
     }
 
-    # Keyword pathway filter
-    cgp_pro <- NULL
-    if (!is.null(fres)) {
-      tryCatch({
-        kw <- c("PROSTATE","ANDROGEN","NEUROENDOCRINE","NEPC",
-                "BELTRAN","CRPC","CASTRATION","AR_","RB1","TP53",
-                "MYCN","EZH2","SMALL_CELL","NEURAL","NEURO",
-                "EPITHELIAL_MESENCHYMAL","STEM_CELL","PLASTICITY",
-                "ADIPOGEN","MDK","TWEAK","TNFSF12",
-                "NECROP","FERROP","PYROP","CUPROP",
-                "APOPTOS","AUTOPHAGY","MITOCHOND","OXPHOS",
-                "SENESCEN","LIPID","FATTY_ACID","CHOLESTEROL")
-        af <- as.data.frame(fres)
-        hits <- af[grepl(paste(kw,collapse="|"),af$pathway,
-                         ignore.case=TRUE) &
-                     !grepl("^CUSTOM_",af$pathway),]
-        if (nrow(hits)>0) {
-          hits$leadingEdge <- vapply(hits$leadingEdge,
-            function(x) if(is.character(x))
-              paste(head(x,30),collapse=";") else "",
-            character(1))
-          hits <- hits[order(hits$pval),]
-          cgp_pro <- hits
-          tryCatch(write.csv(hits,
-            file.path(tier2_dir,
-                      paste0(cond,"_keyword_pathways.csv")),
-            row.names=FALSE), error=function(e) NULL)
-          cat(paste0("      Keyword pathways: ",nrow(hits),"\n"))
+    # Check zone_5class coverage in this condition
+    zone_counts <- list()
+    for (sn in cond_samples) {
+      obj <- load_sample(sn)
+      if (!is.null(obj) && "zone_5class" %in% colnames(obj@meta.data)) {
+        zt <- table(obj$zone_5class)
+        for (zn in names(zt)) {
+          if (is.null(zone_counts[[zn]])) zone_counts[[zn]] <- 0
+          zone_counts[[zn]] <- zone_counts[[zn]] + as.integer(zt[zn])
         }
-      }, error=function(e) NULL)
+      }
+      rm(obj); invisible(gc())
     }
+    cat(paste0("    Zone counts: ",
+               paste(paste0(names(zone_counts), "=", zone_counts),
+                     collapse = " | "), "\n"))
 
-    # ================================================================
-    # PLOTS
-    # ================================================================
+    # Accumulators for this condition across all 4 comparisons
+    cond_de_results    <- list()
+    cond_fgsea_results <- list()
+    cond_ce_results    <- list()
+    cond_volcano_plots <- list()
+    cond_nes_plots     <- list()
+    cond_src_plots     <- list()
+    cond_fcurves       <- list()
 
-    # Volcano
-    de$label <- ifelse(de$gene %in% t15, de$gene, "")
-    p_vol <- ggplot(de, aes(x=log2FC,y=-log10(pvalue+1e-300),
-                            color=sig)) +
-      geom_point(size=0.8,alpha=0.6) +
-      scale_color_manual(values=c("FALSE"="grey60","TRUE"="red")) +
-      geom_vline(xintercept=c(-0.5,0.5),linetype="dashed") +
-      geom_hline(yintercept=-log10(0.05),linetype="dashed") +
-      labs(title=paste0(cond," — Interface vs Distal"),
-           subtitle=paste0(nsig," sig"),
-           x="log2FC",y="-log10(p)") +
-      theme_minimal(base_size=10)
-    if (requireNamespace("ggrepel",quietly=TRUE) &&
-        any(nchar(de$label)>0))
-      p_vol <- p_vol + ggrepel::geom_text_repel(
-        aes(label=label),size=2.5,max.overlaps=20,color="black")
+    for (comp in comparison_defs) {
+      cat(paste0("\n    --- ", comp$description, " ---\n"))
 
-    # Heatmap
-    tryCatch({
-      hc <- list()
-      for (bn in abl) {
-        v <- bm[[bn]]
-        if (is.null(v))
-          hc[[bn]] <- setNames(rep(NA_real_,length(t50)),t50)
-        else {
-          vv <- setNames(rep(NA_real_,length(t50)),t50)
-          m <- t50[t50 %in% names(v)]; vv[m] <- v[m]
-          hc[[bn]] <- vv
+      comp_tag <- paste0(comp$ref_label, "_vs_", comp$comp_label)
+
+      # Check that both zones have spots
+      n_ref  <- ifelse(comp$zone_ref %in% names(zone_counts),
+                       zone_counts[[comp$zone_ref]], 0)
+      n_comp <- ifelse(comp$zone_comp %in% names(zone_counts),
+                       zone_counts[[comp$zone_comp]], 0)
+      if (n_ref == 0 || n_comp == 0) {
+        cat(paste0("      Skipping: ", comp$zone_ref, "=", n_ref,
+                   " ", comp$zone_comp, "=", n_comp, " spots\n"))
+        next
+      }
+
+      # ---- DE ----
+      de <- tryCatch(
+        run_zone_de(cond_samples,
+                    comp$zone_ref, comp$zone_comp,
+                    comp$ref_label, comp$comp_label),
+        error = function(e) {
+          cat(paste0("      DE error: ", conditionMessage(e), "\n"))
+          NULL
+        })
+
+      if (is.null(de) || nrow(de) == 0) {
+        cat("      No DE results — skipping\n"); next
+      }
+
+      nsig <- sum(de$sig, na.rm = TRUE)
+      cat(paste0("      DE: ", nrow(de), " genes, ", nsig, " sig\n"))
+
+      # Save DE CSV
+      tryCatch(write.csv(de,
+        file.path(tier2_dir,
+                  paste0(cond, "_DE_", comp_tag, ".csv")),
+        row.names = FALSE), error = function(e) NULL)
+
+      cond_de_results[[comp_tag]] <- de
+      all_cond_de[[paste0(cond, "__", comp_tag)]] <- data.frame(
+        condition = cond, comparison = comp_tag,
+        n_genes = nrow(de), n_sig = nsig,
+        stringsAsFactors = FALSE)
+
+      # ---- fgsea ----
+      cat("      fgsea...\n")
+      fres <- run_fgsea_on_de(de, gene_set_list, gs_source)
+
+      if (!is.null(fres) && nrow(fres) > 0) {
+        cond_fgsea_results[[comp_tag]] <- fres
+
+        # Save full results
+        fsv <- as.data.frame(fres)
+        fsv$leadingEdge <- vapply(fsv$leadingEdge,
+          function(x) paste(head(x, 50), collapse = ";"),
+          character(1))
+        tryCatch(write.csv(
+          fsv[!is.na(fsv$padj) & fsv$padj < 0.25, ],
+          file.path(tier2_dir,
+                    paste0(cond, "_fgsea_", comp_tag, "_padj025.csv")),
+          row.names = FALSE), error = function(e) NULL)
+
+        # Per-source CSVs
+        for (src in unique(fsv$source)) {
+          sr <- fsv[fsv$source == src &
+                      !is.na(fsv$padj) & fsv$padj < 0.25, ]
+          if (nrow(sr) > 0)
+            tryCatch(write.csv(sr,
+              file.path(tier2_dir,
+                        paste0(cond, "_fgsea_", comp_tag, "_", src, ".csv")),
+              row.names = FALSE), error = function(e) NULL)
         }
-      }
-      hm <- do.call(cbind,hc); colnames(hm) <- names(hc)
-      rownames(hm) <- t50
-      gr2 <- apply(hm,1,function(r)!all(is.na(r)))
-      gc2 <- apply(hm,2,function(c2)!all(is.na(c2)))
-      hm <- hm[gr2,gc2,drop=FALSE]
-      if (nrow(hm)>=2 && ncol(hm)>=2) {
-        hm[is.na(hm)] <- 0
-        pdf(file.path(tier2_dir,paste0(cond,"_heatmap_top50.pdf")),
-            width=10,height=max(8,nrow(hm)*0.2))
-        if (have_pheatmap)
-          pheatmap(hm,cluster_cols=FALSE,scale="row",
-                   main=paste0(cond," — Top 50 DE"),
-                   fontsize_row=6,fontsize_col=8)
-        else heatmap(hm,Colv=NA,scale="row")
-        dev.off()
-      }
-    }, error=function(e) tryCatch(dev.off(),error=function(e2)NULL))
 
-    # Gradient
-    p_grad <- NULL
-    tryCatch({
-      gl <- list()
-      for (bn in abl) {
-        v <- bm[[bn]]; if(is.null(v)) next
-        for (gg in t10) if(gg %in% names(v))
-          gl[[length(gl)+1]] <- data.frame(
-            gene=gg,bin=bn,expr=v[gg],stringsAsFactors=FALSE)
+        # Report per source
+        cat("      Per source:\n")
+        for (src in c("CUSTOM", "HALLMARK", "C2_CP", "C5_GO",
+                      "C6_ONCO", "C7_IMMUNO")) {
+          nt <- sum(fres$source == src, na.rm = TRUE)
+          ns2 <- sum(fres$source == src & !is.na(fres$padj) &
+                       fres$padj < 0.05, na.rm = TRUE)
+          if (nt > 0) cat(paste0("        ", src, ": ",
+                                  nt, " tested, ", ns2, " sig\n"))
+        }
+        rm(fsv)
       }
-      if (length(gl)>0) {
-        gd <- do.call(rbind,gl)
-        gd$bin <- factor(gd$bin,levels=abl)
-        p_grad <- ggplot(gd,aes(x=bin,y=expr,
-                                color=gene,group=gene))+
-          geom_line(linewidth=0.8)+geom_point(size=2)+
-          labs(title=paste0(cond," — Top 10 Gradient"),
-               x="Bin",y="Expr")+
-          theme_minimal(base_size=10)+
-          theme(axis.text.x=element_text(angle=45,hjust=1))
-      }
-    }, error=function(e) NULL)
 
-    # Combined score bar
-    p_cs <- NULL
-    tryCatch({
-      cd <- head(de[de$cscore>0,],40)
-      if(nrow(cd)>0) {
-        cd$gene <- factor(cd$gene,levels=rev(cd$gene))
-        cd$dir <- ifelse(cd$log2FC>0,"Up","Down")
-        p_cs <- ggplot(cd,aes(x=gene,y=cscore,fill=dir))+
-          geom_bar(stat="identity")+coord_flip()+
-          scale_fill_manual(values=c(Up="firebrick",
-                                     Down="steelblue"))+
-          labs(title=paste0(cond," — Top 40 Score"),
-               x="",y="Score")+
-          theme_minimal(base_size=10)+
-          theme(axis.text.y=element_text(size=7))
-      }
-    }, error=function(e) NULL)
+      # ---- Custom enrichment ----
+      cat("      Custom enrichment...\n")
+      cedf <- compute_custom_enrichment(de, custom_sigs, fres,
+                                         cond, comp_tag)
+      cond_ce_results[[comp_tag]] <- cedf
+      all_cond_ce[[paste0(cond, "__", comp_tag)]] <- cedf
 
-    # --- NES bars per custom group ---
-    grp_nes_plots <- list()
-    tryCatch({
-      if (!is.null(fres)) {
+      tryCatch(write.csv(cedf,
+        file.path(tier2_dir,
+                  paste0(cond, "_custom_enrichment_", comp_tag, ".csv")),
+        row.names = FALSE), error = function(e) NULL)
+
+      for (i in seq_len(nrow(cedf))) {
+        r <- cedf[i, ]
+        cat(paste0("      ", sub("^CUSTOM_", "", r$signature), ": ",
+                   r$n_sig, "/", r$n_in,
+                   ifelse(!is.na(r$NES),
+                          paste0(" NES=", round(r$NES, 2)), ""), "\n"))
+      }
+
+      # ---- Generate plots ----
+
+      # Volcano — top 10 sig genes labeled
+      cond_volcano_plots[[comp_tag]] <- make_volcano(
+        de, paste0(cond, " — ", comp_tag))
+
+      # NES bars per custom group
+      if (!is.null(fres) && nrow(fres) > 0) {
         for (grp in names(custom_groups)) {
           gn <- custom_groups[[grp]]
-          cf <- as.data.frame(fres[fres$pathway %in% gn,])
-          if (nrow(cf)==0) next
-          cf$pw <- sub("^CUSTOM_","",cf$pathway)
-          cf$sl <- ifelse(!is.na(cf$padj)&cf$padj<0.05,"*","")
-          cf$d <- ifelse(cf$NES>0,"Interface","Distal")
-          grp_nes_plots[[grp]] <- ggplot(
-            cf, aes(x=reorder(pw,NES),y=NES,fill=d))+
-            geom_bar(stat="identity")+coord_flip()+
-            scale_fill_manual(values=c(Interface="firebrick",
-                                       Distal="steelblue"))+
-            geom_hline(yintercept=0,linetype="dashed")+
-            geom_text(aes(label=sl),hjust=-0.3,size=5)+
-            labs(title=paste0(cond," — ",grp," NES"),
-                 subtitle="*=padj<0.05",
-                 x="",y="NES",fill="")+
-            theme_minimal(base_size=11)
+          p_nes <- make_nes_bar(fres, gn,
+                                paste0(cond, " — ", grp, " NES (",
+                                       comp_tag, ")"),
+                                comp$comp_label)
+          if (!is.null(p_nes))
+            cond_nes_plots[[paste0(comp_tag, "__", grp)]] <- p_nes
         }
-      }
-    }, error=function(e) NULL)
 
-    # Enrichment count bar (all 21 sigs)
-    p_ebar <- NULL
-    tryCatch({
-      el <- data.frame(
-        sig=rep(sub("^CUSTOM_","",cedf$signature),2),
-        dir=rep(c("Up","Down"),each=nrow(cedf)),
-        n=c(cedf$n_up,cedf$n_down),stringsAsFactors=FALSE)
-      p_ebar <- ggplot(el,aes(x=sig,y=n,fill=dir))+
-        geom_bar(stat="identity",position="dodge")+
-        scale_fill_manual(values=c(Up="firebrick",
-                                   Down="steelblue"))+
-        labs(title=paste0(cond," — DE per Signature"),
-             x="",y="Count")+
-        theme_minimal(base_size=8)+
-        theme(axis.text.x=element_text(angle=70,hjust=1))
-    }, error=function(e) NULL)
-
-    # --- Per-source MSigDB pathway bars ---
-    src_plots <- list()
-    for (src in c("HALLMARK","C2_CP","C5_GO",
-                  "C6_ONCO","C7_IMMUNO")) {
-      tryCatch({
-        if (!is.null(fres)) {
-          sf <- as.data.frame(fres[fres$source==src,])
-          ms <- sf[!is.na(sf$padj)&sf$padj<0.05,]
-          if (nrow(ms)>0) {
-            tp <- head(ms[ms$NES>0,][
-              order(-ms$NES[ms$NES>0]),],15)
-            tn <- head(ms[ms$NES<0,][
-              order(ms$NES[ms$NES<0]),],15)
-            tb <- rbind(tp,tn)
-            if (nrow(tb)>0) {
-              tb$pw <- substring(gsub(
-                paste0("^HALLMARK_|^GOBP_|^GOCC_|^GOMF_|",
-                       "^REACTOME_|^KEGG_|^WP_|^PID_|^BIOCARTA_"),
-                "",tb$pathway),1,50)
-              tb$d <- ifelse(tb$NES>0,"Interface","Distal")
-              src_plots[[src]] <- ggplot(
-                tb,aes(x=reorder(pw,NES),y=NES,fill=d))+
-                geom_bar(stat="identity")+coord_flip()+
-                scale_fill_manual(
-                  values=c(Interface="firebrick",
-                           Distal="steelblue"))+
-                geom_hline(yintercept=0)+
-                labs(title=paste0(cond," — ",src," (padj<0.05)"),
-                     subtitle=paste0(nrow(ms)," sig"),
-                     x="",y="NES")+
-                theme_minimal(base_size=9)+
-                theme(axis.text.y=element_text(size=6))
-            }
-          }
+        # Source bars
+        for (src in c("HALLMARK", "C2_CP", "C5_GO",
+                      "C6_ONCO", "C7_IMMUNO")) {
+          p_src <- make_source_bar(fres, src,
+                                    paste0(cond, " — ", src,
+                                           " (", comp_tag, ")"),
+                                    comp$comp_label)
+          if (!is.null(p_src))
+            cond_src_plots[[paste0(comp_tag, "__", src)]] <- p_src
         }
-      }, error=function(e) NULL)
-    }
 
-    # Keyword pathway bar
-    p_cgp <- NULL
-    tryCatch({
-      if (!is.null(cgp_pro) && nrow(cgp_pro)>0) {
-        ct <- head(cgp_pro,30)
-        ct$pw <- substring(ct$pathway,1,50)
-        ct$d <- ifelse(ct$NES>0,"Interface","Distal")
-        p_cgp <- ggplot(ct,aes(x=reorder(pw,NES),y=NES,fill=d))+
-          geom_bar(stat="identity")+coord_flip()+
-          scale_fill_manual(values=c(Interface="firebrick",
-                                     Distal="steelblue"))+
-          labs(title=paste0(cond," — Keyword Pathways"),
-               x="",y="NES")+
-          theme_minimal(base_size=9)+
-          theme(axis.text.y=element_text(size=6))
+        # fgsea enrichment curves for custom sigs
+        rk <- setNames(de$log2FC, de$gene)
+        rk <- sort(rk[!is.na(rk) & is.finite(rk)], decreasing = TRUE)
+        for (sn2 in names(custom_sigs)) {
+          tryCatch({
+            gg <- intersect(custom_sigs[[sn2]], names(rk))
+            if (length(gg) >= 5)
+              cond_fcurves[[paste0(comp_tag, "__", sn2)]] <-
+                plotEnrichment(gg, rk) +
+                labs(title = paste0(cond, " — ",
+                                    sub("^CUSTOM_", "", sn2),
+                                    " (", comp_tag, ")"))
+          }, error = function(e) NULL)
+        }
+        rm(rk)
       }
-    }, error=function(e) NULL)
 
-    # fgsea enrichment curves (all 21 custom sigs)
-    fcurves <- list()
-    if (have_fgsea && !is.null(fres)) {
-      rk <- setNames(de$log2FC, de$gene)
-      rk <- sort(rk[!is.na(rk)&is.finite(rk)], decreasing=TRUE)
-      for (sn2 in names(custom_sigs)) {
-        tryCatch({
-          gg <- intersect(custom_sigs[[sn2]], names(rk))
-          if (length(gg)>=5)
-            fcurves[[sn2]] <- plotEnrichment(gg,rk) +
-              labs(title=paste0(cond," — ",
-                                sub("^CUSTOM_","",sn2)))
-        }, error=function(e) NULL)
-      }
-      rm(rk)
-    }
+      rm(fres); invisible(gc())
+
+    }  # end for (comp in comparison_defs)
 
     # ================================================================
-    # Summary PDF
+    # COMBINED COMPARISON PLOTS
     # ================================================================
+
+    # --- Combined NES heatmap across all 4 comparisons ---
+    cat("\n    Generating combined comparison plots...\n")
+
+    combined_ce <- do.call(rbind, cond_ce_results)
+    if (!is.null(combined_ce) && nrow(combined_ce) > 0) {
+      tryCatch(write.csv(combined_ce,
+        file.path(tier2_dir,
+                  paste0(cond, "_custom_enrichment_ALL_comparisons.csv")),
+        row.names = FALSE), error = function(e) NULL)
+    }
+
+    p_nes_heatmap <- NULL
+    tryCatch({
+      if (!is.null(combined_ce) && nrow(combined_ce) > 0 &&
+          any(!is.na(combined_ce$NES))) {
+        nes_wide <- combined_ce[, c("signature", "comparison", "NES")]
+        nes_wide$sig_short <- sub("^CUSTOM_", "", nes_wide$signature)
+        nes_mat <- tidyr::pivot_wider(
+          nes_wide, id_cols = sig_short,
+          names_from = comparison, values_from = NES)
+        nes_m <- as.matrix(nes_mat[, -1])
+        rownames(nes_m) <- nes_mat$sig_short
+        nes_m[is.na(nes_m)] <- 0
+
+        if (nrow(nes_m) >= 2 && ncol(nes_m) >= 2 &&
+            requireNamespace("pheatmap", quietly = TRUE)) {
+          p_nes_heatmap <- "exists"  # flag for PDF generation
+        }
+      }
+    }, error = function(e) NULL)
+
+    # --- Combined enrichment count bar ---
+    p_combined_ebar <- NULL
+    tryCatch({
+      if (!is.null(combined_ce) && nrow(combined_ce) > 0) {
+        ce_plot <- combined_ce
+        ce_plot$sig_short <- sub("^CUSTOM_", "", ce_plot$signature)
+        ce_plot$comp_short <- sub("^Interface_vs_", "", ce_plot$comparison)
+        el <- data.frame(
+          sig  = rep(ce_plot$sig_short, 2),
+          comp = rep(ce_plot$comp_short, 2),
+          dir  = rep(c("Up_in_Interface", "Up_in_Comparison"),
+                     each = nrow(ce_plot)),
+          n    = c(ce_plot$n_up, ce_plot$n_down),
+          stringsAsFactors = FALSE)
+        p_combined_ebar <- ggplot(el,
+          aes(x = sig, y = n, fill = dir)) +
+          geom_bar(stat = "identity", position = "dodge") +
+          scale_fill_manual(values = c(Up_in_Interface = "firebrick",
+                                        Up_in_Comparison = "steelblue")) +
+          facet_wrap(~ comp, ncol = 2) +
+          labs(title = paste0(cond,
+                              " — DE Gene Counts per Signature (All 4 Comparisons)"),
+               x = "", y = "Count", fill = "") +
+          theme_minimal(base_size = 8) +
+          theme(axis.text.x = element_text(angle = 70, hjust = 1))
+      }
+    }, error = function(e) NULL)
+
+    # ================================================================
+    # SUMMARY PDF — All 4 comparisons combined
+    # ================================================================
+    cat("    Generating summary PDF...\n")
     tryCatch({
       pdf(file.path(tier2_dir,
-                    paste0(cond,"_TIER2_summary.pdf")),
-          width=11,height=8.5)
+                    paste0(cond, "_TIER2_5zone_summary.pdf")),
+          width = 12, height = 9)
 
-      # Distance histogram
+      # --- Page: Zone count summary ---
       tryCatch({
-        dv <- list()
-        for (sn in cond_samples) {
-          obj <- load_sample(sn)
-          if (is.null(obj) ||
-              !"dist_to_interface" %in% colnames(obj@meta.data)) {
-            if (!is.null(obj)) rm(obj); invisible(gc()); next
+        zc_df <- data.frame(
+          zone = names(zone_counts),
+          count = as.integer(zone_counts),
+          stringsAsFactors = FALSE)
+        zc_df$zone <- factor(zc_df$zone,
+                              levels = c("Interface", "Proximal_NE",
+                                         "Distal_NE", "Epithelial",
+                                         "Necrotic_Core"))
+        zone5_colors <- c(
+          Interface = "#E31A1C", Proximal_NE = "#FF7F00",
+          Distal_NE = "#FDBF6F", Epithelial = "#33A02C",
+          Necrotic_Core = "#6A3D9A")
+        print(ggplot(zc_df, aes(x = zone, y = count, fill = zone)) +
+          geom_bar(stat = "identity") +
+          scale_fill_manual(values = zone5_colors) +
+          geom_text(aes(label = count), vjust = -0.3, size = 4) +
+          labs(title = paste0(cond, " — Spot Counts by 5-Zone"),
+               subtitle = paste0(length(cond_samples), " samples"),
+               x = "Zone", y = "Spot Count") +
+          theme_minimal(base_size = 12) +
+          theme(legend.position = "none"))
+      }, error = function(e) NULL)
+
+      # --- Volcanoes for all 4 comparisons (top 10 sig genes labeled) ---
+      for (ct in names(cond_volcano_plots))
+        print(cond_volcano_plots[[ct]])
+
+      # --- MA plots with top 10 sig gene labels ---
+      for (ct in names(cond_de_results)) {
+        tryCatch({
+          de <- cond_de_results[[ct]]
+          de$me <- (de$mean_ref + de$mean_comp) / 2
+          # Top 10 significant genes by combined score for MA label
+          sig_genes_ma <- de$gene[de$sig]
+          top10_ma <- head(sig_genes_ma, 10)
+          de$ma_label <- ifelse(de$gene %in% top10_ma, de$gene, "")
+          p_ma <- ggplot(de, aes(x = log10(me + 0.01), y = log2FC,
+                               color = sig)) +
+            geom_point(size = 0.6, alpha = 0.5) +
+            scale_color_manual(values = c("FALSE" = "grey60",
+                                          "TRUE" = "red")) +
+            geom_hline(yintercept = c(-0.5, 0.5), linetype = "dashed") +
+            labs(title = paste0(cond, " — MA Plot (", ct, ")"),
+                 subtitle = "Top 10 sig genes labeled",
+                 x = "log10(Mean Expr)", y = "log2FC") +
+            theme_minimal(base_size = 10)
+          if (requireNamespace("ggrepel", quietly = TRUE) &&
+              any(nchar(de$ma_label) > 0))
+            p_ma <- p_ma + ggrepel::geom_text_repel(
+              aes(label = ma_label), size = 2.5,
+              max.overlaps = 20, color = "black",
+              segment.color = "grey50", segment.size = 0.3,
+              min.segment.length = 0)
+          print(p_ma)
+        }, error = function(e) NULL)
+      }
+
+      # --- Combined score bars ---
+      for (ct in names(cond_de_results)) {
+        tryCatch({
+          de <- cond_de_results[[ct]]
+          cd <- head(de[de$cscore > 0, ], 40)
+          if (nrow(cd) > 0) {
+            cd$gene <- factor(cd$gene, levels = rev(cd$gene))
+            cd$dir <- ifelse(cd$log2FC > 0, "Interface", "Comparison")
+            print(ggplot(cd, aes(x = gene, y = cscore, fill = dir)) +
+              geom_bar(stat = "identity") + coord_flip() +
+              scale_fill_manual(values = c(Interface = "firebrick",
+                                            Comparison = "steelblue")) +
+              labs(title = paste0(cond, " — Top 40 Score (", ct, ")"),
+                   x = "", y = "Combined Score") +
+              theme_minimal(base_size = 10) +
+              theme(axis.text.y = element_text(size = 7)))
           }
-          dv[[sn]] <- data.frame(d=obj$dist_to_interface,
-                                 stringsAsFactors=FALSE)
-          rm(obj); invisible(gc())
-        }
-        if (length(dv)>0) {
-          dd <- do.call(rbind,dv)
-          print(ggplot(dd,aes(x=d))+
-                  geom_histogram(bins=50,fill="steelblue",
-                                 color="white")+
-                  geom_vline(xintercept=bi$breaks,
-                             linetype="dashed",color="red")+
-                  labs(title=paste0(cond," — Distances"),
-                       x="Distance",y="Count")+
-                  theme_minimal(base_size=10))
-          rm(dd,dv)
-        }
-      }, error=function(e) NULL)
+        }, error = function(e) NULL)
+      }
 
-      # Core plots
-      print(p_vol)
-      if (!is.null(p_cs)) print(p_cs)
-      if (!is.null(p_grad)) print(p_grad)
+      # --- NES heatmap across comparisons ---
+      if (!is.null(p_nes_heatmap)) {
+        tryCatch({
+          nes_wide2 <- combined_ce[, c("signature", "comparison", "NES")]
+          nes_wide2$sig_short <- sub("^CUSTOM_", "", nes_wide2$signature)
+          nes_mat2 <- tidyr::pivot_wider(
+            nes_wide2, id_cols = sig_short,
+            names_from = comparison, values_from = NES)
+          nes_m2 <- as.matrix(nes_mat2[, -1])
+          rownames(nes_m2) <- nes_mat2$sig_short
+          nes_m2[is.na(nes_m2)] <- 0
+          colnames(nes_m2) <- sub("^Interface_vs_", "vs_", colnames(nes_m2))
 
-      # MA plot
-      tryCatch({
-        de$me <- (de$mean_iface+de$mean_distal)/2
-        print(ggplot(de,aes(x=log10(me+0.01),y=log2FC,color=sig))+
-                geom_point(size=0.6,alpha=0.5)+
-                scale_color_manual(values=c("FALSE"="grey60",
-                                            "TRUE"="red"))+
-                geom_hline(yintercept=c(-0.5,0.5),linetype="dashed")+
-                labs(title=paste0(cond," — MA"),
-                     x="log10(Mean)",y="log2FC")+
-                theme_minimal(base_size=10))
-      }, error=function(e) NULL)
+          pheatmap::pheatmap(nes_m2,
+            cluster_cols = FALSE, scale = "none",
+            color = colorRampPalette(c("steelblue", "white", "firebrick"))(100),
+            breaks = seq(-3, 3, length.out = 101),
+            main = paste0(cond, " — Custom Signature NES Across 4 Comparisons"),
+            fontsize_row = 8, fontsize_col = 9)
+        }, error = function(e) NULL)
+      }
 
-      # NES by group
-      for (grp in names(grp_nes_plots))
-        print(grp_nes_plots[[grp]])
+      # --- Combined enrichment bar ---
+      if (!is.null(p_combined_ebar)) print(p_combined_ebar)
 
-      if (!is.null(p_ebar)) print(p_ebar)
+      # --- NES bars per custom group per comparison ---
+      for (k in names(cond_nes_plots))
+        print(cond_nes_plots[[k]])
 
-      # MSigDB source bars
-      for (src in names(src_plots))
-        print(src_plots[[src]])
+      # --- MSigDB source bars ---
+      for (k in names(cond_src_plots))
+        print(cond_src_plots[[k]])
 
-      if (!is.null(p_cgp)) print(p_cgp)
-
-      # fgsea curves (grouped)
-      for (grp in names(custom_groups)) {
-        for (sn2 in custom_groups[[grp]]) {
-          if (!is.null(fcurves[[sn2]]))
-            print(fcurves[[sn2]])
+      # --- fgsea enrichment curves (grouped by custom group) ---
+      for (comp in comparison_defs) {
+        ct <- paste0(comp$ref_label, "_vs_", comp$comp_label)
+        for (grp in names(custom_groups)) {
+          for (sn2 in custom_groups[[grp]]) {
+            key <- paste0(ct, "__", sn2)
+            if (!is.null(cond_fcurves[[key]]))
+              print(cond_fcurves[[key]])
+          }
         }
       }
 
-      # Signature volcanos (all 21)
-      for (sn3 in names(custom_sigs)) {
-        tryCatch({
-          de$in_s <- de$gene %in% custom_sigs[[sn3]]
-          if (sum(de$in_s)<3) next
-          de$sl <- ifelse(de$in_s & de$sig, de$gene, "")
-          pp <- ggplot(de,aes(x=log2FC,y=-log10(pvalue+1e-300)))+
-            geom_point(data=de[!de$in_s,],
-                       size=0.5,alpha=0.3,color="grey80")+
-            geom_point(data=de[de$in_s,],
-                       aes(color=sig),size=2,alpha=0.8)+
-            scale_color_manual(values=c("FALSE"="orange",
-                                        "TRUE"="red"))+
-            geom_vline(xintercept=c(-0.5,0.5),linetype="dashed")+
-            labs(title=paste0(cond," — ",
-                              sub("^CUSTOM_","",sn3)),
-                 x="log2FC",y="-log10(p)")+
-            theme_minimal(base_size=10)
-          if (requireNamespace("ggrepel",quietly=TRUE) &&
-              any(nchar(de$sl)>0))
-            pp <- pp + ggrepel::geom_text_repel(
-              data=de[de$sl!="",],
-              aes(label=sl),size=2.5,color="black",
-              max.overlaps=20)
-          print(pp)
-        }, error=function(e) NULL)
+      # --- Signature-specific volcanos — label top 10 sig genes per signature ---
+      for (ct in names(cond_de_results)) {
+        de <- cond_de_results[[ct]]
+        for (sn3 in names(custom_sigs)) {
+          tryCatch({
+            de$in_s <- de$gene %in% custom_sigs[[sn3]]
+            if (sum(de$in_s) < 3) next
+            # Select top 10 sig genes within this signature by combined score
+            sig_in_s <- de[de$in_s & de$sig, ]
+            sig_in_s <- sig_in_s[order(sig_in_s$cscore, decreasing = TRUE), ]
+            top10_in_s <- head(sig_in_s$gene, 10)
+            de$sl <- ifelse(de$gene %in% top10_in_s, de$gene, "")
+            pp <- ggplot(de, aes(x = log2FC,
+                                  y = -log10(pvalue + 1e-300))) +
+              geom_point(data = de[!de$in_s, ],
+                         size = 0.5, alpha = 0.3, color = "grey80") +
+              geom_point(data = de[de$in_s, ],
+                         aes(color = sig), size = 2, alpha = 0.8) +
+              scale_color_manual(values = c("FALSE" = "orange",
+                                            "TRUE" = "red")) +
+              geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed") +
+              labs(title = paste0(cond, " — ",
+                                  sub("^CUSTOM_", "", sn3),
+                                  " (", ct, ")"),
+                   subtitle = "Top 10 sig genes labeled",
+                   x = "log2FC", y = "-log10(p)") +
+              theme_minimal(base_size = 10)
+            if (requireNamespace("ggrepel", quietly = TRUE) &&
+                any(nchar(de$sl) > 0))
+              pp <- pp + ggrepel::geom_text_repel(
+                data = de[de$sl != "", ],
+                aes(label = sl), size = 2.5, color = "black",
+                max.overlaps = 20,
+                segment.color = "grey50", segment.size = 0.3,
+                min.segment.length = 0)
+            print(pp)
+          }, error = function(e) NULL)
+        }
       }
 
       dev.off()
-      cat(paste0("    Summary PDF saved\n"))
-    }, error=function(e) {
+      cat(paste0("    Summary PDF saved: ", cond, "_TIER2_5zone_summary.pdf\n"))
+    }, error = function(e) {
       cat(paste0("    Summary PDF error: ",
-                 conditionMessage(e),"\n"))
-      tryCatch(dev.off(),error=function(e2) NULL)
+                 conditionMessage(e), "\n"))
+      tryCatch(dev.off(), error = function(e2) NULL)
     })
 
     # ================================================================
-    # Enrichment PDF
+    # ENRICHMENT PDF — focused on GSEA results
     # ================================================================
     tryCatch({
       pdf(file.path(tier2_dir,
-                    paste0(cond,"_TIER2_enrichment.pdf")),
-          width=12,height=9)
+                    paste0(cond, "_TIER2_5zone_enrichment.pdf")),
+          width = 12, height = 9)
 
-      # NES by group
-      for (grp in names(grp_nes_plots))
-        print(grp_nes_plots[[grp]])
+      # NES heatmap
+      if (!is.null(p_nes_heatmap)) {
+        tryCatch({
+          nes_wide3 <- combined_ce[, c("signature", "comparison", "NES")]
+          nes_wide3$sig_short <- sub("^CUSTOM_", "", nes_wide3$signature)
+          nes_mat3 <- tidyr::pivot_wider(
+            nes_wide3, id_cols = sig_short,
+            names_from = comparison, values_from = NES)
+          nes_m3 <- as.matrix(nes_mat3[, -1])
+          rownames(nes_m3) <- nes_mat3$sig_short
+          nes_m3[is.na(nes_m3)] <- 0
+          colnames(nes_m3) <- sub("^Interface_vs_", "vs_", colnames(nes_m3))
 
-      if (!is.null(p_ebar)) print(p_ebar)
+          pheatmap::pheatmap(nes_m3,
+            cluster_cols = FALSE, scale = "none",
+            color = colorRampPalette(c("steelblue", "white", "firebrick"))(100),
+            breaks = seq(-3, 3, length.out = 101),
+            main = paste0(cond, " — Custom Signature NES (4 Comparisons)"),
+            fontsize_row = 8, fontsize_col = 9)
+        }, error = function(e) NULL)
+      }
 
-      # fgsea curves grouped
-      for (grp in names(custom_groups)) {
-        for (sn2 in custom_groups[[grp]]) {
-          if (!is.null(fcurves[[sn2]]))
-            print(fcurves[[sn2]])
+      if (!is.null(p_combined_ebar)) print(p_combined_ebar)
+
+      # NES bars
+      for (k in names(cond_nes_plots))
+        print(cond_nes_plots[[k]])
+
+      # fgsea curves
+      for (comp in comparison_defs) {
+        ct <- paste0(comp$ref_label, "_vs_", comp$comp_label)
+        for (grp in names(custom_groups)) {
+          for (sn2 in custom_groups[[grp]]) {
+            key <- paste0(ct, "__", sn2)
+            if (!is.null(cond_fcurves[[key]]))
+              print(cond_fcurves[[key]])
+          }
         }
       }
 
-      # MSigDB source bars
-      for (src in names(src_plots))
-        print(src_plots[[src]])
+      # Source bars
+      for (k in names(cond_src_plots))
+        print(cond_src_plots[[k]])
 
-      if (!is.null(p_cgp)) print(p_cgp)
-
-      # Signature volcanos
-      for (sn3 in names(custom_sigs)) {
+      # Keyword pathways
+      for (ct in names(cond_fgsea_results)) {
         tryCatch({
-          de$in_s <- de$gene %in% custom_sigs[[sn3]]
-          if (sum(de$in_s)<3) next
-          de$sl <- ifelse(de$in_s & de$sig, de$gene, "")
-          pp <- ggplot(de,aes(x=log2FC,y=-log10(pvalue+1e-300)))+
-            geom_point(data=de[!de$in_s,],
-                       size=0.5,alpha=0.3,color="grey80")+
-            geom_point(data=de[de$in_s,],
-                       aes(color=sig),size=2,alpha=0.8)+
-            scale_color_manual(values=c("FALSE"="orange",
-                                        "TRUE"="red"))+
-            geom_vline(xintercept=c(-0.5,0.5),linetype="dashed")+
-            labs(title=paste0(cond," — ",
-                              sub("^CUSTOM_","",sn3)),
-                 x="log2FC",y="-log10(p)")+
-            theme_minimal(base_size=10)
-          if (requireNamespace("ggrepel",quietly=TRUE) &&
-              any(nchar(de$sl)>0))
-            pp <- pp + ggrepel::geom_text_repel(
-              data=de[de$sl!="",],
-              aes(label=sl),size=2.5,color="black",
-              max.overlaps=20)
-          print(pp)
-        }, error=function(e) NULL)
+          fres_ct <- cond_fgsea_results[[ct]]
+          kw <- c("PROSTATE", "ANDROGEN", "NEUROENDOCRINE", "NEPC",
+                  "BELTRAN", "CRPC", "CASTRATION", "AR_", "RB1", "TP53",
+                  "MYCN", "EZH2", "SMALL_CELL", "NEURAL", "NEURO",
+                  "EPITHELIAL_MESENCHYMAL", "STEM_CELL", "PLASTICITY",
+                  "ADIPOGEN", "MDK", "TWEAK", "TNFSF12",
+                  "NECROP", "FERROP", "PYROP", "CUPROP",
+                  "APOPTOS", "AUTOPHAGY", "MITOCHOND", "OXPHOS",
+                  "SENESCEN", "LIPID", "FATTY_ACID", "CHOLESTEROL",
+                  "ESTROGEN", "HORMONE")
+          af <- as.data.frame(fres_ct)
+          hits <- af[grepl(paste(kw, collapse = "|"), af$pathway,
+                           ignore.case = TRUE) &
+                       !grepl("^CUSTOM_", af$pathway), ]
+          if (nrow(hits) > 0) {
+            hits$leadingEdge <- vapply(hits$leadingEdge,
+              function(x) if (is.character(x))
+                paste(head(x, 30), collapse = ";") else "",
+              character(1))
+            hits <- hits[order(hits$pval), ]
+            tryCatch(write.csv(head(hits, 100),
+              file.path(tier2_dir,
+                        paste0(cond, "_keyword_pathways_", ct, ".csv")),
+              row.names = FALSE), error = function(e) NULL)
+
+            ct_top <- head(hits, 30)
+            ct_top$pw <- substring(ct_top$pathway, 1, 50)
+            comp_lab <- sub("^Interface_vs_", "", ct)
+            ct_top$d <- ifelse(ct_top$NES > 0, "Interface", comp_lab)
+            print(ggplot(ct_top,
+              aes(x = reorder(pw, NES), y = NES, fill = d)) +
+              geom_bar(stat = "identity") + coord_flip() +
+              scale_fill_manual(values = c(Interface = "firebrick",
+                                            setNames("steelblue", comp_lab))) +
+              labs(title = paste0(cond, " — Keyword Pathways (", ct, ")"),
+                   x = "", y = "NES") +
+              theme_minimal(base_size = 9) +
+              theme(axis.text.y = element_text(size = 6)))
+          }
+        }, error = function(e) NULL)
       }
 
       dev.off()
-      cat(paste0("    Enrichment PDF saved\n"))
-    }, error=function(e) {
+      cat(paste0("    Enrichment PDF saved: ",
+                 cond, "_TIER2_5zone_enrichment.pdf\n"))
+    }, error = function(e) {
       cat(paste0("    Enrichment PDF error: ",
-                 conditionMessage(e),"\n"))
-      tryCatch(dev.off(),error=function(e2) NULL)
+                 conditionMessage(e), "\n"))
+      tryCatch(dev.off(), error = function(e2) NULL)
     })
 
     # ================================================================
     # Clean up condition-level objects
     # ================================================================
-    rm(bel, bm, sgl, de, sgr, cedf)
-    if (exists("fres",inherits=FALSE)) rm(fres)
-    if (exists("fcurves",inherits=FALSE)) rm(fcurves)
-    if (exists("cgp_pro",inherits=FALSE)) rm(cgp_pro)
-    if (exists("p_vol",inherits=FALSE)) rm(p_vol)
-    if (exists("p_grad",inherits=FALSE)) rm(p_grad)
-    if (exists("p_cs",inherits=FALSE)) rm(p_cs)
-    if (exists("p_ebar",inherits=FALSE)) rm(p_ebar)
-    if (exists("p_cgp",inherits=FALSE)) rm(p_cgp)
-    if (exists("grp_nes_plots",inherits=FALSE)) rm(grp_nes_plots)
-    if (exists("src_plots",inherits=FALSE)) rm(src_plots)
+    rm(cond_de_results, cond_fgsea_results, cond_ce_results,
+       cond_volcano_plots, cond_nes_plots, cond_src_plots,
+       cond_fcurves, combined_ce)
+    if (exists("p_combined_ebar", inherits = FALSE)) rm(p_combined_ebar)
+    if (exists("p_nes_heatmap", inherits = FALSE)) rm(p_nes_heatmap)
     invisible(gc())
 
   }  # end for (cond in conditions)
 
+  # ================================================================
+  # Cross-condition summary
+  # ================================================================
+  cat("\n  Cross-condition summary...\n")
+
+  # DE summary table
+  if (length(all_cond_de) > 0) {
+    de_summary <- do.call(rbind, all_cond_de)
+    write.csv(de_summary,
+              file.path(tier2_dir, "ALL_conditions_DE_summary.csv"),
+              row.names = FALSE)
+    cat(paste0("    DE summary: ", nrow(de_summary), " comparisons\n"))
+  }
+
+  # Combined custom enrichment
+  if (length(all_cond_ce) > 0) {
+    ce_all <- do.call(rbind, all_cond_ce)
+    write.csv(ce_all,
+              file.path(tier2_dir, "ALL_conditions_custom_enrichment.csv"),
+              row.names = FALSE)
+    cat(paste0("    Custom enrichment: ", nrow(ce_all), " rows\n"))
+
+    # Cross-condition NES heatmap PDF
+    tryCatch({
+      if (any(!is.na(ce_all$NES)) &&
+          requireNamespace("pheatmap", quietly = TRUE)) {
+
+        pdf(file.path(tier2_dir,
+                      "ALL_conditions_NES_heatmap.pdf"),
+            width = 14, height = 10)
+
+        # One heatmap per comparison type
+        for (comp in comparison_defs) {
+          ct <- paste0(comp$ref_label, "_vs_", comp$comp_label)
+          ce_sub <- ce_all[ce_all$comparison == ct, ]
+          if (nrow(ce_sub) == 0) next
+
+          ce_sub$sig_short <- sub("^CUSTOM_", "", ce_sub$signature)
+          nes_wide_x <- tidyr::pivot_wider(
+            ce_sub[, c("sig_short", "condition", "NES")],
+            id_cols = sig_short,
+            names_from = condition, values_from = NES)
+          nes_mx <- as.matrix(nes_wide_x[, -1])
+          rownames(nes_mx) <- nes_wide_x$sig_short
+          nes_mx[is.na(nes_mx)] <- 0
+
+          if (nrow(nes_mx) >= 2 && ncol(nes_mx) >= 2) {
+            pheatmap::pheatmap(nes_mx,
+              cluster_cols = FALSE, scale = "none",
+              color = colorRampPalette(
+                c("steelblue", "white", "firebrick"))(100),
+              breaks = seq(-3, 3, length.out = 101),
+              main = paste0("Cross-Condition NES: ", ct),
+              fontsize_row = 8, fontsize_col = 10)
+          }
+        }
+
+        dev.off()
+        cat("    Cross-condition NES heatmap PDF saved\n")
+      }
+    }, error = function(e) {
+      cat(paste0("    Cross-condition heatmap error: ",
+                 conditionMessage(e), "\n"))
+      tryCatch(dev.off(), error = function(e2) NULL)
+    })
+  }
+
   tier2_status <- "COMPLETE"
-  cat("\nTIER 2 complete.\n")
+  cat(paste0("\nTIER 2 REVISED (5-Zone, 4 GSEA) complete.\n"))
 
 }, error = function(e) {
   cat(paste0("TIER 2 ERROR: ", conditionMessage(e), "\n"))
   tier2_status <<- paste0("ERROR: ", conditionMessage(e))
   tryCatch(dev.off(), error = function(e2) NULL)
 })
+
+# ==============================================================================
+# END TIER 2 REVISED
+# ==============================================================================
+cat(paste0("\n  TIER 2 status: ", tier2_status, "\n"))
+          
 # ==============================================================================
 # SECTION 5: TIER 3 — Gradient Modeling (Distance-Expression Relationships)
 # ==============================================================================
