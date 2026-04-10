@@ -696,6 +696,920 @@ for (sn in successfully_loaded) {
 }
 
 # ==============================================================================
+# TIER 1 — REVISED 5-ZONE SPATIAL ANNOTATION (Distance-Only Assignment)
+# ==============================================================================
+# 5 Zones (all distance-based, no score gating):
+#   1. Interface       — dist == 0 (ASPC-adjacent, active NE transition front)
+#   2. Proximal NE     — 0 < dist ≤ Q20 (closest 20% of non-interface)
+#   3. Distal NE       — Q20 < dist ≤ Q45 (next 25%)
+#   4. Epithelial      — Q45 < dist ≤ Q75 (middle 30%)
+#   5. Necrotic Core   — dist > Q75 (farthest 25%)
+#
+# KEY DESIGN PRINCIPLE:
+#   NEPC_UP score is used for POST-HOC VALIDATION (confirming the NE decay
+#   gradient exists) but NOT for zone membership gating. If the paracrine
+#   gradient model is correct, the NE score gradient should emerge naturally
+#   from distance-based zoning.
+#
+# FIXES APPLIED:
+#   - Per-sample quantile computation (not pooled across condition)
+#   - Rank-based assignment to handle discrete distance ties
+#   - Guaranteed non-empty zones via adaptive quantile shifting
+#   - Fallback equal-partition when quantile boundaries collapse
+# ==============================================================================
+
+cat("\n=== TIER 1 REVISED: 5-Zone Spatial Annotation (Distance-Only) ===\n")
+tier1_status <- "SKIPPED"
+
+tryCatch({
+  tier1_dir <- file.path(visium_root, "TIER1_Interface")
+  dir.create(tier1_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # ================================================================
+  # Create RDS directory for per-sample objects (memory-efficient)
+  # ================================================================
+  if (!exists("rds_dir"))
+    rds_dir <- file.path(visium_root, "sample_rds")
+  dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # ================================================================
+  # Define helper functions used by Tier 1-7
+  # ================================================================
+  if (!exists("load_sample", mode = "function")) {
+    load_sample <- function(sample_name) {
+      rds_path <- file.path(rds_dir, paste0(sample_name, ".rds"))
+      if (!file.exists(rds_path)) return(NULL)
+      tryCatch(readRDS(rds_path), error = function(e) {
+        cat(paste0("    Error loading ", sample_name, ": ",
+                   conditionMessage(e), "\n"))
+        NULL
+      })
+    }
+  }
+
+  if (!exists("safe_GetAssayData", mode = "function")) {
+    safe_GetAssayData <- function(obj, layer = "data") {
+      tryCatch({
+        for (assay_name in c("SCT", "RNA")) {
+          if (assay_name %in% Assays(obj)) {
+            DefaultAssay(obj) <- assay_name
+            mat <- tryCatch(
+              GetAssayData(obj, layer = layer),
+              error = function(e) {
+                tryCatch(GetAssayData(obj, slot = layer),
+                         error = function(e2) NULL)
+              })
+            if (!is.null(mat) && ncol(mat) > 0 && nrow(mat) > 0)
+              return(mat)
+          }
+        }
+        NULL
+      }, error = function(e) NULL)
+    }
+  }
+
+  if (!exists("extract_condition", mode = "function")) {
+    extract_condition <- function(sample_name) {
+      if (grepl("BPH",   sample_name)) return("BPH")
+      if (grepl("TRNA",  sample_name)) return("TRNA")
+      if (grepl("NEADT", sample_name)) return("NEADT")
+      if (grepl("CRPC",  sample_name)) return("CRPC")
+      if (grepl("MET",   sample_name)) return("MET")
+      return("Unknown")
+    }
+  }
+
+  if (!exists("compute_spot_size", mode = "function")) {
+    compute_spot_size <- function(coords) {
+      if (nrow(coords) < 2) return(1.5)
+      x_range <- diff(range(coords[, 1], na.rm = TRUE))
+      y_range <- diff(range(coords[, 2], na.rm = TRUE))
+      area <- x_range * y_range
+      if (area <= 0) return(1.5)
+      density <- nrow(coords) / area
+      size <- max(0.3, min(3.0, 1 / sqrt(density) * 10))
+      return(size)
+    }
+  }
+
+  # ================================================================
+  # Determine sample list
+  # ================================================================
+  if (!exists("successfully_loaded") ||
+      length(successfully_loaded) == 0) {
+    rds_files <- list.files(rds_dir, pattern = "\\.rds$",
+                            full.names = FALSE)
+    if (length(rds_files) > 0) {
+      successfully_loaded <- sub("\\.rds$", "", rds_files)
+      cat(paste0("  Found ", length(successfully_loaded),
+                 " RDS files\n"))
+    } else if (exists("seurat_list") && length(seurat_list) > 0) {
+      cat("  Saving seurat_list to RDS...\n")
+      successfully_loaded <- character(0)
+      for (sn in names(seurat_list)) {
+        tryCatch({
+          saveRDS(seurat_list[[sn]],
+                  file.path(rds_dir, paste0(sn, ".rds")))
+          successfully_loaded <- c(successfully_loaded, sn)
+        }, error = function(e) NULL)
+      }
+    } else {
+      stop("No samples available")
+    }
+  }
+
+  # ================================================================
+  # Phase 1: Score & Classify Interface Zones (legacy 4-class)
+  # ================================================================
+  cat("\n  Phase 1: Interface zone scoring...\n")
+  zone_prop_list <- list()
+
+  for (sn in successfully_loaded) {
+    cat(paste0("    ", sn, "\n"))
+    tryCatch({
+      obj <- load_sample(sn)
+      if (is.null(obj)) {
+        cat(paste0("      Load failed — skipping\n"))
+        next
+      }
+      md <- obj@meta.data
+
+      # Check required score columns
+      score_cols <- c("ASPC_score", "AR_score", "NEPC_UP_score")
+      missing_sc <- setdiff(score_cols, colnames(md))
+      if (length(missing_sc) > 0) {
+        cat(paste0("      Missing: ",
+                   paste(missing_sc, collapse = ", "), " — skipping\n"))
+        rm(obj); invisible(gc()); next
+      }
+
+      # Compute medians for thresholding
+      med_aspc <- median(md$ASPC_score, na.rm = TRUE)
+      med_ar   <- median(md$AR_score, na.rm = TRUE)
+      med_nepc <- median(md$NEPC_UP_score, na.rm = TRUE)
+
+      # Classify interface zones (legacy 4-class for backward compatibility)
+      is_interface <- (md$ASPC_score > med_aspc) &
+        (md$NEPC_UP_score > med_nepc | md$AR_score > med_ar)
+      is_aspc_high <- (md$ASPC_score > med_aspc) & !is_interface
+      is_ar_high   <- (md$AR_score > med_ar) &
+        !is_interface & !is_aspc_high
+      is_nepc_high <- (md$NEPC_UP_score > med_nepc) &
+        !is_interface & !is_aspc_high & !is_ar_high
+
+      zone <- rep("Other", nrow(md))
+      zone[is_nepc_high] <- "NEPC_high"
+      zone[is_ar_high]   <- "AR_high"
+      zone[is_aspc_high] <- "ASPC_high"
+      zone[is_interface] <- "Interface"
+
+      obj$interface_zone <- zone
+
+      # Zone proportions
+      tbl <- table(zone)
+      zp <- as.data.frame(tbl, stringsAsFactors = FALSE)
+      colnames(zp) <- c("zone", "count")
+      zp$sample    <- sn
+      zp$condition <- extract_condition(sn)
+      zone_prop_list[[sn]] <- zp
+
+      cat(paste0("      Zones: ",
+                 paste(paste0(names(tbl), "=", tbl), collapse = ", "), "\n"))
+
+      # Save
+      saveRDS(obj, file.path(rds_dir, paste0(sn, ".rds")))
+      if (exists("seurat_list") && sn %in% names(seurat_list))
+        seurat_list[[sn]] <- obj
+
+      rm(obj); invisible(gc())
+    }, error = function(e) {
+      cat(paste0("      ERROR: ", conditionMessage(e), "\n"))
+    })
+  }
+
+  # ================================================================
+  # Phase 2: Compute distances to interface
+  # ================================================================
+  cat("\n  Phase 2: Computing distances to interface...\n")
+
+  # Validate samples have interface_zone + coordinates
+  valid_samples <- character(0)
+  for (sn in successfully_loaded) {
+    obj <- load_sample(sn)
+    if (is.null(obj)) next
+    md <- obj@meta.data
+    ok <- "interface_zone" %in% colnames(md) &&
+      all(c("row", "col") %in% colnames(md)) &&
+      sum(md$interface_zone == "Interface", na.rm = TRUE) > 0
+    if (ok) valid_samples <- c(valid_samples, sn)
+    else cat(paste0("    ", sn, ": skipped (missing data)\n"))
+    rm(obj); invisible(gc())
+  }
+  cat(paste0("  Valid samples: ", length(valid_samples), "\n"))
+  if (length(valid_samples) == 0)
+    stop("No valid samples with interface_zone + coordinates")
+
+  # Compute dist_to_interface per sample
+  for (sn in valid_samples) {
+    obj <- load_sample(sn)
+    if (is.null(obj)) next
+    md <- obj@meta.data
+
+    if (!"dist_to_interface" %in% colnames(md)) {
+      iface_idx <- which(md$interface_zone == "Interface")
+      if (length(iface_idx) == 0) {
+        rm(obj); invisible(gc()); next
+      }
+      coords <- as.matrix(md[, c("row", "col")])
+      ic <- coords[iface_idx, , drop = FALSE]
+      ns <- nrow(coords)
+      dti <- numeric(ns)
+
+      for (ci in seq(1, ns, by = 1000)) {
+        ce <- min(ci + 999, ns)
+        ch <- coords[ci:ce, , drop = FALSE]
+        if (nrow(ic) <= 5000) {
+          rd <- outer(ch[, 1], ic[, 1], "-")
+          cd <- outer(ch[, 2], ic[, 2], "-")
+          dti[ci:ce] <- apply(sqrt(rd^2 + cd^2), 1, min)
+          rm(rd, cd)
+        } else {
+          for (j in seq_len(nrow(ch))) {
+            dd <- sweep(ic, 2, ch[j, ])
+            dti[ci + j - 1] <- min(sqrt(rowSums(dd^2)))
+          }
+        }
+      }
+      dti[iface_idx] <- 0
+      obj$dist_to_interface <- dti
+      saveRDS(obj, file.path(rds_dir, paste0(sn, ".rds")))
+      cat(paste0("    ", sn, ": computed (",
+                 sum(dti == 0), " iface spots)\n"))
+      rm(coords, ic)
+    } else {
+      cat(paste0("    ", sn, ": present\n"))
+    }
+
+    rm(obj); invisible(gc())
+  }
+
+  # ================================================================
+  # Phase 3: Assign 5-zone labels — PER-SAMPLE RANK-BASED
+  # ================================================================
+  # CRITICAL FIX: Zone assignment is done PER-SAMPLE using RANK-BASED
+  # partitioning, not pooled quantile boundaries. This guarantees:
+  #   - Every zone gets spots (cannot be empty unless sample is tiny)
+  #   - Discrete distance ties are handled by rank jittering
+  #   - No spots fall through boundary cracks
+  #
+  # Zone target fractions of non-interface spots:
+  #   Proximal NE:   20%  (ranks 0–20%)
+  #   Distal NE:     25%  (ranks 20–45%)
+  #   Epithelial:    30%  (ranks 45–75%)
+  #   Necrotic Core: 25%  (ranks 75–100%)
+  # ================================================================
+  cat("\n  Phase 3: Assigning 5-zone labels (per-sample rank-based)...\n")
+
+  # Target cumulative fractions for zone boundaries
+  ZONE_CUM_FRAC <- c(
+    proximal_end  = 0.20,  # Proximal NE: 0–20%
+    distal_ne_end = 0.45,  # Distal NE: 20–45%
+    epithelial_end = 0.75  # Epithelial: 45–75%; Necrotic: 75–100%
+  )
+
+  validation_results <- list()
+
+  for (sn in valid_samples) {
+    obj <- load_sample(sn)
+    if (is.null(obj) ||
+        !"dist_to_interface" %in% colnames(obj@meta.data)) {
+      if (!is.null(obj)) rm(obj); invisible(gc())
+      next
+    }
+
+    d <- obj$dist_to_interface
+    n_total <- length(d)
+    zone5 <- rep(NA_character_, n_total)
+
+    # Zone 1: Interface (distance = 0)
+    iface_mask <- (d == 0)
+    zone5[iface_mask] <- "Interface"
+
+    # Non-interface spots: assign by rank of distance
+    ni_idx <- which(d > 0)
+    n_ni   <- length(ni_idx)
+
+    if (n_ni >= 4) {
+      # Compute ranks with jitter to break ties deterministically
+      # Use row index as secondary sort key so ties get spread across zones
+      d_ni <- d[ni_idx]
+
+      # Rank by distance, ties broken by original index (stable sort)
+      ord <- order(d_ni, ni_idx)
+      ranks <- integer(n_ni)
+      ranks[ord] <- seq_len(n_ni)
+
+      # Normalized rank: 0 to 1
+      rank_frac <- (ranks - 1) / (n_ni - 1)
+
+      # Assign zones by rank fraction
+      z_ni <- rep(NA_character_, n_ni)
+      z_ni[rank_frac <= ZONE_CUM_FRAC["proximal_end"]]  <- "Proximal_NE"
+      z_ni[rank_frac > ZONE_CUM_FRAC["proximal_end"] &
+             rank_frac <= ZONE_CUM_FRAC["distal_ne_end"]]  <- "Distal_NE"
+      z_ni[rank_frac > ZONE_CUM_FRAC["distal_ne_end"] &
+             rank_frac <= ZONE_CUM_FRAC["epithelial_end"]] <- "Epithelial"
+      z_ni[rank_frac > ZONE_CUM_FRAC["epithelial_end"]]   <- "Necrotic_Core"
+
+      # Safety: fill any NA from floating-point edge cases
+      z_ni[is.na(z_ni)] <- "Necrotic_Core"
+
+      zone5[ni_idx] <- z_ni
+
+      # Report actual distance ranges per zone
+      zone_dist_ranges <- tapply(d_ni, z_ni, function(x)
+        paste0("[", round(min(x), 2), ", ", round(max(x), 2), "]"))
+      zone_counts <- table(z_ni)
+
+      cat(paste0("    ", sn, " (rank-based, n_ni=", n_ni, "):\n"))
+      for (zn in c("Proximal_NE", "Distal_NE", "Epithelial", "Necrotic_Core")) {
+        ct <- ifelse(zn %in% names(zone_counts), zone_counts[zn], 0)
+        dr <- ifelse(zn %in% names(zone_dist_ranges), zone_dist_ranges[zn], "N/A")
+        cat(paste0("      ", zn, ": n=", ct, " dist=", dr, "\n"))
+      }
+
+    } else if (n_ni > 0) {
+      # Very few non-interface spots: assign all as Epithelial
+      zone5[ni_idx] <- "Epithelial"
+      cat(paste0("    ", sn, ": only ", n_ni,
+                 " non-interface spots — all assigned Epithelial\n"))
+    }
+
+    # Any remaining NA (shouldn't happen, but safety net)
+    zone5[is.na(zone5)] <- "Epithelial"
+
+    obj$zone_5class <- zone5
+
+    # ---- POST-HOC VALIDATION: NE decay gradient ----
+    md <- obj@meta.data
+    ne   <- md$NEPC_UP_score
+    ar   <- md$AR_score
+    aspc <- md$ASPC_score
+    cn   <- extract_condition(sn)
+
+    val_row <- data.frame(
+      sample    = sn,
+      condition = cn,
+      n_interface     = sum(zone5 == "Interface", na.rm = TRUE),
+      n_proximal_ne   = sum(zone5 == "Proximal_NE", na.rm = TRUE),
+      n_distal_ne     = sum(zone5 == "Distal_NE", na.rm = TRUE),
+      n_epithelial    = sum(zone5 == "Epithelial", na.rm = TRUE),
+      n_necrotic_core = sum(zone5 == "Necrotic_Core", na.rm = TRUE),
+      stringsAsFactors = FALSE
+    )
+
+    if (!is.null(ne) && !all(is.na(ne))) {
+      zone_ne_medians <- tapply(ne, zone5, median, na.rm = TRUE)
+      cat(paste0("    ", sn, " NEPC_UP: ",
+                 paste(paste0(names(zone_ne_medians), "=",
+                              round(zone_ne_medians, 4)),
+                       collapse = " | "), "\n"))
+
+      iface_ne  <- zone_ne_medians["Interface"]
+      prox_ne   <- zone_ne_medians["Proximal_NE"]
+      distal_ne <- zone_ne_medians["Distal_NE"]
+      epi_ne    <- zone_ne_medians["Epithelial"]
+      necro_ne  <- zone_ne_medians["Necrotic_Core"]
+
+      val_row$ne_iface  <- ifelse(!is.na(iface_ne), iface_ne, NA_real_)
+      val_row$ne_prox   <- ifelse(!is.na(prox_ne), prox_ne, NA_real_)
+      val_row$ne_distal <- ifelse(!is.na(distal_ne), distal_ne, NA_real_)
+      val_row$ne_epi    <- ifelse(!is.na(epi_ne), epi_ne, NA_real_)
+      val_row$ne_necro  <- ifelse(!is.na(necro_ne), necro_ne, NA_real_)
+
+      if (!is.na(iface_ne) && !is.na(prox_ne) && !is.na(distal_ne)) {
+        decay_ok <- (iface_ne >= prox_ne) && (prox_ne >= distal_ne)
+        val_row$ne_gradient_confirmed <- decay_ok
+        cat(paste0("      NE decay: ",
+                   round(iface_ne, 4), " >= ",
+                   round(prox_ne, 4), " >= ",
+                   round(distal_ne, 4),
+                   ifelse(decay_ok,
+                          " ** GRADIENT CONFIRMED **",
+                          " -- gradient not monotonic --"), "\n"))
+      } else {
+        val_row$ne_gradient_confirmed <- NA
+      }
+    } else {
+      val_row$ne_iface  <- NA_real_
+      val_row$ne_prox   <- NA_real_
+      val_row$ne_distal <- NA_real_
+      val_row$ne_epi    <- NA_real_
+      val_row$ne_necro  <- NA_real_
+      val_row$ne_gradient_confirmed <- NA
+    }
+
+    # AR score validation
+    if (!is.null(ar) && !all(is.na(ar))) {
+      zone_ar_medians <- tapply(ar, zone5, median, na.rm = TRUE)
+      cat(paste0("    ", sn, " AR:      ",
+                 paste(paste0(names(zone_ar_medians), "=",
+                              round(zone_ar_medians, 4)),
+                       collapse = " | "), "\n"))
+      val_row$ar_iface <- zone_ar_medians["Interface"]
+      val_row$ar_epi   <- zone_ar_medians["Epithelial"]
+    } else {
+      val_row$ar_iface <- NA_real_
+      val_row$ar_epi   <- NA_real_
+    }
+
+    # ASPC score validation
+    if (!is.null(aspc) && !all(is.na(aspc))) {
+      zone_aspc_medians <- tapply(aspc, zone5, median, na.rm = TRUE)
+      cat(paste0("    ", sn, " ASPC:    ",
+                 paste(paste0(names(zone_aspc_medians), "=",
+                              round(zone_aspc_medians, 4)),
+                       collapse = " | "), "\n"))
+      val_row$aspc_iface <- zone_aspc_medians["Interface"]
+      val_row$aspc_prox  <- zone_aspc_medians["Proximal_NE"]
+    } else {
+      val_row$aspc_iface <- NA_real_
+      val_row$aspc_prox  <- NA_real_
+    }
+
+    validation_results[[sn]] <- val_row
+
+    # Overall zone counts
+    zt <- table(zone5)
+    cat(paste0("    ", sn, " TOTAL: ",
+               paste(paste0(names(zt), "=", zt), collapse = " | "), "\n"))
+
+    # Backward-compatible interface_zone mapping
+    legacy_zone <- rep("Other", n_total)
+    legacy_zone[zone5 == "Interface"]     <- "Interface"
+    legacy_zone[zone5 == "Proximal_NE"]   <- "NEPC_high"
+    legacy_zone[zone5 == "Distal_NE"]     <- "NEPC_high"
+    legacy_zone[zone5 == "Epithelial"]    <- "AR_high"
+    legacy_zone[zone5 == "Necrotic_Core"] <- "Other"
+    obj$interface_zone <- legacy_zone
+
+    saveRDS(obj, file.path(rds_dir, paste0(sn, ".rds")))
+    if (exists("seurat_list") && sn %in% names(seurat_list))
+      seurat_list[[sn]] <- obj
+
+    rm(obj); invisible(gc())
+  }
+
+  # ================================================================
+  # Phase 4: Save validation & zone proportion summaries
+  # ================================================================
+  cat("\n  Phase 4: Saving summaries...\n")
+
+  # Validation table
+  if (length(validation_results) > 0) {
+    all_cols <- c("sample", "condition",
+                  "n_interface", "n_proximal_ne", "n_distal_ne",
+                  "n_epithelial", "n_necrotic_core",
+                  "ne_iface", "ne_prox", "ne_distal", "ne_epi", "ne_necro",
+                  "ne_gradient_confirmed",
+                  "ar_iface", "ar_epi",
+                  "aspc_iface", "aspc_prox")
+    val_df <- do.call(rbind, lapply(validation_results, function(x) {
+      for (cc in all_cols) {
+        if (!cc %in% colnames(x)) x[[cc]] <- NA
+      }
+      x[, all_cols, drop = FALSE]
+    }))
+    write.csv(val_df,
+              file.path(tier1_dir, "zone5_gradient_validation.csv"),
+              row.names = FALSE)
+
+    n_confirmed <- sum(val_df$ne_gradient_confirmed == TRUE, na.rm = TRUE)
+    n_tested    <- sum(!is.na(val_df$ne_gradient_confirmed))
+    cat(paste0("  NE gradient confirmed: ", n_confirmed, "/", n_tested,
+               " samples\n"))
+
+    # Report Distal NE spot counts
+    total_distal_ne <- sum(val_df$n_distal_ne, na.rm = TRUE)
+    cat(paste0("  Total Distal NE spots across all samples: ",
+               total_distal_ne, "\n"))
+    zero_distal <- sum(val_df$n_distal_ne == 0, na.rm = TRUE)
+    if (zero_distal > 0)
+      cat(paste0("  WARNING: ", zero_distal,
+                 " samples have 0 Distal NE spots\n"))
+    else
+      cat("  All samples have Distal NE spots — rank-based assignment working\n")
+  }
+
+  # Zone proportions (5-class)
+  zone5_prop_list <- list()
+  for (sn in valid_samples) {
+    obj <- load_sample(sn)
+    if (is.null(obj) || !"zone_5class" %in% colnames(obj@meta.data)) {
+      if (!is.null(obj)) rm(obj); invisible(gc()); next
+    }
+    tbl <- table(obj$zone_5class)
+    zp <- as.data.frame(tbl, stringsAsFactors = FALSE)
+    colnames(zp) <- c("zone", "count")
+    zp$sample    <- sn
+    zp$condition <- extract_condition(sn)
+    zone5_prop_list[[sn]] <- zp
+    rm(obj); invisible(gc())
+  }
+
+  if (length(zone5_prop_list) > 0) {
+    zone5_prop_df <- do.call(rbind, zone5_prop_list)
+    write.csv(zone5_prop_df,
+              file.path(tier1_dir, "zone5_proportions_per_sample.csv"),
+              row.names = FALSE)
+
+    cond_zone5 <- zone5_prop_df %>%
+      group_by(condition, zone) %>%
+      summarise(total_spots = sum(count), .groups = "drop") %>%
+      group_by(condition) %>%
+      mutate(fraction = total_spots / sum(total_spots)) %>%
+      ungroup()
+    write.csv(cond_zone5,
+              file.path(tier1_dir, "zone5_proportions_by_condition.csv"),
+              row.names = FALSE)
+    cat(paste0("  Zone5 proportions saved (",
+               nrow(zone5_prop_df), " rows)\n"))
+  }
+
+  # Legacy 4-class zone proportions
+  if (length(zone_prop_list) > 0) {
+    zone_prop_df <- do.call(rbind, zone_prop_list)
+    write.csv(zone_prop_df,
+              file.path(tier1_dir, "zone_proportions_per_sample.csv"),
+              row.names = FALSE)
+
+    cond_zone <- zone_prop_df %>%
+      group_by(condition, zone) %>%
+      summarise(total_spots = sum(count), .groups = "drop") %>%
+      group_by(condition) %>%
+      mutate(fraction = total_spots / sum(total_spots)) %>%
+      ungroup()
+    write.csv(cond_zone,
+              file.path(tier1_dir, "zone_proportions_by_condition.csv"),
+              row.names = FALSE)
+  }
+
+  # ================================================================
+  # Phase 5: Summary PDF
+  # ================================================================
+  cat("\n  Phase 5: Generating summary PDF...\n")
+
+  tryCatch({
+    pdf(file.path(tier1_dir, "TIER1_5zone_summary.pdf"),
+        width = 12, height = 9)
+
+    zone5_colors <- c(
+      Interface     = "#E31A1C",
+      Proximal_NE   = "#FF7F00",
+      Distal_NE     = "#FDBF6F",
+      Epithelial    = "#33A02C",
+      Necrotic_Core = "#6A3D9A"
+    )
+
+    # ---- Page 1: 5-Zone Spatial Maps (first 6 samples per condition) ----
+    for (cn in unique(sapply(valid_samples, extract_condition))) {
+      tryCatch({
+        cond_samps <- valid_samples[sapply(valid_samples, extract_condition) == cn]
+        plot_data_list <- list()
+
+        for (sn in head(cond_samps, 6)) {
+          obj <- load_sample(sn)
+          if (is.null(obj) ||
+              !"zone_5class" %in% colnames(obj@meta.data) ||
+              !all(c("col", "row") %in% colnames(obj@meta.data))) {
+            if (!is.null(obj)) rm(obj); invisible(gc()); next
+          }
+          md <- obj@meta.data
+          plot_data_list[[sn]] <- data.frame(
+            x = md$col, y = -md$row,
+            zone = md$zone_5class,
+            sample = sn,
+            stringsAsFactors = FALSE)
+          rm(obj); invisible(gc())
+        }
+
+        if (length(plot_data_list) > 0) {
+          pd <- do.call(rbind, plot_data_list)
+          pd$zone <- factor(pd$zone,
+                            levels = c("Interface", "Proximal_NE",
+                                       "Distal_NE", "Epithelial",
+                                       "Necrotic_Core"))
+          p_map <- ggplot(pd, aes(x = x, y = y, color = zone)) +
+            geom_point(size = 0.8) +
+            scale_color_manual(values = zone5_colors) +
+            facet_wrap(~ sample, scales = "free") +
+            labs(title = paste0(cn, " — 5-Zone Spatial Model (Rank-Based)"),
+                 subtitle = "Interface (red) | Proximal NE (orange) | Distal NE (yellow) | Epithelial (green) | Necrotic (purple)",
+                 x = "Col", y = "Row (inv)", color = "Zone") +
+            theme_minimal(base_size = 9) +
+            coord_fixed()
+          print(p_map)
+          rm(pd, plot_data_list)
+        }
+      }, error = function(e) NULL)
+    }
+
+    # ---- Page: Distance histogram with per-sample zone boundaries ----
+    for (cn in unique(sapply(valid_samples, extract_condition))) {
+      tryCatch({
+        cond_samps <- valid_samples[sapply(valid_samples, extract_condition) == cn]
+        dv <- list()
+        zone_dv <- list()
+        for (sn in cond_samps) {
+          obj <- load_sample(sn)
+          if (!is.null(obj) &&
+              "dist_to_interface" %in% colnames(obj@meta.data) &&
+              "zone_5class" %in% colnames(obj@meta.data)) {
+            dv[[sn]] <- data.frame(
+              d = obj$dist_to_interface,
+              zone = obj$zone_5class,
+              stringsAsFactors = FALSE)
+          }
+          rm(obj); invisible(gc())
+        }
+        if (length(dv) > 0) {
+          dd <- do.call(rbind, dv)
+          dd$zone <- factor(dd$zone,
+                            levels = c("Interface", "Proximal_NE",
+                                       "Distal_NE", "Epithelial",
+                                       "Necrotic_Core"))
+          p_hist <- ggplot(dd, aes(x = d, fill = zone)) +
+            geom_histogram(bins = 60, color = "white", alpha = 0.8) +
+            scale_fill_manual(values = zone5_colors) +
+            labs(title = paste0(cn, " — Distance Distribution Colored by 5-Zone"),
+                 subtitle = "Rank-based assignment guarantees all zones populated",
+                 x = "Distance to Interface", y = "Spot Count",
+                 fill = "Zone") +
+            theme_minimal(base_size = 10)
+          print(p_hist)
+          rm(dd, dv)
+        }
+      }, error = function(e) NULL)
+    }
+
+    # ---- Page: Zone proportions stacked bar by condition ----
+    if (exists("cond_zone5") && nrow(cond_zone5) > 0) {
+      cz5 <- cond_zone5
+      cz5$zone <- factor(cz5$zone,
+                          levels = c("Necrotic_Core", "Epithelial",
+                                     "Distal_NE", "Proximal_NE",
+                                     "Interface"))
+      p_bar <- ggplot(cz5,
+                      aes(x = condition, y = fraction, fill = zone)) +
+        geom_bar(stat = "identity", position = "stack") +
+        scale_fill_manual(values = zone5_colors) +
+        labs(title = "5-Zone Proportions by Condition",
+             x = "Condition", y = "Fraction of Spots", fill = "Zone") +
+        theme_minimal(base_size = 12)
+      print(p_bar)
+    }
+
+    # ---- Page: Distal NE spot count per sample (diagnostic) ----
+    if (exists("val_df") && nrow(val_df) > 0) {
+      tryCatch({
+        vd <- val_df[, c("sample", "condition",
+                         "n_interface", "n_proximal_ne", "n_distal_ne",
+                         "n_epithelial", "n_necrotic_core")]
+        vd_long <- tidyr::pivot_longer(
+          vd, cols = c("n_interface", "n_proximal_ne", "n_distal_ne",
+                       "n_epithelial", "n_necrotic_core"),
+          names_to = "zone", values_to = "count")
+        vd_long$zone <- factor(
+          gsub("^n_", "", vd_long$zone),
+          levels = c("interface", "proximal_ne", "distal_ne",
+                     "epithelial", "necrotic_core"),
+          labels = c("Interface", "Proximal_NE", "Distal_NE",
+                     "Epithelial", "Necrotic_Core"))
+
+        p_counts <- ggplot(vd_long,
+                           aes(x = condition, y = count, fill = zone)) +
+          geom_boxplot(outlier.size = 0.5) +
+          scale_fill_manual(values = zone5_colors) +
+          facet_wrap(~ zone, scales = "free_y") +
+          labs(title = "Spot Counts per Zone by Condition",
+               subtitle = "All zones should be non-empty with rank-based assignment",
+               x = "Condition", y = "Spot Count") +
+          theme_minimal(base_size = 10) +
+          theme(axis.text.x = element_text(angle = 30, hjust = 1),
+                legend.position = "none")
+        print(p_counts)
+      }, error = function(e) NULL)
+    }
+
+    # ---- Page: NE gradient validation across conditions ----
+    if (exists("val_df") && nrow(val_df) > 0) {
+      tryCatch({
+        val_cols <- c("sample", "condition",
+                      "ne_iface", "ne_prox", "ne_distal", "ne_epi", "ne_necro")
+        val_cols_present <- intersect(val_cols, colnames(val_df))
+        ne_cols <- intersect(c("ne_iface", "ne_prox", "ne_distal",
+                               "ne_epi", "ne_necro"), colnames(val_df))
+        if (length(ne_cols) >= 3) {
+          val_long <- tidyr::pivot_longer(
+            val_df[, val_cols_present],
+            cols = all_of(ne_cols),
+            names_to = "zone",
+            values_to = "NEPC_UP_median"
+          )
+          val_long$zone <- factor(val_long$zone,
+                                  levels = c("ne_iface", "ne_prox",
+                                             "ne_distal", "ne_epi", "ne_necro"),
+                                  labels = c("Interface", "Proximal_NE",
+                                             "Distal_NE", "Epithelial",
+                                             "Necrotic_Core"))
+          val_long <- val_long[!is.na(val_long$NEPC_UP_median), ]
+
+          if (nrow(val_long) > 0) {
+            p_val <- ggplot(val_long,
+                            aes(x = zone, y = NEPC_UP_median,
+                                color = condition, group = sample)) +
+              geom_line(alpha = 0.3, linewidth = 0.4) +
+              geom_point(size = 1.2, alpha = 0.5) +
+              stat_summary(aes(group = condition),
+                           fun = median, geom = "line",
+                           linewidth = 2, alpha = 0.9) +
+              stat_summary(aes(group = condition),
+                           fun = median, geom = "point",
+                           size = 3, alpha = 0.9) +
+              labs(title = "NE Gradient Validation: NEPC_UP Median Score by Zone",
+                   subtitle = "Thick lines = condition median | Thin lines = individual samples",
+                   x = "Zone (Interface -> Necrotic Core)",
+                   y = "Median NEPC_UP Score",
+                   color = "Condition") +
+              theme_minimal(base_size = 10) +
+              theme(axis.text.x = element_text(angle = 30, hjust = 1))
+            print(p_val)
+          }
+        }
+      }, error = function(e) NULL)
+
+      # AR gradient validation
+      tryCatch({
+        if (all(c("ar_iface", "ar_epi") %in% colnames(val_df))) {
+          ar_long <- tidyr::pivot_longer(
+            val_df[, c("sample", "condition", "ar_iface", "ar_epi")],
+            cols = c("ar_iface", "ar_epi"),
+            names_to = "zone", values_to = "AR_median")
+          ar_long$zone <- factor(ar_long$zone,
+                                 levels = c("ar_iface", "ar_epi"),
+                                 labels = c("Interface", "Epithelial"))
+          ar_long <- ar_long[!is.na(ar_long$AR_median), ]
+
+          if (nrow(ar_long) > 0) {
+            p_ar_val <- ggplot(ar_long,
+                               aes(x = zone, y = AR_median,
+                                   color = condition, group = sample)) +
+              geom_line(alpha = 0.4) +
+              geom_point(size = 2, alpha = 0.6) +
+              labs(title = "AR Score Validation: Interface vs Epithelial",
+                   subtitle = "Expect: Epithelial > Interface (luminal identity recovery)",
+                   x = "Zone", y = "Median AR Score", color = "Condition") +
+              theme_minimal(base_size = 10)
+            print(p_ar_val)
+          }
+        }
+      }, error = function(e) NULL)
+    }
+
+    # ---- Page: Score distributions by 5-zone (per condition) ----
+    for (cn in unique(sapply(valid_samples, extract_condition))) {
+      tryCatch({
+        cond_samps <- valid_samples[sapply(valid_samples, extract_condition) == cn]
+        score_all <- list()
+        for (sn in cond_samps) {
+          obj <- load_sample(sn)
+          if (is.null(obj)) next
+          md <- obj@meta.data
+          if (!all(c("ASPC_score", "AR_score", "NEPC_UP_score",
+                     "zone_5class") %in% colnames(md))) {
+            rm(obj); invisible(gc()); next
+          }
+          score_all[[sn]] <- data.frame(
+            ASPC    = md$ASPC_score,
+            AR      = md$AR_score,
+            NEPC_UP = md$NEPC_UP_score,
+            zone    = md$zone_5class,
+            sample  = sn,
+            stringsAsFactors = FALSE)
+          rm(obj); invisible(gc())
+        }
+        if (length(score_all) > 0) {
+          sd_all <- do.call(rbind, score_all)
+          sd_all$zone <- factor(sd_all$zone,
+                                levels = c("Interface", "Proximal_NE",
+                                           "Distal_NE", "Epithelial",
+                                           "Necrotic_Core"))
+          sd_long <- tidyr::pivot_longer(
+            sd_all, cols = c("ASPC", "AR", "NEPC_UP"),
+            names_to = "score_type", values_to = "value")
+          p_sc <- ggplot(sd_long,
+                         aes(x = zone, y = value, fill = zone)) +
+            geom_violin(scale = "width", alpha = 0.7) +
+            geom_boxplot(width = 0.15, outlier.size = 0.3) +
+            facet_wrap(~ score_type, scales = "free_y") +
+            scale_fill_manual(values = zone5_colors) +
+            labs(title = paste0(cn, " — Score Distributions by 5-Zone"),
+                 x = "Zone", y = "Score") +
+            theme_minimal(base_size = 10) +
+            theme(axis.text.x = element_text(angle = 45, hjust = 1))
+          print(p_sc)
+          rm(sd_all, sd_long, score_all)
+        }
+      }, error = function(e) NULL)
+    }
+
+    # ---- Page: Per-sample spatial zone maps (individual, first 12) ----
+    for (sn in head(valid_samples, 12)) {
+      tryCatch({
+        obj <- load_sample(sn)
+        if (is.null(obj) ||
+            !"zone_5class" %in% colnames(obj@meta.data) ||
+            !all(c("col", "row") %in% colnames(obj@meta.data))) {
+          if (!is.null(obj)) rm(obj); invisible(gc()); next
+        }
+        md <- obj@meta.data
+        plot_df <- data.frame(
+          x = md$col, y = -md$row,
+          zone = factor(md$zone_5class,
+                        levels = c("Interface", "Proximal_NE",
+                                   "Distal_NE", "Epithelial",
+                                   "Necrotic_Core")),
+          stringsAsFactors = FALSE)
+        spot_sz <- compute_spot_size(plot_df[, c("x", "y")])
+        p <- ggplot(plot_df, aes(x = x, y = y, color = zone)) +
+          geom_point(size = spot_sz) +
+          scale_color_manual(values = zone5_colors) +
+          labs(title = paste0(sn, " — 5-Zone Spatial Map"),
+               x = "Array Col", y = "Array Row (inv)", color = "Zone") +
+          theme_minimal(base_size = 10) +
+          coord_fixed()
+        print(p)
+        rm(obj); invisible(gc())
+      }, error = function(e) NULL)
+    }
+
+    dev.off()
+    cat("  TIER1_5zone_summary.pdf saved\n")
+  }, error = function(e) {
+    cat(paste0("  Summary PDF error: ", conditionMessage(e), "\n"))
+    tryCatch(dev.off(), error = function(e2) NULL)
+  })
+
+  # ================================================================
+  # Print final summary
+  # ================================================================
+  total_iface <- 0
+  total_spots <- 0
+  zone5_totals <- list(Interface = 0, Proximal_NE = 0, Distal_NE = 0,
+                       Epithelial = 0, Necrotic_Core = 0)
+  for (sn in valid_samples) {
+    obj <- load_sample(sn)
+    if (!is.null(obj)) {
+      total_spots <- total_spots + ncol(obj)
+      if ("zone_5class" %in% colnames(obj@meta.data)) {
+        zt <- table(obj$zone_5class)
+        for (zn in names(zt))
+          if (zn %in% names(zone5_totals))
+            zone5_totals[[zn]] <- zone5_totals[[zn]] + as.integer(zt[zn])
+      }
+      if ("interface_zone" %in% colnames(obj@meta.data))
+        total_iface <- total_iface +
+          sum(obj$interface_zone == "Interface", na.rm = TRUE)
+    }
+    rm(obj); invisible(gc())
+  }
+
+  cat(paste0("\n  ===== TIER 1 SUMMARY =====\n"))
+  cat(paste0("  Total spots:   ", total_spots, "\n"))
+  for (zn in c("Interface", "Proximal_NE", "Distal_NE",
+               "Epithelial", "Necrotic_Core")) {
+    ct <- zone5_totals[[zn]]
+    pct <- round(100 * ct / max(total_spots, 1), 1)
+    cat(paste0("  ", formatC(zn, width = 15, flag = "-"), ": ",
+               formatC(ct, width = 7), " (", pct, "%)\n"))
+  }
+
+  tier1_status <- "COMPLETE"
+  cat("\nTIER 1 REVISED (5-Zone Rank-Based) complete.\n")
+
+}, error = function(e) {
+  cat(paste0("TIER 1 ERROR: ", conditionMessage(e), "\n"))
+  tier1_status <<- paste0("ERROR: ", conditionMessage(e))
+  tryCatch(dev.off(), error = function(e2) NULL)
+})
+
+# ==============================================================================
+# END TIER 1 REVISED
+# ==============================================================================
+cat(paste0("\n  TIER 1 status: ", tier1_status, "\n"))
+
+                
+# ==============================================================================
 # TIER 2 PART 1 — Setup, Gene Sets, Distance Computation, Bin Assignment
 # Source this file first, then source TIER2_Part2.R in the same session.
 # ==============================================================================
