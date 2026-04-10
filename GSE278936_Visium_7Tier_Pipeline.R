@@ -3956,20 +3956,159 @@ tryCatch({
 })
 
 # ==============================================================================
-# SECTION 7: TIER 5 — Trajectory / Spatial Pseudotime
+# SECTION 7: TIER 5 — Trajectory / Spatial Pseudotime (5-Zone Distance-Based)
 # ==============================================================================
-cat("\n=== TIER 5: Trajectory / Spatial Pseudotime ===\n")
+# REVISED to use zone_5class from TIER 1 (rank-based distance-only assignment):
+#   1. Interface       — dist == 0 (ASPC-adjacent, active NE transition front)
+#   2. Proximal NE     — closest 20% (committed NE, paracrine signaling)
+#   3. Distal NE       — next 25% (NE signal decaying)
+#   4. Epithelial      — next 30% (AR+, luminal identity)
+#   5. Necrotic Core   — farthest 25% (ghost mRNA, necrotic valley)
+#
+# KEY CHANGES FROM LEGACY VERSION:
+#   - Spot selection uses zone_5class (distance-based), NOT interface_zone (score-gated)
+#   - Trajectory corridor: Interface + Proximal_NE + Distal_NE + Epithelial
+#   - Necrotic_Core EXCLUDED (ghost mRNA confounds trajectory)
+#   - PCA colored by 5-zone model with consistent color scheme
+#   - Pseudotime validated against 5-zone ordering (monotonic increase expected)
+#   - Transition genes annotated by zone boundary transitions
+#
+# EXPECTED PSEUDOTIME ORDERING (if paracrine model is correct):
+#   Interface (low PT) → Proximal_NE → Distal_NE → Epithelial (high PT)
+#
+# EXPECTED SCORE CORRELATIONS WITH PSEUDOTIME:
+#   NEPC_UP_score:      negative (NE identity decays along trajectory)
+#   ASPC_score:         negative (stromal progenitor signal decays)
+#   AR_score:           positive (luminal identity recovers)
+#   NEPC_Beltran_NET:   negative (net NE score decreases)
+# ==============================================================================
+
+cat("\n=== TIER 5 REVISED: Trajectory / Spatial Pseudotime (5-Zone Model) ===\n")
 tier5_status <- "SKIPPED"
 
 tryCatch({
   tier5_dir <- file.path(visium_root, "TIER5_Trajectory")
+  dir.create(tier5_dir, showWarnings = FALSE, recursive = TRUE)
 
-  # Use samples_with_dist from Tier 2 (these have interface zones + distances)
-  # Fall back to successfully_loaded if samples_with_dist doesn't exist
-  tier5_samples <- if (exists("samples_with_dist")) samples_with_dist else successfully_loaded
-  conditions <- unique(sapply(tier5_samples, extract_condition))
+  # ================================================================
+  # Ensure helpers and sample list are available
+  # ================================================================
+  if (!exists("rds_dir"))
+    rds_dir <- file.path(visium_root, "sample_rds")
+  dir.create(rds_dir, showWarnings = FALSE, recursive = TRUE)
 
-  # --- Helper: get or compute variable features ---
+  if (!exists("load_sample", mode = "function")) {
+    load_sample <- function(sample_name) {
+      p <- file.path(rds_dir, paste0(sample_name, ".rds"))
+      if (!file.exists(p)) return(NULL)
+      tryCatch(readRDS(p), error = function(e) NULL)
+    }
+  }
+
+  if (!exists("safe_GetAssayData", mode = "function")) {
+    safe_GetAssayData <- function(obj, layer = "data") {
+      tryCatch({
+        for (an in c("SCT", "RNA")) {
+          if (an %in% Assays(obj)) {
+            DefaultAssay(obj) <- an
+            mat <- tryCatch(
+              GetAssayData(obj, layer = layer),
+              error = function(e) {
+                tryCatch(GetAssayData(obj, slot = layer),
+                         error = function(e2) NULL)
+              })
+            if (!is.null(mat) && ncol(mat) > 0 && nrow(mat) > 0)
+              return(mat)
+          }
+        }
+        NULL
+      }, error = function(e) NULL)
+    }
+  }
+
+  if (!exists("extract_condition", mode = "function")) {
+    extract_condition <- function(sample_name) {
+      if (grepl("BPH",   sample_name)) return("BPH")
+      if (grepl("TRNA",  sample_name)) return("TRNA")
+      if (grepl("NEADT", sample_name)) return("NEADT")
+      if (grepl("CRPC",  sample_name)) return("CRPC")
+      if (grepl("MET",   sample_name)) return("MET")
+      return("Unknown")
+    }
+  }
+
+  if (!exists("compute_spot_size", mode = "function")) {
+    compute_spot_size <- function(coords) {
+      if (nrow(coords) < 2) return(1.5)
+      x_range <- diff(range(coords[, 1], na.rm = TRUE))
+      y_range <- diff(range(coords[, 2], na.rm = TRUE))
+      area <- x_range * y_range
+      if (area <= 0) return(1.5)
+      density <- nrow(coords) / area
+      size <- max(0.3, min(3.0, 1 / sqrt(density) * 10))
+      return(size)
+    }
+  }
+
+  # ================================================================
+  # Determine sample list
+  # ================================================================
+  if (!exists("successfully_loaded") ||
+      length(successfully_loaded) == 0) {
+    rds_files <- list.files(rds_dir, pattern = "\\.rds$",
+                            full.names = FALSE)
+    if (length(rds_files) > 0) {
+      successfully_loaded <- sub("\\.rds$", "", rds_files)
+      cat(paste0("  Found ", length(successfully_loaded), " RDS files\n"))
+    } else {
+      stop("No samples available")
+    }
+  }
+
+  # Validate: require zone_5class + dist_to_interface + coordinates
+  cat("  Validating samples (require zone_5class + dist_to_interface)...\n")
+  tier5_valid_samples <- character(0)
+  for (sn in successfully_loaded) {
+    obj <- load_sample(sn)
+    if (is.null(obj)) next
+    md <- obj@meta.data
+    ok <- "zone_5class" %in% colnames(md) &&
+      "dist_to_interface" %in% colnames(md) &&
+      all(c("row", "col") %in% colnames(md)) &&
+      sum(md$zone_5class == "Interface", na.rm = TRUE) > 0
+    if (ok) tier5_valid_samples <- c(tier5_valid_samples, sn)
+    else cat(paste0("    ", sn, ": skipped (missing zone_5class/dist/coords)\n"))
+    rm(obj); invisible(gc())
+  }
+  cat(paste0("  Valid samples for TIER 5: ", length(tier5_valid_samples), "\n"))
+  if (length(tier5_valid_samples) == 0)
+    stop("No valid samples with zone_5class + dist_to_interface")
+
+  conditions <- unique(sapply(tier5_valid_samples, extract_condition))
+
+  # ================================================================
+  # 5-Zone color scheme (consistent with TIER 1 & 2)
+  # ================================================================
+  zone5_colors <- c(
+    Interface     = "#E31A1C",
+    Proximal_NE   = "#FF7F00",
+    Distal_NE     = "#FDBF6F",
+    Epithelial    = "#33A02C",
+    Necrotic_Core = "#6A3D9A"
+  )
+
+  # Trajectory corridor: zones included in pseudotime analysis
+  # Necrotic_Core excluded — ghost mRNA would confound the trajectory
+  TRAJECTORY_ZONES <- c("Interface", "Proximal_NE", "Distal_NE", "Epithelial")
+
+  # Ordered factor levels for consistent plotting
+  ZONE5_LEVELS <- c("Interface", "Proximal_NE", "Distal_NE",
+                     "Epithelial", "Necrotic_Core")
+  TRAJECTORY_LEVELS <- c("Interface", "Proximal_NE", "Distal_NE", "Epithelial")
+
+  # ================================================================
+  # Helper: get or compute variable features
+  # ================================================================
   get_or_compute_vf <- function(obj, n_features = 2000) {
     img_bak <- obj@images
     obj@images <- list()
@@ -3998,78 +4137,68 @@ tryCatch({
     return(character(0))
   }
 
+  # ================================================================
+  # MAIN LOOP: Per condition
+  # ================================================================
   for (cond in conditions) {
-    cat(paste0("\n  TIER5 — condition: ", cond, "\n"))
-    cond_samples <- tier5_samples[sapply(tier5_samples, extract_condition) == cond]
-    if (length(cond_samples) == 0) next
+    cat(paste0("\n  =============================================\n"))
+    cat(paste0("  ===== TIER 5 — ", cond, " =====\n"))
+    cat(paste0("  =============================================\n"))
+
+    cond_samples <- tier5_valid_samples[
+      sapply(tier5_valid_samples, extract_condition) == cond]
+    if (length(cond_samples) == 0) {
+      cat("    No samples — skipping\n"); next
+    }
 
     # ============================================================
-    # Phase 1: Identify near-interface spots and variable features
+    # Phase 1: Select trajectory corridor spots (5-zone based)
     # ============================================================
-    near_iface_info <- list()  # sn -> list(cells)
+    # Include: Interface + Proximal_NE + Distal_NE + Epithelial
+    # Exclude: Necrotic_Core (ghost mRNA confounds trajectory)
+    # ============================================================
+    cat("\n    Phase 1: Selecting trajectory corridor spots...\n")
+    corridor_info <- list()   # sn -> list(cells)
     all_var_genes <- character(0)
 
     for (sn in cond_samples) {
       obj <- load_sample(sn)
-      if (is.null(obj)) { cat(paste0("    ", sn, ": load failed\n")); next }
+      if (is.null(obj)) {
+        cat(paste0("      ", sn, ": load failed\n")); next
+      }
       md <- obj@meta.data
 
-      # Determine near-interface spots using adaptive bins or distance
-      near_cells <- character(0)
+      # Select spots in the trajectory corridor (distance-based zones)
+      corridor_cells <- colnames(obj)[!is.na(md$zone_5class) &
+                                        md$zone_5class %in% TRAJECTORY_ZONES]
 
-      if ("dist_bin_adaptive" %in% colnames(md)) {
-        # Use the first 2-3 adaptive bins (interface + nearest)
-        all_bins <- sort(unique(md$dist_bin_adaptive[!is.na(md$dist_bin_adaptive)]))
-        # Always include interface; then take next 2 nearest bins
-        near_bin_names <- c("bin_0_interface")
-        other_bins <- setdiff(all_bins, "bin_0_interface")
-        near_bin_names <- c(near_bin_names, head(other_bins, 2))
-        near_cells <- colnames(obj)[!is.na(md$dist_bin_adaptive) &
-                                      md$dist_bin_adaptive %in% near_bin_names]
-        cat(paste0("    ", sn, ": using adaptive bins ",
-                   paste(near_bin_names, collapse = ", "), "\n"))
-
-      } else if ("dist_to_interface" %in% colnames(md)) {
-        # Fallback: use distance threshold (bottom 60% of distances)
-        d <- md$dist_to_interface
-        thresh <- quantile(d[d > 0], 0.6, na.rm = TRUE)
-        near_cells <- colnames(obj)[!is.na(d) & d <= thresh]
-        cat(paste0("    ", sn, ": using distance threshold <= ",
-                   round(thresh, 2), "\n"))
-
-      } else if ("interface_zone" %in% colnames(md)) {
-        # Fallback: use interface + neighboring zones
-        near_cells <- colnames(obj)[md$interface_zone %in%
-                                      c("Interface","ASPC_high","AR_high","NEPC_high")]
-        cat(paste0("    ", sn, ": using zone-based selection\n"))
-
-      } else {
-        cat(paste0("    ", sn, ": no spatial data — skipping\n"))
+      if (length(corridor_cells) < 20) {
+        cat(paste0("      ", sn, ": only ", length(corridor_cells),
+                   " corridor spots — skipping\n"))
         rm(obj); invisible(gc()); next
       }
 
-      if (length(near_cells) < 10) {
-        cat(paste0("    ", sn, ": only ", length(near_cells),
-                   " near-interface spots — skipping\n"))
-        rm(obj); invisible(gc()); next
-      }
+      # Report zone composition within corridor
+      zone_tbl <- table(md$zone_5class[md$zone_5class %in% TRAJECTORY_ZONES])
+      cat(paste0("      ", sn, ": ", length(corridor_cells), " spots (",
+                 paste(paste0(names(zone_tbl), "=", zone_tbl), collapse = ", "),
+                 ")\n"))
 
       # Get variable features
       vf <- get_or_compute_vf(obj, n_features = 2000)
 
-      near_iface_info[[sn]] <- list(cells = near_cells)
+      corridor_info[[sn]] <- list(cells = corridor_cells)
       all_var_genes <- union(all_var_genes, vf)
-      cat(paste0("    ", sn, ": ", length(near_cells), " spots, ",
-                 length(vf), " VF\n"))
 
       rm(obj); invisible(gc())
     }
 
-    cat(paste0("    Samples with near-interface spots: ",
-               length(near_iface_info), "\n"))
-    cat(paste0("    Union of variable genes: ", length(all_var_genes), "\n"))
+    cat(paste0("    Samples with corridor spots: ",
+               length(corridor_info), "\n"))
+    cat(paste0("    Union of variable genes: ",
+               length(all_var_genes), "\n"))
 
-    if (length(near_iface_info) == 0) {
+    if (length(corridor_info) == 0) {
       cat(paste0("    No usable samples for ", cond, " — skipping\n"))
       next
     }
@@ -4083,19 +4212,20 @@ tryCatch({
     # ============================================================
     # Phase 2: Collect expression matrices (one sample at a time)
     # ============================================================
+    cat("\n    Phase 2: Collecting expression data...\n")
     expr_list <- list()
     sample_gene_sets <- list()
 
-    for (sn in names(near_iface_info)) {
+    for (sn in names(corridor_info)) {
       obj <- load_sample(sn)
       if (is.null(obj)) next
 
       expr_mat <- safe_GetAssayData(obj, layer = "data")
       if (is.null(expr_mat)) { rm(obj); invisible(gc()); next }
 
-      cells <- near_iface_info[[sn]]$cells
+      cells <- corridor_info[[sn]]$cells
       cells <- cells[cells %in% colnames(expr_mat)]
-      if (length(cells) < 10) { rm(obj, expr_mat); invisible(gc()); next }
+      if (length(cells) < 20) { rm(obj, expr_mat); invisible(gc()); next }
 
       genes_avail <- intersect(all_var_genes, rownames(expr_mat))
       if (length(genes_avail) < 20) { rm(obj, expr_mat); invisible(gc()); next }
@@ -4111,7 +4241,7 @@ tryCatch({
       next
     }
 
-    # Align to common genes across all samples (prevents cbind mismatch)
+    # Align to common genes across all samples
     if (length(sample_gene_sets) >= 2) {
       common_vf <- Reduce(intersect, sample_gene_sets)
     } else {
@@ -4134,9 +4264,13 @@ tryCatch({
     cat(paste0("    Combined: ", length(common_vf), " genes x ",
                total_spots, " spots\n"))
 
+    # ============================================================
+    # Phase 3: PCA
+    # ============================================================
+    cat("\n    Phase 3: PCA...\n")
     expr_t <- t(as.matrix(expr_combined))
 
-    # Remove zero-variance genes (PCA requires nonzero variance)
+    # Remove zero-variance genes
     gene_vars <- apply(expr_t, 2, var, na.rm = TRUE)
     nonzero <- gene_vars > 0 & !is.na(gene_vars)
     if (sum(nonzero) < 20) {
@@ -4144,14 +4278,10 @@ tryCatch({
       rm(expr_combined, expr_t); invisible(gc()); next
     }
     expr_t <- expr_t[, nonzero, drop = FALSE]
-    # Keep expr_combined aligned
     expr_combined <- expr_combined[colnames(expr_t), , drop = FALSE]
 
     cat(paste0("    After variance filter: ", ncol(expr_t), " genes\n"))
 
-    # ============================================================
-    # Phase 3: PCA + Pseudotime
-    # ============================================================
     n_pcs <- min(10, ncol(expr_t) - 1, nrow(expr_t) - 1)
     if (n_pcs < 2) {
       cat(paste0("    Not enough dims for PCA — skipping ", cond, "\n"))
@@ -4168,12 +4298,15 @@ tryCatch({
     if (is.null(pca_res)) { rm(expr_combined, expr_t); invisible(gc()); next }
 
     pc_scores <- pca_res$x
-    pca_var_explained <- summary(pca_res)$importance[2, ]  # proportion of variance
+    pca_var_explained <- summary(pca_res)$importance[2, ]
     cat(paste0("    PCA: ", ncol(pc_scores), " PCs, ",
                "PC1 var=", round(pca_var_explained[1] * 100, 1), "%\n"))
     rm(pca_res); invisible(gc())
 
-    # Fit principal curve or use PC1
+    # ============================================================
+    # Phase 4: Pseudotime via principal curve or PC1
+    # ============================================================
+    cat("\n    Phase 4: Computing pseudotime...\n")
     pseudotime <- tryCatch({
       if (have_princurve) {
         n_fit <- min(5, ncol(pc_scores))
@@ -4199,75 +4332,125 @@ tryCatch({
                round(max(pseudotime), 3), "]\n"))
 
     # ============================================================
-    # Phase 4: Collect metadata (reload one sample at a time)
+    # Phase 5: Collect metadata (reload one sample at a time)
     # ============================================================
+    cat("\n    Phase 5: Collecting metadata...\n")
     meta_list <- list()
-    for (sn in names(near_iface_info)) {
+    for (sn in names(corridor_info)) {
       obj <- load_sample(sn)
       if (is.null(obj)) next
-      cells <- near_iface_info[[sn]]$cells
+      cells <- corridor_info[[sn]]$cells
       cells <- cells[cells %in% colnames(obj)]
       if (length(cells) == 0) { rm(obj); invisible(gc()); next }
       md <- obj@meta.data[cells, ]
 
       meta_list[[sn]] <- data.frame(
-        barcode          = cells,
-        sample_id        = sn,
-        condition        = extract_condition(sn),
-        interface_zone   = if ("interface_zone" %in% colnames(md)) md$interface_zone else NA,
+        barcode           = cells,
+        sample_id         = sn,
+        condition         = extract_condition(sn),
+        zone_5class       = if ("zone_5class" %in% colnames(md)) md$zone_5class else NA,
         dist_to_interface = if ("dist_to_interface" %in% colnames(md)) md$dist_to_interface else NA_real_,
-        dist_bin_adaptive = if ("dist_bin_adaptive" %in% colnames(md)) md$dist_bin_adaptive else NA,
-        ASPC_score       = if ("ASPC_score" %in% colnames(md)) md$ASPC_score else NA_real_,
-        AR_score         = if ("AR_score" %in% colnames(md)) md$AR_score else NA_real_,
-        NEPC_UP_score    = if ("NEPC_UP_score" %in% colnames(md)) md$NEPC_UP_score else NA_real_,
-        NEPC_Beltran_NET = if ("NEPC_Beltran_NET" %in% colnames(md)) md$NEPC_Beltran_NET else NA_real_,
-        row = if ("row" %in% colnames(md)) md$row else NA_real_,
-        col = if ("col" %in% colnames(md)) md$col else NA_real_,
-        stringsAsFactors = FALSE
+        ASPC_score        = if ("ASPC_score" %in% colnames(md)) md$ASPC_score else NA_real_,
+        AR_score          = if ("AR_score" %in% colnames(md)) md$AR_score else NA_real_,
+        NEPC_UP_score     = if ("NEPC_UP_score" %in% colnames(md)) md$NEPC_UP_score else NA_real_,
+        NEPC_Beltran_NET  = if ("NEPC_Beltran_NET" %in% colnames(md)) md$NEPC_Beltran_NET else NA_real_,
+        row               = if ("row" %in% colnames(md)) md$row else NA_real_,
+        col               = if ("col" %in% colnames(md)) md$col else NA_real_,
+        stringsAsFactors  = FALSE
       )
       rm(obj); invisible(gc())
     }
 
-    all_near_meta <- do.call(rbind, meta_list)
+    corridor_meta <- do.call(rbind, meta_list)
     rm(meta_list); invisible(gc())
 
     # ============================================================
     # Align pseudotime to metadata by barcode
     # ============================================================
     expr_barcodes <- colnames(expr_combined)
-    meta_barcodes <- all_near_meta$barcode
+    meta_barcodes <- corridor_meta$barcode
 
     common_bcs <- intersect(expr_barcodes, meta_barcodes)
     cat(paste0("    Barcode alignment: expr=", length(expr_barcodes),
-               ", meta=", nrow(all_near_meta),
+               ", meta=", nrow(corridor_meta),
                ", common=", length(common_bcs), "\n"))
 
     if (length(common_bcs) < 20) {
       cat(paste0("    Too few common barcodes — skipping ", cond, "\n"))
-      rm(all_near_meta, expr_combined, expr_t, pc_scores, pseudotime)
+      rm(corridor_meta, expr_combined, expr_t, pc_scores, pseudotime)
       invisible(gc()); next
     }
 
-    # Subset and align both
-    all_near_meta <- all_near_meta[match(common_bcs, all_near_meta$barcode), ]
+    # Subset and align
+    corridor_meta <- corridor_meta[match(common_bcs, corridor_meta$barcode), ]
     pt_idx <- match(common_bcs, expr_barcodes)
     pseudotime <- pseudotime[pt_idx]
     pc_scores <- pc_scores[pt_idx, , drop = FALSE]
     expr_combined <- expr_combined[, common_bcs, drop = FALSE]
 
-    all_near_meta$pseudotime <- pseudotime
+    corridor_meta$pseudotime <- pseudotime
+
+    # Orient pseudotime: ensure Interface has LOWER pseudotime
+    # (flip if Interface median > Epithelial median)
+    iface_pt_med <- median(
+      corridor_meta$pseudotime[corridor_meta$zone_5class == "Interface"],
+      na.rm = TRUE)
+    epi_pt_med <- median(
+      corridor_meta$pseudotime[corridor_meta$zone_5class == "Epithelial"],
+      na.rm = TRUE)
+    if (!is.na(iface_pt_med) && !is.na(epi_pt_med) &&
+        iface_pt_med > epi_pt_med) {
+      cat("    Flipping pseudotime orientation (Interface should be low)\n")
+      corridor_meta$pseudotime <- 1 - corridor_meta$pseudotime
+      pseudotime <- corridor_meta$pseudotime
+    }
+
+    # Make zone_5class an ordered factor for plotting
+    corridor_meta$zone_5class <- factor(
+      corridor_meta$zone_5class, levels = TRAJECTORY_LEVELS)
 
     # Save data table
-    write.csv(all_near_meta,
-              file.path(tier5_dir, paste0(cond, "_pseudotime_data.csv")),
+    write.csv(corridor_meta,
+              file.path(tier5_dir, paste0(cond, "_pseudotime_5zone_data.csv")),
               row.names = FALSE)
 
+    # Report zone x pseudotime summary
+    zone_pt_summary <- tapply(corridor_meta$pseudotime,
+                              corridor_meta$zone_5class, function(x) {
+                                c(median = median(x, na.rm = TRUE),
+                                  mean   = mean(x, na.rm = TRUE),
+                                  n      = length(x))
+                              })
+    cat("    Zone pseudotime summary:\n")
+    for (zn in TRAJECTORY_LEVELS) {
+      if (zn %in% names(zone_pt_summary)) {
+        s <- zone_pt_summary[[zn]]
+        cat(paste0("      ", formatC(zn, width = 15, flag = "-"),
+                   ": median=", round(s["median"], 3),
+                   "  mean=", round(s["mean"], 3),
+                   "  n=", s["n"], "\n"))
+      }
+    }
+
+    # Check monotonicity: Interface < Proximal < Distal < Epithelial
+    zone_medians <- sapply(TRAJECTORY_LEVELS, function(zn) {
+      median(corridor_meta$pseudotime[corridor_meta$zone_5class == zn],
+             na.rm = TRUE)
+    })
+    is_monotonic <- all(diff(zone_medians[!is.na(zone_medians)]) >= 0)
+    cat(paste0("    Pseudotime monotonicity: ",
+               paste(round(zone_medians, 3), collapse = " < "),
+               ifelse(is_monotonic,
+                      " ** MONOTONIC CONFIRMED **",
+                      " -- not monotonic --"), "\n"))
+
     # ============================================================
-    # Phase 5: Spearman correlations of scores with pseudotime
+    # Phase 6: Spearman correlations of scores with pseudotime
     # ============================================================
-    score_cols_pt <- c("ASPC_score","AR_score","NEPC_UP_score","NEPC_Beltran_NET")
+    cat("\n    Phase 6: Score-pseudotime correlations...\n")
+    score_cols_pt <- c("ASPC_score", "AR_score", "NEPC_UP_score", "NEPC_Beltran_NET")
     cor_table <- lapply(score_cols_pt, function(sc) {
-      v <- all_near_meta[[sc]]
+      v <- corridor_meta[[sc]]
       if (all(is.na(v))) return(NULL)
       ct <- tryCatch(
         cor.test(pseudotime, v, method = "spearman",
@@ -4281,26 +4464,42 @@ tryCatch({
     cor_df <- do.call(rbind, Filter(Negate(is.null), cor_table))
     if (!is.null(cor_df) && nrow(cor_df) > 0) {
       write.csv(cor_df,
-                file.path(tier5_dir, paste0(cond, "_pseudotime_score_correlations.csv")),
+                file.path(tier5_dir,
+                          paste0(cond, "_pseudotime_score_correlations_5zone.csv")),
                 row.names = FALSE)
       for (ri in seq_len(nrow(cor_df))) {
+        expected <- switch(cor_df$score[ri],
+                           ASPC_score       = "negative",
+                           AR_score         = "positive",
+                           NEPC_UP_score    = "negative",
+                           NEPC_Beltran_NET = "negative",
+                           "unknown")
+        actual_dir <- ifelse(cor_df$rho[ri] > 0, "positive", "negative")
+        match_str <- ifelse(actual_dir == expected,
+                            " MATCHES EXPECTATION",
+                            " DOES NOT MATCH")
         cat(paste0("      ", cor_df$score[ri], ": rho=",
                    round(cor_df$rho[ri], 3), ", p=",
-                   formatC(cor_df$pvalue[ri], format = "e", digits = 2), "\n"))
+                   formatC(cor_df$pvalue[ri], format = "e", digits = 2),
+                   " (expected ", expected, ")", match_str, "\n"))
       }
     }
 
     # ============================================================
-    # Phase 6: Transition genes (gene ~ pseudotime correlation)
+    # Phase 7: Transition genes (gene ~ pseudotime correlation)
     # ============================================================
+    cat("\n    Phase 7: Identifying transition genes...\n")
     trans_sig <- NULL
+    trans_genes_df <- NULL
+
     gene_pt_cor <- tryCatch({
       expr_for_cor <- as.matrix(expr_combined)
       n_genes <- nrow(expr_for_cor)
-      cat(paste0("    Computing gene-pseudotime correlations for ",
+      cat(paste0("      Computing gene-pseudotime correlations for ",
                  n_genes, " genes...\n"))
       result <- matrix(NA_real_, nrow = 2, ncol = n_genes,
-                       dimnames = list(c("rho","pvalue"), rownames(expr_for_cor)))
+                       dimnames = list(c("rho", "pvalue"),
+                                       rownames(expr_for_cor)))
       for (gi in seq_len(n_genes)) {
         y <- expr_for_cor[gi, ]
         ct <- tryCatch(
@@ -4313,7 +4512,8 @@ tryCatch({
       }
       result
     }, error = function(e) {
-      cat(paste0("    Gene-PT correlation error: ", conditionMessage(e), "\n"))
+      cat(paste0("      Gene-PT correlation error: ",
+                 conditionMessage(e), "\n"))
       NULL
     })
 
@@ -4332,9 +4532,15 @@ tryCatch({
       trans_genes_df$in_NEPC_UP <- trans_genes_df$gene %in% NEPC_Beltran_UP
       trans_genes_df$in_NEPC_DN <- trans_genes_df$gene %in% NEPC_Beltran_DOWN
 
+      # Annotate transition direction
+      trans_genes_df$direction <- ifelse(
+        trans_genes_df$rho > 0, "increasing_with_distance",
+        "decreasing_with_distance")
+
       # Save all
       write.csv(trans_genes_df,
-                file.path(tier5_dir, paste0(cond, "_transition_genes_all.csv")),
+                file.path(tier5_dir,
+                          paste0(cond, "_transition_genes_5zone_all.csv")),
                 row.names = FALSE)
 
       # Filter significant
@@ -4345,85 +4551,133 @@ tryCatch({
       trans_sig <- trans_sig[order(abs(trans_sig$rho), decreasing = TRUE), ]
 
       write.csv(trans_sig,
-                file.path(tier5_dir, paste0(cond, "_transition_genes_sig.csv")),
+                file.path(tier5_dir,
+                          paste0(cond, "_transition_genes_5zone_sig.csv")),
                 row.names = FALSE)
-      cat(paste0("    Transition genes (|rho|>0.2, padj<0.05): ",
-                 nrow(trans_sig), " / ", nrow(trans_genes_df), "\n"))
+
+      n_inc <- sum(trans_sig$rho > 0)
+      n_dec <- sum(trans_sig$rho < 0)
+      cat(paste0("      Transition genes (|rho|>0.2, padj<0.05): ",
+                 nrow(trans_sig), " / ", nrow(trans_genes_df),
+                 " (", n_inc, " increasing, ", n_dec, " decreasing)\n"))
     }
 
     # ============================================================
-    # Phase 7: Multi-page PDF output
+    # Phase 8: Per-zone transition gene expression (zone means)
     # ============================================================
-    cat(paste0("    Generating PDF for ", cond, "...\n"))
+    cat("\n    Phase 8: Per-zone transition gene expression...\n")
+    zone_gene_means <- NULL
+    if (!is.null(trans_sig) && nrow(trans_sig) > 0) {
+      top_trans <- head(trans_sig$gene, min(50, nrow(trans_sig)))
+      top_trans <- top_trans[top_trans %in% rownames(expr_combined)]
 
-    pdf(file.path(tier5_dir, paste0(cond, "_TIER5_trajectory_results.pdf")),
+      if (length(top_trans) >= 3) {
+        zone_gene_means <- sapply(TRAJECTORY_LEVELS, function(zn) {
+          idx <- which(corridor_meta$zone_5class == zn)
+          if (length(idx) < 3) return(rep(NA, length(top_trans)))
+          rowMeans(expr_combined[top_trans, idx, drop = FALSE], na.rm = TRUE)
+        })
+        rownames(zone_gene_means) <- top_trans
+        colnames(zone_gene_means) <- TRAJECTORY_LEVELS
+
+        write.csv(zone_gene_means,
+                  file.path(tier5_dir,
+                            paste0(cond, "_transition_gene_zone_means.csv")),
+                  row.names = TRUE)
+        cat(paste0("      Zone means computed for ", nrow(zone_gene_means),
+                   " transition genes\n"))
+      }
+    }
+
+    # ============================================================
+    # Phase 9: Multi-page PDF output
+    # ============================================================
+    cat(paste0("\n    Phase 9: Generating PDF for ", cond, "...\n"))
+
+    pdf(file.path(tier5_dir,
+                  paste0(cond, "_TIER5_trajectory_5zone.pdf")),
         width = 11, height = 8.5)
 
     # ---- Page 1: Spatial pseudotime map ----
-    if (all(c("col","row") %in% colnames(all_near_meta)) &&
-        !all(is.na(all_near_meta$col))) {
-      spot_sz <- compute_spot_size(all_near_meta[, c("col","row")])
-      p_spatial <- ggplot(all_near_meta, aes(x = col, y = -row,
-                                             color = pseudotime)) +
+    if (all(c("col", "row") %in% colnames(corridor_meta)) &&
+        !all(is.na(corridor_meta$col))) {
+      spot_sz <- compute_spot_size(corridor_meta[, c("col", "row")])
+      p_spatial_pt <- ggplot(corridor_meta,
+                             aes(x = col, y = -row, color = pseudotime)) +
         geom_point(size = spot_sz) +
         scale_color_viridis_c(option = "plasma") +
-        labs(title = paste0(cond, " — Spatial Pseudotime Map"),
-             subtitle = paste0(nrow(all_near_meta), " spots from ",
-                               length(unique(all_near_meta$sample_id)),
-                               " samples"),
+        labs(title = paste0(cond, " — Spatial Pseudotime Map (5-Zone Corridor)"),
+             subtitle = paste0(nrow(corridor_meta), " spots from ",
+                               length(unique(corridor_meta$sample_id)),
+                               " samples | Necrotic Core excluded"),
              x = "Array Col", y = "Array Row (inv)",
              color = "Pseudotime") +
-        theme_minimal(base_size = 10)
-      print(p_spatial)
+        theme_minimal(base_size = 10) +
+        coord_fixed()
+      print(p_spatial_pt)
       cat("      Page: spatial pseudotime map\n")
     }
 
-    # ---- Page 2: PCA colored by pseudotime ----
+    # ---- Page 2: Spatial 5-zone map (corridor only) ----
+    if (all(c("col", "row") %in% colnames(corridor_meta)) &&
+        !all(is.na(corridor_meta$col))) {
+      spot_sz <- compute_spot_size(corridor_meta[, c("col", "row")])
+      p_spatial_zone <- ggplot(corridor_meta,
+                               aes(x = col, y = -row, color = zone_5class)) +
+        geom_point(size = spot_sz) +
+        scale_color_manual(values = zone5_colors, drop = FALSE) +
+        labs(title = paste0(cond, " — 5-Zone Spatial Map (Trajectory Corridor)"),
+             subtitle = "Interface (red) → Proximal NE → Distal NE → Epithelial (green)",
+             x = "Array Col", y = "Array Row (inv)",
+             color = "Zone") +
+        theme_minimal(base_size = 10) +
+        coord_fixed()
+      print(p_spatial_zone)
+      cat("      Page: spatial 5-zone map\n")
+    }
+
+    # ---- Page 3: PCA colored by pseudotime ----
     if (ncol(pc_scores) >= 2) {
       pca_df <- data.frame(
         PC1 = pc_scores[, 1], PC2 = pc_scores[, 2],
-        pseudotime = pseudotime
+        pseudotime = pseudotime,
+        zone = corridor_meta$zone_5class
       )
-      p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = pseudotime)) +
+      p_pca_pt <- ggplot(pca_df, aes(x = PC1, y = PC2, color = pseudotime)) +
         geom_point(size = 0.8, alpha = 0.6) +
         scale_color_viridis_c(option = "plasma") +
         labs(title = paste0(cond, " — PCA (colored by pseudotime)"),
-             subtitle = paste0("PC1: ", round(pca_var_explained[1]*100,1),
-                               "%, PC2: ", round(pca_var_explained[2]*100,1), "%"),
+             subtitle = paste0("PC1: ", round(pca_var_explained[1] * 100, 1),
+                               "%, PC2: ", round(pca_var_explained[2] * 100, 1), "%"),
              x = "PC1", y = "PC2", color = "Pseudotime") +
         theme_minimal(base_size = 10)
-      print(p_pca)
+      print(p_pca_pt)
 
-      # Also color by interface zone
-      if ("interface_zone" %in% colnames(all_near_meta) &&
-          !all(is.na(all_near_meta$interface_zone))) {
-        pca_df$zone <- all_near_meta$interface_zone
-        zone_colors <- c(Interface = "#E31A1C", ASPC_high = "#1F78B4",
-                         AR_high = "#33A02C", NEPC_high = "#FF7F00",
-                         Other = "#CCCCCC")
-        p_pca_zone <- ggplot(pca_df, aes(x = PC1, y = PC2, color = zone)) +
-          geom_point(size = 0.8, alpha = 0.5) +
-          scale_color_manual(values = zone_colors) +
-          labs(title = paste0(cond, " — PCA (colored by zone)"),
-               x = "PC1", y = "PC2", color = "Zone") +
-          theme_minimal(base_size = 10)
-        print(p_pca_zone)
-      }
+      # ---- Page 4: PCA colored by 5-zone ----
+      p_pca_zone <- ggplot(pca_df, aes(x = PC1, y = PC2, color = zone)) +
+        geom_point(size = 0.8, alpha = 0.5) +
+        scale_color_manual(values = zone5_colors, drop = FALSE) +
+        labs(title = paste0(cond, " — PCA (colored by 5-Zone)"),
+             subtitle = "Expect: zones separate along PC1, Interface between NE and Epithelial",
+             x = "PC1", y = "PC2", color = "Zone") +
+        theme_minimal(base_size = 10)
+      print(p_pca_zone)
       cat("      Page: PCA plots\n")
     }
 
-    # ---- Page 3: Pseudotime distribution ----
-    p_hist <- ggplot(all_near_meta, aes(x = pseudotime)) +
+    # ---- Page 5: Pseudotime distribution ----
+    p_hist <- ggplot(corridor_meta, aes(x = pseudotime)) +
       geom_histogram(bins = 50, fill = "steelblue", color = "white",
                      alpha = 0.8) +
-      labs(title = paste0(cond, " — Pseudotime Distribution"),
+      labs(title = paste0(cond, " — Pseudotime Distribution (Corridor Spots)"),
+           subtitle = paste0(nrow(corridor_meta), " spots"),
            x = "Pseudotime", y = "Count") +
       theme_minimal(base_size = 10)
     print(p_hist)
 
     # Per-sample density
-    p_density <- ggplot(all_near_meta, aes(x = pseudotime,
-                                           color = sample_id)) +
+    p_density <- ggplot(corridor_meta,
+                        aes(x = pseudotime, color = sample_id)) +
       geom_density(linewidth = 0.6, alpha = 0.5) +
       labs(title = paste0(cond, " — Pseudotime Density per Sample"),
            x = "Pseudotime", y = "Density") +
@@ -4433,72 +4687,120 @@ tryCatch({
     print(p_density)
     cat("      Page: pseudotime distribution\n")
 
-    # ---- Page 4: Pseudotime vs distance to interface ----
-    if ("dist_to_interface" %in% colnames(all_near_meta) &&
-        !all(is.na(all_near_meta$dist_to_interface))) {
+    # ---- Page 6: KEY VALIDATION — Pseudotime by 5-Zone boxplot ----
+    p_pt_zone <- ggplot(corridor_meta,
+                        aes(x = zone_5class, y = pseudotime,
+                            fill = zone_5class)) +
+      geom_boxplot(outlier.size = 0.5, alpha = 0.8) +
+      geom_violin(alpha = 0.3, color = NA) +
+      scale_fill_manual(values = zone5_colors, drop = FALSE) +
+      geom_hline(yintercept = 0.5, linetype = "dashed", color = "grey50") +
+      labs(title = paste0(cond, " — Pseudotime by 5-Zone (KEY VALIDATION)"),
+           subtitle = paste0(
+             "Expect monotonic: Interface < Proximal NE < Distal NE < Epithelial",
+             ifelse(is_monotonic,
+                    "  |  ** CONFIRMED **",
+                    "  |  -- not confirmed --")),
+           x = "Zone (distance-based)", y = "Pseudotime",
+           fill = "Zone") +
+      theme_minimal(base_size = 11) +
+      theme(legend.position = "none",
+            axis.text.x = element_text(angle = 20, hjust = 1))
+    print(p_pt_zone)
+    cat("      Page: pseudotime by 5-zone (key validation)\n")
+
+    # ---- Page 7: Pseudotime vs physical distance ----
+    if ("dist_to_interface" %in% colnames(corridor_meta) &&
+        !all(is.na(corridor_meta$dist_to_interface))) {
       rho_dist <- tryCatch({
-        ct <- cor.test(all_near_meta$pseudotime,
-                       all_near_meta$dist_to_interface,
+        ct <- cor.test(corridor_meta$pseudotime,
+                       corridor_meta$dist_to_interface,
                        method = "spearman", exact = FALSE)
         paste0("rho=", round(ct$estimate, 3),
                ", p=", formatC(ct$p.value, format = "e", digits = 2))
       }, error = function(e) "")
 
-      p_pt_dist <- ggplot(all_near_meta,
-                          aes(x = pseudotime, y = dist_to_interface)) +
-        geom_point(size = 0.3, alpha = 0.15, color = "grey40") +
-        geom_smooth(method = "loess", color = "blue", linewidth = 1) +
+      p_pt_dist <- ggplot(corridor_meta,
+                          aes(x = pseudotime, y = dist_to_interface,
+                              color = zone_5class)) +
+        geom_point(size = 0.5, alpha = 0.3) +
+        scale_color_manual(values = zone5_colors, drop = FALSE) +
+        geom_smooth(aes(group = 1), method = "loess",
+                    color = "black", linewidth = 1.2, se = TRUE) +
         labs(title = paste0(cond, " — Pseudotime vs Distance to Interface"),
-             subtitle = rho_dist,
-             x = "Pseudotime", y = "Distance to Interface") +
+             subtitle = paste0("Spearman ", rho_dist,
+                               " | Strong positive = trajectory follows spatial gradient"),
+             x = "Pseudotime", y = "Distance to Interface",
+             color = "Zone") +
         theme_minimal(base_size = 10)
       print(p_pt_dist)
       cat("      Page: pseudotime vs distance\n")
     }
 
-    # ---- Page 5: Pseudotime by adaptive distance bin ----
-    if ("dist_bin_adaptive" %in% colnames(all_near_meta) &&
-        !all(is.na(all_near_meta$dist_bin_adaptive))) {
-      p_box_bin <- ggplot(all_near_meta,
-                          aes(x = dist_bin_adaptive, y = pseudotime,
-                              fill = dist_bin_adaptive)) +
-        geom_boxplot(outlier.size = 0.3) +
-        labs(title = paste0(cond, " — Pseudotime by Distance Bin"),
-             x = "Distance Bin", y = "Pseudotime") +
-        theme_minimal(base_size = 10) +
-        theme(axis.text.x = element_text(angle = 45, hjust = 1),
-              legend.position = "none")
-      print(p_box_bin)
-      cat("      Page: pseudotime by bin\n")
-    }
-
-    # ---- Pages 6+: Score vs pseudotime scatters ----
+    # ---- Pages 8+: Score vs pseudotime scatters ----
     for (sc in score_cols_pt) {
-      if (!sc %in% colnames(all_near_meta) ||
-          all(is.na(all_near_meta[[sc]]))) next
+      if (!sc %in% colnames(corridor_meta) ||
+          all(is.na(corridor_meta[[sc]]))) next
 
       rho_str <- ""
+      expected <- switch(sc,
+                         ASPC_score       = "negative",
+                         AR_score         = "positive",
+                         NEPC_UP_score    = "negative",
+                         NEPC_Beltran_NET = "negative",
+                         "unknown")
       if (!is.null(cor_df) && nrow(cor_df) > 0 && sc %in% cor_df$score) {
         rv <- cor_df$rho[cor_df$score == sc]
         pv <- cor_df$pvalue[cor_df$score == sc]
+        actual_dir <- ifelse(rv > 0, "positive", "negative")
+        match_str <- ifelse(actual_dir == expected, " MATCHES", " MISMATCH")
         rho_str <- paste0("rho=", round(rv, 3),
-                          ", p=", formatC(pv, format = "e", digits = 2))
+                          ", p=", formatC(pv, format = "e", digits = 2),
+                          " (expected ", expected, ")", match_str)
       }
 
-      p_sc <- ggplot(all_near_meta,
-                     aes(x = pseudotime, y = .data[[sc]])) +
-        geom_point(size = 0.3, alpha = 0.15, color = "grey40") +
-        geom_smooth(method = "loess", color = "blue",
-                    linewidth = 1.2, se = TRUE) +
+      p_sc <- ggplot(corridor_meta,
+                     aes(x = pseudotime, y = .data[[sc]],
+                         color = zone_5class)) +
+        geom_point(size = 0.3, alpha = 0.2) +
+        scale_color_manual(values = zone5_colors, drop = FALSE) +
+        geom_smooth(aes(group = 1), method = "loess",
+                    color = "black", linewidth = 1.2, se = TRUE) +
         labs(title = paste0(cond, " — ", sc, " vs Pseudotime"),
              subtitle = rho_str,
-             x = "Pseudotime", y = sc) +
+             x = "Pseudotime", y = sc, color = "Zone") +
         theme_minimal(base_size = 10)
       print(p_sc)
     }
     cat("      Page: score vs pseudotime scatters\n")
 
-    # ---- Transition gene heatmap ----
+    # ---- Page: Score trends across 5-zones (boxplot panel) ----
+    tryCatch({
+      score_zone_long <- tidyr::pivot_longer(
+        corridor_meta,
+        cols = all_of(intersect(score_cols_pt, colnames(corridor_meta))),
+        names_to = "score_type", values_to = "value")
+      score_zone_long <- score_zone_long[!is.na(score_zone_long$value), ]
+
+      if (nrow(score_zone_long) > 0) {
+        p_score_zone <- ggplot(score_zone_long,
+                               aes(x = zone_5class, y = value,
+                                   fill = zone_5class)) +
+          geom_boxplot(outlier.size = 0.3) +
+          scale_fill_manual(values = zone5_colors, drop = FALSE) +
+          facet_wrap(~ score_type, scales = "free_y", ncol = 2) +
+          labs(title = paste0(cond, " — Signature Scores Across 5-Zones"),
+               subtitle = "Expect: NEPC_UP & ASPC decrease, AR increases Interface -> Epithelial",
+               x = "Zone", y = "Score") +
+          theme_minimal(base_size = 10) +
+          theme(axis.text.x = element_text(angle = 30, hjust = 1),
+                legend.position = "none")
+        print(p_score_zone)
+        cat("      Page: score trends across zones\n")
+      }
+    }, error = function(e) NULL)
+
+    # ---- Transition gene heatmap (ordered by pseudotime, annotated by zone) ----
     if (!is.null(trans_sig) && nrow(trans_sig) > 0) {
       top_trans <- head(trans_sig$gene, min(40, nrow(trans_sig)))
       top_trans <- top_trans[top_trans %in% rownames(expr_combined)]
@@ -4512,19 +4814,25 @@ tryCatch({
         heat_scaled[is.na(heat_scaled)] <- 0
 
         if (have_pheatmap) {
-          # Pseudotime bin annotation
+          # Zone + pseudotime bin annotation
           pt_sorted <- pseudotime[pt_order]
+          zone_sorted <- as.character(corridor_meta$zone_5class[pt_order])
           pt_bins <- cut(pt_sorted, breaks = 5, labels = FALSE)
           annot_col <- data.frame(
-            PT_bin = factor(pt_bins),
+            Zone    = factor(zone_sorted, levels = TRAJECTORY_LEVELS),
+            PT_bin  = factor(pt_bins),
             row.names = colnames(heat_mat)
+          )
+          annot_colors <- list(
+            Zone = zone5_colors[TRAJECTORY_LEVELS]
           )
           pheatmap(heat_scaled,
                    cluster_cols = FALSE, cluster_rows = TRUE,
                    show_colnames = FALSE,
                    annotation_col = annot_col,
+                   annotation_colors = annot_colors,
                    main = paste0(cond,
-                                 " — Top Transition Genes Along Pseudotime"),
+                                 " — Top Transition Genes Along Pseudotime (5-Zone)"),
                    fontsize_row = 7)
         } else {
           heatmap(heat_scaled, Colv = NA, scale = "none", labCol = "",
@@ -4532,6 +4840,25 @@ tryCatch({
         }
         cat("      Page: transition gene heatmap\n")
       }
+    }
+
+    # ---- Zone-mean heatmap for transition genes ----
+    if (!is.null(zone_gene_means) && nrow(zone_gene_means) >= 3) {
+      tryCatch({
+        zgm_scaled <- t(scale(t(zone_gene_means)))
+        zgm_scaled[is.na(zgm_scaled)] <- 0
+        zgm_scaled[zgm_scaled > 2]  <-  2
+        zgm_scaled[zgm_scaled < -2] <- -2
+
+        if (have_pheatmap) {
+          pheatmap(zgm_scaled,
+                   cluster_cols = FALSE,
+                   main = paste0(cond,
+                                 " — Transition Gene Mean Expression by Zone"),
+                   fontsize_row = 7, fontsize_col = 10)
+        }
+        cat("      Page: zone-mean heatmap\n")
+      }, error = function(e) NULL)
     }
 
     # ---- Top 12 transition gene individual curves ----
@@ -4544,20 +4871,25 @@ tryCatch({
         for (gg in top12) {
           gdf <- data.frame(
             pseudotime = pseudotime,
-            expr = as.numeric(expr_combined[gg, ])
+            expr       = as.numeric(expr_combined[gg, ]),
+            zone       = corridor_meta$zone_5class
           )
           rho_g <- trans_sig$rho[trans_sig$gene == gg]
           padj_g <- trans_sig$padj[trans_sig$gene == gg]
+          dir_g <- trans_sig$direction[trans_sig$gene == gg]
           sub_txt <- paste0("rho=", round(rho_g, 3),
-                            "  padj=", formatC(padj_g, format = "e", digits = 2))
+                            "  padj=", formatC(padj_g, format = "e", digits = 2),
+                            "  ", dir_g)
 
           gp <- ggplot(gdf, aes(x = pseudotime, y = expr)) +
-            geom_point(size = 0.3, alpha = 0.2, color = "grey50") +
-            geom_smooth(method = "loess", color = "red",
+            geom_point(aes(color = zone), size = 0.4, alpha = 0.3) +
+            scale_color_manual(values = zone5_colors, drop = FALSE) +
+            geom_smooth(method = "loess", color = "black",
                         linewidth = 0.8, se = TRUE) +
             labs(title = gg, subtitle = sub_txt,
                  x = "Pseudotime", y = "Expression") +
-            theme_minimal(base_size = 8)
+            theme_minimal(base_size = 8) +
+            theme(legend.position = "none")
           gene_plots[[gg]] <- gp
         }
 
@@ -4567,30 +4899,43 @@ tryCatch({
           print(wrap_plots(sub, ncol = 3) +
                   plot_annotation(
                     title = paste0(cond,
-                                   " — Transition Gene Expression vs Pseudotime")))
+                                   " — Transition Gene Expression vs Pseudotime (5-Zone)")))
         }
         cat("      Page: individual gene curves\n")
       }
     }
 
     # ---- Transition gene volcano-style plot ----
-    if (!is.null(gene_pt_cor) && exists("trans_genes_df")) {
+    if (!is.null(trans_genes_df)) {
       tg <- trans_genes_df
       tg$sig <- !is.na(tg$padj) & tg$padj < 0.05 & abs(tg$rho) > 0.2
+
+      # Highlight signature membership
+      tg$sig_label <- "none"
+      tg$sig_label[tg$in_ASPC]    <- "ASPC"
+      tg$sig_label[tg$in_AR]      <- "AR"
+      tg$sig_label[tg$in_NEPC_UP] <- "NEPC_UP"
+      tg$sig_label[tg$in_NEPC_DN] <- "NEPC_DN"
+
+      # Label top 15 significant genes
       tg$label <- ""
       top_lbl <- head(tg$gene[tg$sig][order(abs(tg$rho[tg$sig]),
                                             decreasing = TRUE)], 15)
       tg$label[tg$gene %in% top_lbl] <- tg$gene[tg$gene %in% top_lbl]
 
+      sig_colors <- c(none = "grey70", ASPC = "#1F78B4", AR = "#33A02C",
+                      NEPC_UP = "#FF7F00", NEPC_DN = "#6A3D9A")
+
       p_rho <- ggplot(tg, aes(x = rho, y = -log10(pvalue + 1e-300),
-                               color = sig)) +
+                               color = sig_label)) +
         geom_point(size = 0.8, alpha = 0.5) +
-        scale_color_manual(values = c("FALSE" = "grey60", "TRUE" = "red")) +
+        scale_color_manual(values = sig_colors) +
         geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed",
                    color = "grey40") +
-        labs(title = paste0(cond, " — Gene-Pseudotime Correlation"),
+        labs(title = paste0(cond, " — Gene-Pseudotime Correlation (5-Zone Corridor)"),
              subtitle = paste0(sum(tg$sig), " significant transition genes"),
-             x = "Spearman rho", y = "-log10(p-value)", color = "Sig") +
+             x = "Spearman rho (+ = increases Interface → Epithelial)",
+             y = "-log10(p-value)", color = "Signature") +
         theme_minimal(base_size = 10)
 
       if (requireNamespace("ggrepel", quietly = TRUE) &&
@@ -4598,89 +4943,157 @@ tryCatch({
         p_rho <- p_rho +
           ggrepel::geom_text_repel(aes(label = label),
                                    size = 2.5, color = "black",
-                                   max.overlaps = 15)
+                                   max.overlaps = 20)
       }
       print(p_rho)
       cat("      Page: transition gene volcano\n")
     }
 
-    # ---- Signature gene enrichment in transition genes ----
+    # ---- Signature enrichment among transition genes ----
     if (!is.null(trans_sig) && nrow(trans_sig) > 0) {
       sig_lists <- list(ASPC = ASPC_genes, AR = Hallmark_AR_genes,
                         NEPC_UP = NEPC_Beltran_UP, NEPC_DOWN = NEPC_Beltran_DOWN)
       enrich_data <- lapply(names(sig_lists), function(sl) {
         sl_g <- sig_lists[[sl]]
-        n_trans <- sum(trans_sig$gene %in% sl_g)
-        n_up    <- sum(trans_sig$gene %in% sl_g & trans_sig$rho > 0)
-        n_down  <- sum(trans_sig$gene %in% sl_g & trans_sig$rho < 0)
-        data.frame(signature = sl, n_transition = n_trans,
-                   n_increasing = n_up, n_decreasing = n_down,
+        n_trans   <- sum(trans_sig$gene %in% sl_g)
+        n_up      <- sum(trans_sig$gene %in% sl_g & trans_sig$rho > 0)
+        n_down    <- sum(trans_sig$gene %in% sl_g & trans_sig$rho < 0)
+        data.frame(signature     = sl,
+                   n_transition  = n_trans,
+                   n_increasing  = n_up,
+                   n_decreasing  = n_down,
                    stringsAsFactors = FALSE)
       })
       enrich_df <- do.call(rbind, enrich_data)
       write.csv(enrich_df,
                 file.path(tier5_dir,
-                          paste0(cond, "_transition_signature_enrichment.csv")),
+                          paste0(cond, "_transition_signature_enrichment_5zone.csv")),
                 row.names = FALSE)
 
       # Bar plot
       enrich_long <- data.frame(
         signature = rep(enrich_df$signature, 2),
-        direction = rep(c("Increasing","Decreasing"), each = nrow(enrich_df)),
+        direction = rep(c("Increasing\n(toward Epithelial)",
+                          "Decreasing\n(toward Interface)"),
+                        each = nrow(enrich_df)),
         count = c(enrich_df$n_increasing, enrich_df$n_decreasing),
         stringsAsFactors = FALSE
       )
       p_enrich <- ggplot(enrich_long,
                          aes(x = signature, y = count, fill = direction)) +
         geom_bar(stat = "identity", position = "dodge") +
-        scale_fill_manual(values = c(Increasing = "firebrick",
-                                     Decreasing = "steelblue")) +
+        scale_fill_manual(values = c("Increasing\n(toward Epithelial)" = "#33A02C",
+                                     "Decreasing\n(toward Interface)" = "#E31A1C")) +
         labs(title = paste0(cond,
-                            " — Signature Genes Among Transition Genes"),
+                            " — Signature Genes Among Transition Genes (5-Zone)"),
+             subtitle = "Increasing = enriched toward Epithelial; Decreasing = enriched toward Interface",
              x = "Signature", y = "Count", fill = "Direction") +
         theme_minimal(base_size = 10)
       print(p_enrich)
       cat("      Page: signature enrichment\n")
     }
 
-    dev.off()
-    cat(paste0("    PDF saved: ", cond, "_TIER5_trajectory_results.pdf\n"))
+    # ---- Summary statistics page ----
+    tryCatch({
+      summary_text <- paste0(
+        cond, " — TIER 5 Summary (5-Zone Model)\n",
+        "================================================\n",
+        "Trajectory corridor: Interface + Proximal_NE + Distal_NE + Epithelial\n",
+        "Necrotic_Core: EXCLUDED (ghost mRNA)\n",
+        "Total corridor spots: ", nrow(corridor_meta), "\n",
+        "Samples: ", length(unique(corridor_meta$sample_id)), "\n",
+        "Variable features: ", length(common_vf), "\n",
+        "PCs used: ", ncol(pc_scores), "\n",
+        "PC1 variance: ", round(pca_var_explained[1] * 100, 1), "%\n",
+        "Pseudotime method: ",
+        ifelse(have_princurve, "principal curve", "PC1 projection"), "\n",
+        "\nZone pseudotime medians:\n"
+      )
+      for (zn in TRAJECTORY_LEVELS) {
+        med_pt <- median(
+          corridor_meta$pseudotime[corridor_meta$zone_5class == zn],
+          na.rm = TRUE)
+        n_zn <- sum(corridor_meta$zone_5class == zn, na.rm = TRUE)
+        summary_text <- paste0(summary_text,
+                               "  ", zn, ": median PT=", round(med_pt, 3),
+                               " (n=", n_zn, ")\n")
+      }
+      summary_text <- paste0(summary_text,
+                             "Monotonic ordering: ",
+                             ifelse(is_monotonic, "CONFIRMED", "NOT CONFIRMED"),
+                             "\n")
+      if (!is.null(trans_sig)) {
+        summary_text <- paste0(summary_text,
+                               "\nTransition genes: ", nrow(trans_sig),
+                               " (", sum(trans_sig$rho > 0), " increasing, ",
+                               sum(trans_sig$rho < 0), " decreasing)\n")
+      }
+      if (!is.null(cor_df) && nrow(cor_df) > 0) {
+        summary_text <- paste0(summary_text, "\nScore-pseudotime correlations:\n")
+        for (ri in seq_len(nrow(cor_df))) {
+          summary_text <- paste0(summary_text,
+                                 "  ", cor_df$score[ri], ": rho=",
+                                 round(cor_df$rho[ri], 3), " p=",
+                                 formatC(cor_df$pvalue[ri], format = "e", digits = 2),
+                                 "\n")
+        }
+      }
 
-    # ---- Also save standalone spatial pseudotime PDF ----
-    if (all(c("col","row") %in% colnames(all_near_meta)) &&
-        !all(is.na(all_near_meta$col))) {
-      spot_sz <- compute_spot_size(all_near_meta[, c("col","row")])
-      p_pt_standalone <- ggplot(all_near_meta,
+      plot.new()
+      text(0.05, 0.95, summary_text, adj = c(0, 1), cex = 0.9, family = "mono")
+      cat("      Page: summary statistics\n")
+    }, error = function(e) NULL)
+
+    dev.off()
+    cat(paste0("    PDF saved: ", cond, "_TIER5_trajectory_5zone.pdf\n"))
+
+    # ---- Standalone spatial pseudotime PDF ----
+    if (all(c("col", "row") %in% colnames(corridor_meta)) &&
+        !all(is.na(corridor_meta$col))) {
+      spot_sz <- compute_spot_size(corridor_meta[, c("col", "row")])
+      p_pt_standalone <- ggplot(corridor_meta,
                                 aes(x = col, y = -row,
                                     color = pseudotime)) +
         geom_point(size = spot_sz) +
         scale_color_viridis_c(option = "plasma") +
-        labs(title = paste0(cond, " — Spatial Pseudotime"),
+        labs(title = paste0(cond, " — Spatial Pseudotime (5-Zone Corridor)"),
              x = "Array Col", y = "Array Row (inv)",
              color = "Pseudotime") +
-        theme_minimal(base_size = 10)
-      ggsave(file.path(tier5_dir, paste0(cond, "_spatial_pseudotime.pdf")),
+        theme_minimal(base_size = 10) +
+        coord_fixed()
+      ggsave(file.path(tier5_dir,
+                       paste0(cond, "_spatial_pseudotime_5zone.pdf")),
              plot = p_pt_standalone, width = 10, height = 8)
     }
 
-    # Clean up
-    rm(all_near_meta, expr_combined, expr_t, pc_scores, pseudotime,
-       near_iface_info)
+    # ============================================================
+    # Clean up condition-level objects
+    # ============================================================
+    rm(corridor_meta, expr_combined, expr_t, pc_scores, pseudotime,
+       corridor_info)
     if (exists("trans_sig", inherits = FALSE)) rm(trans_sig)
     if (exists("trans_genes_df", inherits = FALSE)) rm(trans_genes_df)
     if (exists("gene_pt_cor", inherits = FALSE)) rm(gene_pt_cor)
     if (exists("cor_df", inherits = FALSE)) rm(cor_df)
+    if (exists("zone_gene_means", inherits = FALSE)) rm(zone_gene_means)
     invisible(gc())
-  }
+
+  }  # end for (cond in conditions)
 
   tier5_status <- "COMPLETE"
-  cat("\nTIER 5 complete.\n")
+  cat("\nTIER 5 REVISED (5-Zone Trajectory) complete.\n")
 
 }, error = function(e) {
   cat(paste0("TIER 5 ERROR: ", conditionMessage(e), "\n"))
   tier5_status <<- paste0("ERROR: ", conditionMessage(e))
   tryCatch(dev.off(), error = function(e2) NULL)
 })
+
+# ==============================================================================
+# END TIER 5 REVISED
+# ==============================================================================
+cat(paste0("\n  TIER 5 status: ", tier5_status, "\n"))
+          
 # ==============================================================================
 # SECTION 8: TIER 6 — GRN (Interface-Specific)
 # ==============================================================================
