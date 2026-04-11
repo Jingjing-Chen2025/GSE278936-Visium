@@ -3973,6 +3973,15 @@ tryCatch({
 #   - Pseudotime validated against 5-zone ordering (monotonic increase expected)
 #   - Transition genes annotated by zone boundary transitions
 #
+# SAMPLE-LEVEL PT RANGE FILTERING (NEW):
+#   - After computing pseudotime, each sample's PT range is evaluated.
+#   - Samples with PT range < 0.1 are EXCLUDED entirely (too compressed to be
+#     informative; likely lack sufficient zone diversity or spot count).
+#   - Only samples with PT range > 0.3 contribute to transition gene analysis
+#     and trajectory-level statistics (meaningful trajectory spread required).
+#   - Samples with 0.1 <= PT range <= 0.3 are retained in spatial plots but
+#     flagged as "low-spread" and excluded from gene-pseudotime correlations.
+#
 # EXPECTED PSEUDOTIME ORDERING (if paracrine model is correct):
 #   Interface (low PT) → Proximal_NE → Distal_NE → Epithelial (high PT)
 #
@@ -4105,6 +4114,21 @@ tryCatch({
   ZONE5_LEVELS <- c("Interface", "Proximal_NE", "Distal_NE",
                      "Epithelial", "Necrotic_Core")
   TRAJECTORY_LEVELS <- c("Interface", "Proximal_NE", "Distal_NE", "Epithelial")
+
+  # ================================================================
+  # PT RANGE FILTERING THRESHOLDS (NEW)
+  # ================================================================
+  # PT_RANGE_EXCLUDE: samples with per-sample PT range below this
+  #   threshold are dropped entirely (too compressed to be informative)
+  # PT_RANGE_MEANINGFUL: only samples above this threshold contribute
+
+  #   to transition gene analysis and trajectory-level statistics
+  # ================================================================
+  PT_RANGE_EXCLUDE     <- 0.1
+  PT_RANGE_MEANINGFUL  <- 0.3
+
+  cat(paste0("  PT range thresholds: exclude < ", PT_RANGE_EXCLUDE,
+             " | meaningful > ", PT_RANGE_MEANINGFUL, "\n"))
 
   # ================================================================
   # Helper: get or compute variable features
@@ -4409,7 +4433,87 @@ tryCatch({
     corridor_meta$zone_5class <- factor(
       corridor_meta$zone_5class, levels = TRAJECTORY_LEVELS)
 
-    # Save data table
+    # ============================================================
+    # Phase 5b: PER-SAMPLE PT RANGE FILTERING (NEW)
+    # ============================================================
+    # Compute PT range within each sample and classify:
+    #   - EXCLUDED:    PT range < 0.1  (too compressed, uninformative)
+    #   - LOW_SPREAD:  0.1 <= PT range <= 0.3  (kept for spatial plots,
+    #                  excluded from gene-PT correlations)
+    #   - MEANINGFUL:  PT range > 0.3  (drives trajectory analysis)
+    # ============================================================
+    cat("\n    Phase 5b: Per-sample PT range filtering...\n")
+
+    sample_pt_ranges <- tapply(
+      corridor_meta$pseudotime,
+      corridor_meta$sample_id,
+      function(x) diff(range(x, na.rm = TRUE))
+    )
+
+    # Classification
+    pt_range_df <- data.frame(
+      sample_id = names(sample_pt_ranges),
+      pt_range  = as.numeric(sample_pt_ranges),
+      stringsAsFactors = FALSE
+    )
+    pt_range_df$pt_class <- ifelse(
+      pt_range_df$pt_range < PT_RANGE_EXCLUDE, "EXCLUDED",
+      ifelse(pt_range_df$pt_range > PT_RANGE_MEANINGFUL, "MEANINGFUL",
+             "LOW_SPREAD")
+    )
+
+    # Report
+    cat("    Per-sample PT ranges:\n")
+    for (ri in seq_len(nrow(pt_range_df))) {
+      cat(paste0("      ", pt_range_df$sample_id[ri],
+                 ": PT range = ", round(pt_range_df$pt_range[ri], 4),
+                 "  -> ", pt_range_df$pt_class[ri], "\n"))
+    }
+
+    n_excluded    <- sum(pt_range_df$pt_class == "EXCLUDED")
+    n_low_spread  <- sum(pt_range_df$pt_class == "LOW_SPREAD")
+    n_meaningful  <- sum(pt_range_df$pt_class == "MEANINGFUL")
+    cat(paste0("    Summary: ", n_meaningful, " MEANINGFUL, ",
+               n_low_spread, " LOW_SPREAD, ",
+               n_excluded, " EXCLUDED\n"))
+
+    # Save PT range diagnostics
+    write.csv(pt_range_df,
+              file.path(tier5_dir, paste0(cond, "_sample_pt_range_filter.csv")),
+              row.names = FALSE)
+
+    # --- Remove EXCLUDED samples from all downstream data ---
+    excluded_samples <- pt_range_df$sample_id[pt_range_df$pt_class == "EXCLUDED"]
+    if (length(excluded_samples) > 0) {
+      cat(paste0("    Removing ", length(excluded_samples),
+                 " EXCLUDED samples (PT range < ", PT_RANGE_EXCLUDE, "): ",
+                 paste(excluded_samples, collapse = ", "), "\n"))
+      keep_mask <- !(corridor_meta$sample_id %in% excluded_samples)
+      corridor_meta <- corridor_meta[keep_mask, ]
+      pseudotime    <- corridor_meta$pseudotime
+      pc_scores     <- pc_scores[keep_mask, , drop = FALSE]
+      expr_combined <- expr_combined[, corridor_meta$barcode, drop = FALSE]
+
+      cat(paste0("    After exclusion: ", nrow(corridor_meta), " spots remain\n"))
+    }
+
+    if (nrow(corridor_meta) < 20) {
+      cat(paste0("    Too few spots after PT range exclusion — skipping ", cond, "\n"))
+      rm(corridor_meta, expr_combined, expr_t, pc_scores, pseudotime,
+         corridor_info, pt_range_df)
+      invisible(gc()); next
+    }
+
+    # --- Identify MEANINGFUL samples for trajectory gene analysis ---
+    meaningful_samples <- pt_range_df$sample_id[pt_range_df$pt_class == "MEANINGFUL"]
+    meaningful_mask    <- corridor_meta$sample_id %in% meaningful_samples
+    n_meaningful_spots <- sum(meaningful_mask)
+
+    cat(paste0("    MEANINGFUL samples for trajectory analysis: ",
+               length(meaningful_samples), " (",
+               n_meaningful_spots, " spots)\n"))
+
+    # Save the full data table (includes LOW_SPREAD for spatial plots)
     write.csv(corridor_meta,
               file.path(tier5_dir, paste0(cond, "_pseudotime_5zone_data.csv")),
               row.names = FALSE)
@@ -4446,124 +4550,157 @@ tryCatch({
 
     # ============================================================
     # Phase 6: Spearman correlations of scores with pseudotime
+    #          (MEANINGFUL samples only)
     # ============================================================
-    cat("\n    Phase 6: Score-pseudotime correlations...\n")
+    cat("\n    Phase 6: Score-pseudotime correlations (MEANINGFUL samples only)...\n")
     score_cols_pt <- c("ASPC_score", "AR_score", "NEPC_UP_score", "NEPC_Beltran_NET")
-    cor_table <- lapply(score_cols_pt, function(sc) {
-      v <- corridor_meta[[sc]]
-      if (all(is.na(v))) return(NULL)
-      ct <- tryCatch(
-        cor.test(pseudotime, v, method = "spearman",
-                 use = "complete.obs", exact = FALSE),
-        error = function(e) NULL
-      )
-      if (is.null(ct)) return(NULL)
-      data.frame(score = sc, rho = ct$estimate, pvalue = ct$p.value,
-                 stringsAsFactors = FALSE)
-    })
-    cor_df <- do.call(rbind, Filter(Negate(is.null), cor_table))
-    if (!is.null(cor_df) && nrow(cor_df) > 0) {
-      write.csv(cor_df,
-                file.path(tier5_dir,
-                          paste0(cond, "_pseudotime_score_correlations_5zone.csv")),
-                row.names = FALSE)
-      for (ri in seq_len(nrow(cor_df))) {
-        expected <- switch(cor_df$score[ri],
-                           ASPC_score       = "negative",
-                           AR_score         = "positive",
-                           NEPC_UP_score    = "negative",
-                           NEPC_Beltran_NET = "negative",
-                           "unknown")
-        actual_dir <- ifelse(cor_df$rho[ri] > 0, "positive", "negative")
-        match_str <- ifelse(actual_dir == expected,
-                            " MATCHES EXPECTATION",
-                            " DOES NOT MATCH")
-        cat(paste0("      ", cor_df$score[ri], ": rho=",
-                   round(cor_df$rho[ri], 3), ", p=",
-                   formatC(cor_df$pvalue[ri], format = "e", digits = 2),
-                   " (expected ", expected, ")", match_str, "\n"))
+    cor_df <- NULL
+
+    if (n_meaningful_spots >= 20) {
+      meta_meaningful <- corridor_meta[meaningful_mask, ]
+      pt_meaningful   <- meta_meaningful$pseudotime
+
+      cor_table <- lapply(score_cols_pt, function(sc) {
+        v <- meta_meaningful[[sc]]
+        if (all(is.na(v))) return(NULL)
+        ct <- tryCatch(
+          cor.test(pt_meaningful, v, method = "spearman",
+                   use = "complete.obs", exact = FALSE),
+          error = function(e) NULL
+        )
+        if (is.null(ct)) return(NULL)
+        data.frame(score = sc, rho = ct$estimate, pvalue = ct$p.value,
+                   n_spots = sum(!is.na(v) & !is.na(pt_meaningful)),
+                   n_samples_meaningful = length(meaningful_samples),
+                   stringsAsFactors = FALSE)
+      })
+      cor_df <- do.call(rbind, Filter(Negate(is.null), cor_table))
+      if (!is.null(cor_df) && nrow(cor_df) > 0) {
+        write.csv(cor_df,
+                  file.path(tier5_dir,
+                            paste0(cond, "_pseudotime_score_correlations_5zone.csv")),
+                  row.names = FALSE)
+        for (ri in seq_len(nrow(cor_df))) {
+          expected <- switch(cor_df$score[ri],
+                             ASPC_score       = "negative",
+                             AR_score         = "positive",
+                             NEPC_UP_score    = "negative",
+                             NEPC_Beltran_NET = "negative",
+                             "unknown")
+          actual_dir <- ifelse(cor_df$rho[ri] > 0, "positive", "negative")
+          match_str <- ifelse(actual_dir == expected,
+                              " MATCHES EXPECTATION",
+                              " DOES NOT MATCH")
+          cat(paste0("      ", cor_df$score[ri], ": rho=",
+                     round(cor_df$rho[ri], 3), ", p=",
+                     formatC(cor_df$pvalue[ri], format = "e", digits = 2),
+                     " (expected ", expected, ")", match_str, "\n"))
+        }
       }
+    } else {
+      cat(paste0("    Too few MEANINGFUL spots (", n_meaningful_spots,
+                 ") — skipping score correlations\n"))
     }
 
     # ============================================================
     # Phase 7: Transition genes (gene ~ pseudotime correlation)
+    #          ONLY using MEANINGFUL samples (PT range > 0.3)
     # ============================================================
-    cat("\n    Phase 7: Identifying transition genes...\n")
+    cat("\n    Phase 7: Identifying transition genes (MEANINGFUL samples only)...\n")
     trans_sig <- NULL
     trans_genes_df <- NULL
 
-    gene_pt_cor <- tryCatch({
-      expr_for_cor <- as.matrix(expr_combined)
-      n_genes <- nrow(expr_for_cor)
-      cat(paste0("      Computing gene-pseudotime correlations for ",
-                 n_genes, " genes...\n"))
-      result <- matrix(NA_real_, nrow = 2, ncol = n_genes,
-                       dimnames = list(c("rho", "pvalue"),
-                                       rownames(expr_for_cor)))
-      for (gi in seq_len(n_genes)) {
-        y <- expr_for_cor[gi, ]
-        ct <- tryCatch(
-          cor.test(pseudotime, y, method = "spearman",
-                   use = "complete.obs", exact = FALSE),
-          error = function(e) list(estimate = NA, p.value = NA)
+    if (n_meaningful_spots >= 20) {
+      # Subset expression to MEANINGFUL-sample spots only
+      meaningful_bcs   <- corridor_meta$barcode[meaningful_mask]
+      meaningful_bcs   <- meaningful_bcs[meaningful_bcs %in% colnames(expr_combined)]
+      expr_meaningful  <- expr_combined[, meaningful_bcs, drop = FALSE]
+      pt_meaningful    <- corridor_meta$pseudotime[
+        match(meaningful_bcs, corridor_meta$barcode)]
+
+      gene_pt_cor <- tryCatch({
+        n_genes <- nrow(expr_meaningful)
+        cat(paste0("      Computing gene-pseudotime correlations for ",
+                   n_genes, " genes across ", length(meaningful_bcs),
+                   " spots from ", length(meaningful_samples), " samples...\n"))
+        result <- matrix(NA_real_, nrow = 2, ncol = n_genes,
+                         dimnames = list(c("rho", "pvalue"),
+                                         rownames(expr_meaningful)))
+        for (gi in seq_len(n_genes)) {
+          y <- as.numeric(expr_meaningful[gi, ])
+          ct <- tryCatch(
+            cor.test(pt_meaningful, y, method = "spearman",
+                     use = "complete.obs", exact = FALSE),
+            error = function(e) list(estimate = NA, p.value = NA)
+          )
+          result[1, gi] <- as.numeric(ct$estimate)
+          result[2, gi] <- as.numeric(ct$p.value)
+        }
+        result
+      }, error = function(e) {
+        cat(paste0("      Gene-PT correlation error: ",
+                   conditionMessage(e), "\n"))
+        NULL
+      })
+
+      rm(expr_meaningful); invisible(gc())
+
+      if (!is.null(gene_pt_cor)) {
+        trans_genes_df <- data.frame(
+          gene   = colnames(gene_pt_cor),
+          rho    = gene_pt_cor["rho", ],
+          pvalue = gene_pt_cor["pvalue", ],
+          stringsAsFactors = FALSE
         )
-        result[1, gi] <- as.numeric(ct$estimate)
-        result[2, gi] <- as.numeric(ct$p.value)
+        trans_genes_df$padj <- p.adjust(trans_genes_df$pvalue, method = "BH")
+
+        # Annotate signature membership
+        trans_genes_df$in_ASPC    <- trans_genes_df$gene %in% ASPC_genes
+        trans_genes_df$in_AR      <- trans_genes_df$gene %in% Hallmark_AR_genes
+        trans_genes_df$in_NEPC_UP <- trans_genes_df$gene %in% NEPC_Beltran_UP
+        trans_genes_df$in_NEPC_DN <- trans_genes_df$gene %in% NEPC_Beltran_DOWN
+
+        # Annotate transition direction
+        trans_genes_df$direction <- ifelse(
+          trans_genes_df$rho > 0, "increasing_with_distance",
+          "decreasing_with_distance")
+
+        # Annotate filtering metadata
+        trans_genes_df$n_meaningful_samples <- length(meaningful_samples)
+        trans_genes_df$n_meaningful_spots   <- n_meaningful_spots
+
+        # Save all
+        write.csv(trans_genes_df,
+                  file.path(tier5_dir,
+                            paste0(cond, "_transition_genes_5zone_all.csv")),
+                  row.names = FALSE)
+
+        # Filter significant
+        trans_sig <- trans_genes_df[
+          !is.na(trans_genes_df$rho) &
+            abs(trans_genes_df$rho) > 0.2 &
+            trans_genes_df$padj < 0.05, ]
+        trans_sig <- trans_sig[order(abs(trans_sig$rho), decreasing = TRUE), ]
+
+        write.csv(trans_sig,
+                  file.path(tier5_dir,
+                            paste0(cond, "_transition_genes_5zone_sig.csv")),
+                  row.names = FALSE)
+
+        n_inc <- sum(trans_sig$rho > 0)
+        n_dec <- sum(trans_sig$rho < 0)
+        cat(paste0("      Transition genes (|rho|>0.2, padj<0.05): ",
+                   nrow(trans_sig), " / ", nrow(trans_genes_df),
+                   " (", n_inc, " increasing, ", n_dec, " decreasing)\n"))
       }
-      result
-    }, error = function(e) {
-      cat(paste0("      Gene-PT correlation error: ",
-                 conditionMessage(e), "\n"))
-      NULL
-    })
-
-    if (!is.null(gene_pt_cor)) {
-      trans_genes_df <- data.frame(
-        gene   = colnames(gene_pt_cor),
-        rho    = gene_pt_cor["rho", ],
-        pvalue = gene_pt_cor["pvalue", ],
-        stringsAsFactors = FALSE
-      )
-      trans_genes_df$padj <- p.adjust(trans_genes_df$pvalue, method = "BH")
-
-      # Annotate signature membership
-      trans_genes_df$in_ASPC    <- trans_genes_df$gene %in% ASPC_genes
-      trans_genes_df$in_AR      <- trans_genes_df$gene %in% Hallmark_AR_genes
-      trans_genes_df$in_NEPC_UP <- trans_genes_df$gene %in% NEPC_Beltran_UP
-      trans_genes_df$in_NEPC_DN <- trans_genes_df$gene %in% NEPC_Beltran_DOWN
-
-      # Annotate transition direction
-      trans_genes_df$direction <- ifelse(
-        trans_genes_df$rho > 0, "increasing_with_distance",
-        "decreasing_with_distance")
-
-      # Save all
-      write.csv(trans_genes_df,
-                file.path(tier5_dir,
-                          paste0(cond, "_transition_genes_5zone_all.csv")),
-                row.names = FALSE)
-
-      # Filter significant
-      trans_sig <- trans_genes_df[
-        !is.na(trans_genes_df$rho) &
-          abs(trans_genes_df$rho) > 0.2 &
-          trans_genes_df$padj < 0.05, ]
-      trans_sig <- trans_sig[order(abs(trans_sig$rho), decreasing = TRUE), ]
-
-      write.csv(trans_sig,
-                file.path(tier5_dir,
-                          paste0(cond, "_transition_genes_5zone_sig.csv")),
-                row.names = FALSE)
-
-      n_inc <- sum(trans_sig$rho > 0)
-      n_dec <- sum(trans_sig$rho < 0)
-      cat(paste0("      Transition genes (|rho|>0.2, padj<0.05): ",
-                 nrow(trans_sig), " / ", nrow(trans_genes_df),
-                 " (", n_inc, " increasing, ", n_dec, " decreasing)\n"))
+    } else {
+      cat(paste0("    Too few MEANINGFUL spots (", n_meaningful_spots,
+                 ") — skipping transition gene analysis\n"))
     }
 
     # ============================================================
     # Phase 8: Per-zone transition gene expression (zone means)
+    #          Uses ALL non-excluded spots (including LOW_SPREAD)
     # ============================================================
     cat("\n    Phase 8: Per-zone transition gene expression...\n")
     zone_gene_means <- NULL
@@ -4598,6 +4735,42 @@ tryCatch({
                   paste0(cond, "_TIER5_trajectory_5zone.pdf")),
         width = 11, height = 8.5)
 
+    # ---- Page 0: PT Range Diagnostic ----
+    tryCatch({
+      pt_range_df$color <- ifelse(
+        pt_range_df$pt_class == "EXCLUDED", "red",
+        ifelse(pt_range_df$pt_class == "LOW_SPREAD", "orange", "steelblue"))
+      pt_range_df$sample_short <- sub("^GSM\\d+_", "", pt_range_df$sample_id)
+      pt_range_df <- pt_range_df[order(pt_range_df$pt_range, decreasing = TRUE), ]
+      pt_range_df$sample_short <- factor(pt_range_df$sample_short,
+                                          levels = rev(pt_range_df$sample_short))
+
+      p_ptr <- ggplot(pt_range_df,
+                      aes(x = sample_short, y = pt_range, fill = pt_class)) +
+        geom_bar(stat = "identity") +
+        scale_fill_manual(values = c(EXCLUDED    = "#E31A1C",
+                                     LOW_SPREAD  = "#FF7F00",
+                                     MEANINGFUL  = "#1F78B4")) +
+        geom_hline(yintercept = PT_RANGE_EXCLUDE, linetype = "dashed",
+                   color = "red", linewidth = 0.8) +
+        geom_hline(yintercept = PT_RANGE_MEANINGFUL, linetype = "dashed",
+                   color = "blue", linewidth = 0.8) +
+        coord_flip() +
+        labs(title = paste0(cond, " — Per-Sample Pseudotime Range"),
+             subtitle = paste0("Red dashed = exclude threshold (",
+                               PT_RANGE_EXCLUDE,
+                               ") | Blue dashed = meaningful threshold (",
+                               PT_RANGE_MEANINGFUL, ")\n",
+                               n_meaningful, " MEANINGFUL, ",
+                               n_low_spread, " LOW_SPREAD, ",
+                               n_excluded, " EXCLUDED"),
+             x = "Sample", y = "Pseudotime Range", fill = "Classification") +
+        theme_minimal(base_size = 10) +
+        theme(axis.text.y = element_text(size = 7))
+      print(p_ptr)
+      cat("      Page: PT range diagnostic\n")
+    }, error = function(e) NULL)
+
     # ---- Page 1: Spatial pseudotime map ----
     if (all(c("col", "row") %in% colnames(corridor_meta)) &&
         !all(is.na(corridor_meta$col))) {
@@ -4609,7 +4782,8 @@ tryCatch({
         labs(title = paste0(cond, " — Spatial Pseudotime Map (5-Zone Corridor)"),
              subtitle = paste0(nrow(corridor_meta), " spots from ",
                                length(unique(corridor_meta$sample_id)),
-                               " samples | Necrotic Core excluded"),
+                               " samples (", n_excluded, " excluded for PT range < ",
+                               PT_RANGE_EXCLUDE, ") | Necrotic Core excluded"),
              x = "Array Col", y = "Array Row (inv)",
              color = "Pseudotime") +
         theme_minimal(base_size = 10) +
@@ -4627,7 +4801,7 @@ tryCatch({
         geom_point(size = spot_sz) +
         scale_color_manual(values = zone5_colors, drop = FALSE) +
         labs(title = paste0(cond, " — 5-Zone Spatial Map (Trajectory Corridor)"),
-             subtitle = "Interface (red) → Proximal NE → Distal NE → Epithelial (green)",
+             subtitle = "Interface (red) -> Proximal NE -> Distal NE -> Epithelial (green)",
              x = "Array Col", y = "Array Row (inv)",
              color = "Zone") +
         theme_minimal(base_size = 10) +
@@ -4641,7 +4815,9 @@ tryCatch({
       pca_df <- data.frame(
         PC1 = pc_scores[, 1], PC2 = pc_scores[, 2],
         pseudotime = pseudotime,
-        zone = corridor_meta$zone_5class
+        zone = corridor_meta$zone_5class,
+        meaningful = ifelse(corridor_meta$sample_id %in% meaningful_samples,
+                            "MEANINGFUL", "LOW_SPREAD")
       )
       p_pca_pt <- ggplot(pca_df, aes(x = PC1, y = PC2, color = pseudotime)) +
         geom_point(size = 0.8, alpha = 0.6) +
@@ -4662,6 +4838,21 @@ tryCatch({
              x = "PC1", y = "PC2", color = "Zone") +
         theme_minimal(base_size = 10)
       print(p_pca_zone)
+
+      # ---- Page 4b: PCA colored by meaningful vs low-spread (NEW) ----
+      p_pca_meaningful <- ggplot(pca_df,
+                                  aes(x = PC1, y = PC2, color = meaningful)) +
+        geom_point(size = 0.8, alpha = 0.5) +
+        scale_color_manual(values = c(MEANINGFUL = "#1F78B4",
+                                      LOW_SPREAD = "#FF7F00")) +
+        labs(title = paste0(cond, " — PCA (MEANINGFUL vs LOW_SPREAD samples)"),
+             subtitle = paste0("MEANINGFUL (PT range > ", PT_RANGE_MEANINGFUL,
+                               "): ", n_meaningful_spots, " spots | LOW_SPREAD: ",
+                               sum(!meaningful_mask), " spots"),
+             x = "PC1", y = "PC2", color = "PT Spread") +
+        theme_minimal(base_size = 10)
+      print(p_pca_meaningful)
+
       cat("      Page: PCA plots\n")
     }
 
@@ -4670,16 +4861,22 @@ tryCatch({
       geom_histogram(bins = 50, fill = "steelblue", color = "white",
                      alpha = 0.8) +
       labs(title = paste0(cond, " — Pseudotime Distribution (Corridor Spots)"),
-           subtitle = paste0(nrow(corridor_meta), " spots"),
+           subtitle = paste0(nrow(corridor_meta), " spots after PT range filtering"),
            x = "Pseudotime", y = "Count") +
       theme_minimal(base_size = 10)
     print(p_hist)
 
-    # Per-sample density
+    # Per-sample density colored by PT class
+    corridor_meta$pt_class <- ifelse(
+      corridor_meta$sample_id %in% meaningful_samples, "MEANINGFUL", "LOW_SPREAD")
     p_density <- ggplot(corridor_meta,
-                        aes(x = pseudotime, color = sample_id)) +
+                        aes(x = pseudotime, color = sample_id,
+                            linetype = pt_class)) +
       geom_density(linewidth = 0.6, alpha = 0.5) +
+      scale_linetype_manual(values = c(MEANINGFUL = "solid",
+                                       LOW_SPREAD = "dashed")) +
       labs(title = paste0(cond, " — Pseudotime Density per Sample"),
+           subtitle = "Solid = MEANINGFUL (PT range > 0.3) | Dashed = LOW_SPREAD",
            x = "Pseudotime", y = "Density") +
       theme_minimal(base_size = 10) +
       theme(legend.text = element_text(size = 5),
@@ -4700,7 +4897,9 @@ tryCatch({
              "Expect monotonic: Interface < Proximal NE < Distal NE < Epithelial",
              ifelse(is_monotonic,
                     "  |  ** CONFIRMED **",
-                    "  |  -- not confirmed --")),
+                    "  |  -- not confirmed --"),
+             "\n", n_excluded, " samples excluded (PT range < ",
+             PT_RANGE_EXCLUDE, ")"),
            x = "Zone (distance-based)", y = "Pseudotime",
            fill = "Zone") +
       theme_minimal(base_size = 11) +
@@ -4756,7 +4955,8 @@ tryCatch({
         match_str <- ifelse(actual_dir == expected, " MATCHES", " MISMATCH")
         rho_str <- paste0("rho=", round(rv, 3),
                           ", p=", formatC(pv, format = "e", digits = 2),
-                          " (expected ", expected, ")", match_str)
+                          " (expected ", expected, ")", match_str,
+                          " [MEANINGFUL samples only]")
       }
 
       p_sc <- ggplot(corridor_meta,
@@ -4818,13 +5018,17 @@ tryCatch({
           pt_sorted <- pseudotime[pt_order]
           zone_sorted <- as.character(corridor_meta$zone_5class[pt_order])
           pt_bins <- cut(pt_sorted, breaks = 5, labels = FALSE)
+          meaningful_sorted <- corridor_meta$pt_class[pt_order]
           annot_col <- data.frame(
-            Zone    = factor(zone_sorted, levels = TRAJECTORY_LEVELS),
-            PT_bin  = factor(pt_bins),
+            Zone       = factor(zone_sorted, levels = TRAJECTORY_LEVELS),
+            PT_bin     = factor(pt_bins),
+            PT_spread  = factor(meaningful_sorted,
+                                levels = c("MEANINGFUL", "LOW_SPREAD")),
             row.names = colnames(heat_mat)
           )
           annot_colors <- list(
-            Zone = zone5_colors[TRAJECTORY_LEVELS]
+            Zone = zone5_colors[TRAJECTORY_LEVELS],
+            PT_spread = c(MEANINGFUL = "#1F78B4", LOW_SPREAD = "#FF7F00")
           )
           pheatmap(heat_scaled,
                    cluster_cols = FALSE, cluster_rows = TRUE,
@@ -4832,7 +5036,9 @@ tryCatch({
                    annotation_col = annot_col,
                    annotation_colors = annot_colors,
                    main = paste0(cond,
-                                 " — Top Transition Genes Along Pseudotime (5-Zone)"),
+                                 " — Top Transition Genes Along Pseudotime (5-Zone)\n",
+                                 "Transition genes from MEANINGFUL samples only (PT range > ",
+                                 PT_RANGE_MEANINGFUL, ")"),
                    fontsize_row = 7)
         } else {
           heatmap(heat_scaled, Colv = NA, scale = "none", labCol = "",
@@ -4872,18 +5078,23 @@ tryCatch({
           gdf <- data.frame(
             pseudotime = pseudotime,
             expr       = as.numeric(expr_combined[gg, ]),
-            zone       = corridor_meta$zone_5class
+            zone       = corridor_meta$zone_5class,
+            pt_class   = corridor_meta$pt_class
           )
           rho_g <- trans_sig$rho[trans_sig$gene == gg]
           padj_g <- trans_sig$padj[trans_sig$gene == gg]
           dir_g <- trans_sig$direction[trans_sig$gene == gg]
           sub_txt <- paste0("rho=", round(rho_g, 3),
                             "  padj=", formatC(padj_g, format = "e", digits = 2),
-                            "  ", dir_g)
+                            "  ", dir_g,
+                            " [MEANINGFUL samples]")
 
           gp <- ggplot(gdf, aes(x = pseudotime, y = expr)) +
-            geom_point(aes(color = zone), size = 0.4, alpha = 0.3) +
+            geom_point(aes(color = zone, shape = pt_class),
+                       size = 0.4, alpha = 0.3) +
             scale_color_manual(values = zone5_colors, drop = FALSE) +
+            scale_shape_manual(values = c(MEANINGFUL = 16,
+                                          LOW_SPREAD = 1)) +
             geom_smooth(method = "loess", color = "black",
                         linewidth = 0.8, se = TRUE) +
             labs(title = gg, subtitle = sub_txt,
@@ -4899,7 +5110,8 @@ tryCatch({
           print(wrap_plots(sub, ncol = 3) +
                   plot_annotation(
                     title = paste0(cond,
-                                   " — Transition Gene Expression vs Pseudotime (5-Zone)")))
+                                   " — Transition Gene Expression vs Pseudotime (5-Zone)\n",
+                                   "Correlations computed on MEANINGFUL samples only")))
         }
         cat("      Page: individual gene curves\n")
       }
@@ -4933,8 +5145,11 @@ tryCatch({
         geom_vline(xintercept = c(-0.2, 0.2), linetype = "dashed",
                    color = "grey40") +
         labs(title = paste0(cond, " — Gene-Pseudotime Correlation (5-Zone Corridor)"),
-             subtitle = paste0(sum(tg$sig), " significant transition genes"),
-             x = "Spearman rho (+ = increases Interface → Epithelial)",
+             subtitle = paste0(sum(tg$sig), " significant transition genes",
+                               " | Computed on ", length(meaningful_samples),
+                               " MEANINGFUL samples (PT range > ",
+                               PT_RANGE_MEANINGFUL, ")"),
+             x = "Spearman rho (+ = increases Interface -> Epithelial)",
              y = "-log10(p-value)", color = "Signature") +
         theme_minimal(base_size = 10)
 
@@ -4986,7 +5201,9 @@ tryCatch({
                                      "Decreasing\n(toward Interface)" = "#E31A1C")) +
         labs(title = paste0(cond,
                             " — Signature Genes Among Transition Genes (5-Zone)"),
-             subtitle = "Increasing = enriched toward Epithelial; Decreasing = enriched toward Interface",
+             subtitle = paste0("Based on ", length(meaningful_samples),
+                               " MEANINGFUL samples (PT range > ",
+                               PT_RANGE_MEANINGFUL, ")"),
              x = "Signature", y = "Count", fill = "Direction") +
         theme_minimal(base_size = 10)
       print(p_enrich)
@@ -4996,12 +5213,19 @@ tryCatch({
     # ---- Summary statistics page ----
     tryCatch({
       summary_text <- paste0(
-        cond, " — TIER 5 Summary (5-Zone Model)\n",
+        cond, " — TIER 5 Summary (5-Zone Model + PT Range Filtering)\n",
         "================================================\n",
         "Trajectory corridor: Interface + Proximal_NE + Distal_NE + Epithelial\n",
         "Necrotic_Core: EXCLUDED (ghost mRNA)\n",
-        "Total corridor spots: ", nrow(corridor_meta), "\n",
-        "Samples: ", length(unique(corridor_meta$sample_id)), "\n",
+        "\n--- PT RANGE FILTERING ---\n",
+        "  Exclude threshold:    PT range < ", PT_RANGE_EXCLUDE, "\n",
+        "  Meaningful threshold: PT range > ", PT_RANGE_MEANINGFUL, "\n",
+        "  Samples EXCLUDED:     ", n_excluded, "\n",
+        "  Samples LOW_SPREAD:   ", n_low_spread, "\n",
+        "  Samples MEANINGFUL:   ", n_meaningful, "\n",
+        "\nTotal corridor spots (after exclusion): ", nrow(corridor_meta), "\n",
+        "MEANINGFUL spots (for gene correlations): ", n_meaningful_spots, "\n",
+        "Samples contributing: ", length(unique(corridor_meta$sample_id)), "\n",
         "Variable features: ", length(common_vf), "\n",
         "PCs used: ", ncol(pc_scores), "\n",
         "PC1 variance: ", round(pca_var_explained[1] * 100, 1), "%\n",
@@ -5024,12 +5248,14 @@ tryCatch({
                              "\n")
       if (!is.null(trans_sig)) {
         summary_text <- paste0(summary_text,
-                               "\nTransition genes: ", nrow(trans_sig),
+                               "\nTransition genes (MEANINGFUL samples): ",
+                               nrow(trans_sig),
                                " (", sum(trans_sig$rho > 0), " increasing, ",
                                sum(trans_sig$rho < 0), " decreasing)\n")
       }
       if (!is.null(cor_df) && nrow(cor_df) > 0) {
-        summary_text <- paste0(summary_text, "\nScore-pseudotime correlations:\n")
+        summary_text <- paste0(summary_text,
+                               "\nScore-pseudotime correlations (MEANINGFUL only):\n")
         for (ri in seq_len(nrow(cor_df))) {
           summary_text <- paste0(summary_text,
                                  "  ", cor_df$score[ri], ": rho=",
@@ -5057,6 +5283,8 @@ tryCatch({
         geom_point(size = spot_sz) +
         scale_color_viridis_c(option = "plasma") +
         labs(title = paste0(cond, " — Spatial Pseudotime (5-Zone Corridor)"),
+             subtitle = paste0(n_excluded, " samples excluded (PT range < ",
+                               PT_RANGE_EXCLUDE, ")"),
              x = "Array Col", y = "Array Row (inv)",
              color = "Pseudotime") +
         theme_minimal(base_size = 10) +
@@ -5070,7 +5298,7 @@ tryCatch({
     # Clean up condition-level objects
     # ============================================================
     rm(corridor_meta, expr_combined, expr_t, pc_scores, pseudotime,
-       corridor_info)
+       corridor_info, pt_range_df)
     if (exists("trans_sig", inherits = FALSE)) rm(trans_sig)
     if (exists("trans_genes_df", inherits = FALSE)) rm(trans_genes_df)
     if (exists("gene_pt_cor", inherits = FALSE)) rm(gene_pt_cor)
@@ -5081,7 +5309,7 @@ tryCatch({
   }  # end for (cond in conditions)
 
   tier5_status <- "COMPLETE"
-  cat("\nTIER 5 REVISED (5-Zone Trajectory) complete.\n")
+  cat("\nTIER 5 REVISED (5-Zone Trajectory + PT Range Filtering) complete.\n")
 
 }, error = function(e) {
   cat(paste0("TIER 5 ERROR: ", conditionMessage(e), "\n"))
