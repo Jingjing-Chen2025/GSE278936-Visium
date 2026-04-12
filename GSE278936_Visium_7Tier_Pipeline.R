@@ -699,7 +699,7 @@ for (sn in successfully_loaded) {
 # TIER 1 — REVISED 5-ZONE SPATIAL ANNOTATION (Distance-Only Assignment)
 # ==============================================================================
 # 5 Zones (all distance-based, no score gating):
-#   1. Interface       — dist == 0 (ASPC-adjacent, active NE transition front)
+#   1. Interface       — dist == 0
 #   2. Proximal NE     — 0 < dist ≤ Q20 (closest 20% of non-interface)
 #   3. Distal NE       — Q20 < dist ≤ Q45 (next 25%)
 #   4. Epithelial      — Q45 < dist ≤ Q75 (middle 30%)
@@ -716,6 +716,9 @@ for (sn in successfully_loaded) {
 #   - Rank-based assignment to handle discrete distance ties
 #   - Guaranteed non-empty zones via adaptive quantile shifting
 #   - Fallback equal-partition when quantile boundaries collapse
+#   - **FIX: dist_to_interface now uses pixel coordinates (imagerow/imagecol)
+#     instead of array coordinates (row/col) to produce CONTINUOUS distances
+#     rather than discrete banded values from the hex grid**
 # ==============================================================================
 
 cat("\n=== TIER 1 REVISED: 5-Zone Spatial Annotation (Distance-Only) ===\n")
@@ -890,7 +893,15 @@ tryCatch({
   # ================================================================
   # Phase 2: Compute distances to interface
   # ================================================================
-  cat("\n  Phase 2: Computing distances to interface...\n")
+  # **FIX: Use pixel coordinates (imagerow/imagecol) for CONTINUOUS
+  # Euclidean distances. The previous version used array coordinates
+  # (row/col) which are sparse integers on the Visium hex grid,
+  # producing discrete banded distances (e.g., 0, 1, sqrt(2), 2...)
+  # that collapse the spatial gradient into a handful of values.**
+  #
+  # Falls back to row/col if pixel coordinates are not available.
+  # ================================================================
+  cat("\n  Phase 2: Computing distances to interface (PIXEL COORDINATES)...\n")
 
   # Validate samples have interface_zone + coordinates
   valid_samples <- character(0)
@@ -915,41 +926,67 @@ tryCatch({
     if (is.null(obj)) next
     md <- obj@meta.data
 
-    if (!"dist_to_interface" %in% colnames(md)) {
-      iface_idx <- which(md$interface_zone == "Interface")
-      if (length(iface_idx) == 0) {
-        rm(obj); invisible(gc()); next
-      }
-      coords <- as.matrix(md[, c("row", "col")])
-      ic <- coords[iface_idx, , drop = FALSE]
-      ns <- nrow(coords)
-      dti <- numeric(ns)
-
-      for (ci in seq(1, ns, by = 1000)) {
-        ce <- min(ci + 999, ns)
-        ch <- coords[ci:ce, , drop = FALSE]
-        if (nrow(ic) <= 5000) {
-          rd <- outer(ch[, 1], ic[, 1], "-")
-          cd <- outer(ch[, 2], ic[, 2], "-")
-          dti[ci:ce] <- apply(sqrt(rd^2 + cd^2), 1, min)
-          rm(rd, cd)
-        } else {
-          for (j in seq_len(nrow(ch))) {
-            dd <- sweep(ic, 2, ch[j, ])
-            dti[ci + j - 1] <- min(sqrt(rowSums(dd^2)))
-          }
-        }
-      }
-      dti[iface_idx] <- 0
-      obj$dist_to_interface <- dti
-      saveRDS(obj, file.path(rds_dir, paste0(sn, ".rds")))
-      cat(paste0("    ", sn, ": computed (",
-                 sum(dti == 0), " iface spots)\n"))
-      rm(coords, ic)
-    } else {
-      cat(paste0("    ", sn, ": present\n"))
+    # ---- ALWAYS RECOMPUTE to apply the pixel-coordinate fix ----
+    # (Remove the "if not present" guard so the fix takes effect
+    #  even if a stale dist_to_interface column exists from a prior run)
+    iface_idx <- which(md$interface_zone == "Interface")
+    if (length(iface_idx) == 0) {
+      rm(obj); invisible(gc()); next
     }
 
+    # **FIX: Select coordinate columns — prefer pixel coords for
+    #  continuous distances; fall back to array coords if unavailable**
+    use_pixel <- all(c("imagerow", "imagecol") %in% colnames(md)) &&
+      !all(is.na(md$imagerow)) && !all(is.na(md$imagecol))
+
+    if (use_pixel) {
+      coord_cols <- c("imagerow", "imagecol")
+      coord_label <- "pixel (imagerow/imagecol)"
+    } else {
+      coord_cols <- c("row", "col")
+      coord_label <- "array (row/col) — FALLBACK, distances may be discrete"
+    }
+
+    coords <- as.matrix(md[, coord_cols])
+    ic <- coords[iface_idx, , drop = FALSE]
+    ns <- nrow(coords)
+    dti <- numeric(ns)
+
+    for (ci in seq(1, ns, by = 1000)) {
+      ce <- min(ci + 999, ns)
+      ch <- coords[ci:ce, , drop = FALSE]
+      if (nrow(ic) <= 5000) {
+        rd <- outer(ch[, 1], ic[, 1], "-")
+        cd <- outer(ch[, 2], ic[, 2], "-")
+        dti[ci:ce] <- apply(sqrt(rd^2 + cd^2), 1, min)
+        rm(rd, cd)
+      } else {
+        for (j in seq_len(nrow(ch))) {
+          dd <- sweep(ic, 2, ch[j, ])
+          dti[ci + j - 1] <- min(sqrt(rowSums(dd^2)))
+        }
+      }
+    }
+    dti[iface_idx] <- 0
+    obj$dist_to_interface <- dti
+    saveRDS(obj, file.path(rds_dir, paste0(sn, ".rds")))
+
+    # **Diagnostic: report distance statistics to confirm continuity**
+    n_unique <- length(unique(round(dti, 4)))
+    d_range <- range(dti[dti > 0], na.rm = TRUE)
+    cat(paste0("    ", sn, ": computed using ", coord_label, " (",
+               sum(dti == 0), " iface spots, ",
+               n_unique, " unique distances, ",
+               "range=[", round(d_range[1], 2), ", ",
+               round(d_range[2], 2), "])\n"))
+
+    # **WARNING if distances look discrete (likely fell back to array coords)**
+    if (n_unique < 20 && ns > 100) {
+      cat(paste0("      WARNING: only ", n_unique,
+                 " unique distances — check coordinate source!\n"))
+    }
+
+    rm(coords, ic)
     rm(obj); invisible(gc())
   }
 
@@ -1343,7 +1380,7 @@ tryCatch({
             scale_fill_manual(values = zone5_colors) +
             labs(title = paste0(cn, " — Distance Distribution Colored by 5-Zone"),
                  subtitle = "Rank-based assignment guarantees all zones populated",
-                 x = "Distance to Interface", y = "Spot Count",
+                 x = "Distance to Interface (pixel units)", y = "Spot Count",
                  fill = "Zone") +
             theme_minimal(base_size = 10)
           print(p_hist)
@@ -1595,7 +1632,7 @@ tryCatch({
   }
 
   tier1_status <- "COMPLETE"
-  cat("\nTIER 1 REVISED (5-Zone Rank-Based) complete.\n")
+  cat("\nTIER 1 REVISED (5-Zone Rank-Based + Pixel Distance Fix) complete.\n")
 
 }, error = function(e) {
   cat(paste0("TIER 1 ERROR: ", conditionMessage(e), "\n"))
