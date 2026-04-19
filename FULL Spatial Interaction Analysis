@@ -1,0 +1,1233 @@
+# ==============================================================================
+# GSE278936 Visium — FULL Spatial Interaction Analysis (Seurat v5 compatible)
+# ASPC–Cancer Crosstalk, L-R Interactions, ECM, Zonation, Plasticity
+# 52 samples: BPH(4), TRNA(17), NEADT(22), CRPC(4), MET(4), + cross-sample
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 0. Install & Load Packages
+# ------------------------------------------------------------------------------
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+pkgs <- c("Seurat", "ggplot2", "patchwork", "dplyr", "tidyr", "Matrix", "scales",
+          "RColorBrewer", "grDevices", "png", "jsonlite", "data.table",
+          "ggrepel", "pheatmap", "ggpubr")
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tidyr)
+library(Matrix)
+library(scales)
+library(grDevices)
+library(png)
+library(jsonlite)
+library(data.table)
+library(ggrepel)
+library(pheatmap)
+library(ggpubr)
+
+cat("Libraries loaded\n")
+
+# ------------------------------------------------------------------------------
+# Seurat v5 compatibility helper
+# GetAssayData changed: slot= is defunct, use layer= instead
+# ------------------------------------------------------------------------------
+safe_GetAssayData <- function(obj, layer_name = "data") {
+  tryCatch({
+    GetAssayData(obj, layer = layer_name)
+  }, error = function(e) {
+    tryCatch({
+      GetAssayData(obj, slot = layer_name)
+    }, error = function(e2) {
+      # Last resort: try accessing directly
+      obj[[DefaultAssay(obj)]]@data
+    })
+  })
+}
+
+cat(paste0("Seurat version: ", packageVersion("Seurat"), "\n"))
+cat(paste0("SeuratObject version: ", packageVersion("SeuratObject"), "\n"))
+
+# ------------------------------------------------------------------------------
+# 1. Sample Definitions (52 samples with disease group annotation)
+# ------------------------------------------------------------------------------
+base_root <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE278936 Visium"
+
+cross_sample_dir <- file.path(base_root, "Cross_Sample_Analysis")
+dir.create(cross_sample_dir, showWarnings = FALSE, recursive = TRUE)
+
+samples <- list(
+  # BPH (4)
+  list(name = "BPH_1",    dir = file.path(base_root, "GSM8557976_BPH_1"),    group = "BPH"),
+  list(name = "BPH_2",    dir = file.path(base_root, "GSM8557977_BPH_2"),    group = "BPH"),
+  list(name = "BPH_3",    dir = file.path(base_root, "GSM8557978_BPH_3"),    group = "BPH"),
+  list(name = "BPH_4",    dir = file.path(base_root, "GSM8557979_BPH_4"),    group = "BPH"),
+  # TRNA (17)
+  list(name = "TRNA_1",   dir = file.path(base_root, "GSM8557980_TRNA_1"),   group = "TRNA"),
+  list(name = "TRNA_2",   dir = file.path(base_root, "GSM8557981_TRNA_2"),   group = "TRNA"),
+  list(name = "TRNA_3",   dir = file.path(base_root, "GSM8557982_TRNA_3"),   group = "TRNA"),
+  list(name = "TRNA_4",   dir = file.path(base_root, "GSM8557983_TRNA_4"),   group = "TRNA"),
+  list(name = "TRNA_5",   dir = file.path(base_root, "GSM8557984_TRNA_5"),   group = "TRNA"),
+  list(name = "TRNA_6",   dir = file.path(base_root, "GSM8557985_TRNA_6"),   group = "TRNA"),
+  list(name = "TRNA_7",   dir = file.path(base_root, "GSM8557986_TRNA_7"),   group = "TRNA"),
+  list(name = "TRNA_8",   dir = file.path(base_root, "GSM8557987_TRNA_8"),   group = "TRNA"),
+  list(name = "TRNA_9",   dir = file.path(base_root, "GSM8557988_TRNA_9"),   group = "TRNA"),
+  list(name = "TRNA_10",  dir = file.path(base_root, "GSM8557989_TRNA_10"),  group = "TRNA"),
+  list(name = "TRNA_11",  dir = file.path(base_root, "GSM8557990_TRNA_11"),  group = "TRNA"),
+  list(name = "TRNA_12",  dir = file.path(base_root, "GSM8557991_TRNA_12"),  group = "TRNA"),
+  list(name = "TRNA_13",  dir = file.path(base_root, "GSM8557992_TRNA_13"),  group = "TRNA"),
+  list(name = "TRNA_14",  dir = file.path(base_root, "GSM8557993_TRNA_14"),  group = "TRNA"),
+  list(name = "TRNA_15",  dir = file.path(base_root, "GSM8557994_TRNA_15"),  group = "TRNA"),
+  list(name = "TRNA_16",  dir = file.path(base_root, "GSM8557995_TRNA_16"),  group = "TRNA"),
+  list(name = "TRNA_17",  dir = file.path(base_root, "GSM8557996_TRNA_17"),  group = "TRNA"),
+  # NEADT (22)
+  list(name = "NEADT_1",  dir = file.path(base_root, "GSM8557997_NEADT_1"),  group = "NEADT"),
+  list(name = "NEADT_2",  dir = file.path(base_root, "GSM8557998_NEADT_2"),  group = "NEADT"),
+  list(name = "NEADT_3",  dir = file.path(base_root, "GSM8557999_NEADT_3"),  group = "NEADT"),
+  list(name = "NEADT_4",  dir = file.path(base_root, "GSM8558000_NEADT_4"),  group = "NEADT"),
+  list(name = "NEADT_5",  dir = file.path(base_root, "GSM8558001_NEADT_5"),  group = "NEADT"),
+  list(name = "NEADT_6",  dir = file.path(base_root, "GSM8558002_NEADT_6"),  group = "NEADT"),
+  list(name = "NEADT_7",  dir = file.path(base_root, "GSM8558003_NEADT_7"),  group = "NEADT"),
+  list(name = "NEADT_8",  dir = file.path(base_root, "GSM8558004_NEADT_8"),  group = "NEADT"),
+  list(name = "NEADT_9",  dir = file.path(base_root, "GSM8558005_NEADT_9"),  group = "NEADT"),
+  list(name = "NEADT_10", dir = file.path(base_root, "GSM8558006_NEADT_10"), group = "NEADT"),
+  list(name = "NEADT_11", dir = file.path(base_root, "GSM8558007_NEADT_11"), group = "NEADT"),
+  list(name = "NEADT_12", dir = file.path(base_root, "GSM8558008_NEADT_12"), group = "NEADT"),
+  list(name = "NEADT_13", dir = file.path(base_root, "GSM8558009_NEADT_13"), group = "NEADT"),
+  list(name = "NEADT_14", dir = file.path(base_root, "GSM8558010_NEADT_14"), group = "NEADT"),
+  list(name = "NEADT_15", dir = file.path(base_root, "GSM8558011_NEADT_15"), group = "NEADT"),
+  list(name = "NEADT_16", dir = file.path(base_root, "GSM8558012_NEADT_16"), group = "NEADT"),
+  list(name = "NEADT_17", dir = file.path(base_root, "GSM8558013_NEADT_17"), group = "NEADT"),
+  list(name = "NEADT_18", dir = file.path(base_root, "GSM8558014_NEADT_18"), group = "NEADT"),
+  list(name = "NEADT_19", dir = file.path(base_root, "GSM8558015_NEADT_19"), group = "NEADT"),
+  list(name = "NEADT_20", dir = file.path(base_root, "GSM8558016_NEADT_20"), group = "NEADT"),
+  list(name = "NEADT_21", dir = file.path(base_root, "GSM8558017_NEADT_21"), group = "NEADT"),
+  list(name = "NEADT_22", dir = file.path(base_root, "GSM8558018_NEADT_22"), group = "NEADT"),
+  # CRPC (4)
+  list(name = "CRPC_1",   dir = file.path(base_root, "GSM8558019_CRPC_1"),   group = "CRPC"),
+  list(name = "CRPC_2",   dir = file.path(base_root, "GSM8558020_CRPC_2"),   group = "CRPC"),
+  list(name = "CRPC_3",   dir = file.path(base_root, "GSM8558021_CRPC_3"),   group = "CRPC"),
+  list(name = "CRPC_4",   dir = file.path(base_root, "GSM8558022_CRPC_4"),   group = "CRPC"),
+  # MET (4)
+  list(name = "MET_A",    dir = file.path(base_root, "GSM8558024_MET_A"),    group = "MET"),
+  list(name = "MET_B",    dir = file.path(base_root, "GSM8558025_MET_B"),    group = "MET"),
+  list(name = "MET_C",    dir = file.path(base_root, "GSM8558026_MET_C"),    group = "MET"),
+  list(name = "MET_D",    dir = file.path(base_root, "GSM8558027_MET_D"),    group = "MET")
+)
+
+cat(paste0("Total samples to process: ", length(samples), "\n"))
+
+# ------------------------------------------------------------------------------
+# Helper: scan a directory recursively and find a file that ends with a suffix
+# ------------------------------------------------------------------------------
+find_file <- function(base, suffix) {
+  all_files <- list.files(base, recursive = TRUE, full.names = TRUE)
+  hits <- all_files[grepl(paste0(gsub("\\.", "\\\\.", suffix), "$"), all_files)]
+  if (length(hits) == 0) return(NA_character_)
+  return(hits[1])
+}
+
+# ------------------------------------------------------------------------------
+# 2. Gene Signatures
+# ------------------------------------------------------------------------------
+ASPC_genes <- c("LAMA2","THBS3","FGF2","POSTN","THBS2","VCAN","LAMB1","COL4A1","GAS6",
+  "BMPER","COL5A1","COL6A5","COL5A3","ENTPD2","ALDH1A1","MFAP2","COL5A2","LOXL2",
+  "FBLN7","BDH2","COL3A1","GPC6","LGI2","AK1","SRPX2","LOXL3","NOTCH3","CLU",
+  "CTHRC1","FGFR1","C3","DPEP1","SSC5D","NAALAD2","ITGBL1","FOXS1","COL11A1",
+  "NNMT","HEYL","TFCP2L1","PRG4","ZFHX4","BNC2","ADAMTS2","NFASC","CHRD",
+  "PDGFRL","C1QTNF2","ANO1","HOXB7","ADAMTS15","ADAMTS12","IGSF10","DNM1","CHL1",
+  "HAS2","CYGB","NR2F1","ZFPM2","ADAMTS5","CP","SULF1","C2","PCSK5","PTPRD",
+  "FAP","TNFAIP6","S100A16","HSD11B1","TIMP1","BMP1","CACNA2D1","TBX2","RBP1",
+  "NFATC4","GPRC5B","MMP11","DPYSL3","ADAMTSL1","KRT7","FST","ID4","SERPINH1",
+  "MDK","HOXC8","PDGFRA","ANGPT4","HIGD1B","MMP3","GPR153","MEG3","ISL1",
+  "TSPAN11","HOXC9","GJC1","SMIM22","ABCC9","ILDR2","HP","LHFP","NTRK2","FEZ1",
+  "FMO2","FZD2","TMEM45A","MMP15","CRLF1","TENM3","ARHGEF25","FOXC2","PIEZO2",
+  "S1PR3","CADM3","DCLK1","LRRN2","LBP","KCNE4","PLS3","PKDCC","NUMBL","STOX2",
+  "PLCE1","STEAP3","PDE1A","CCDC102B","PRKG1","ARHGAP42","S100A14","ELF3","SPHK1",
+  "NAV3","FXYD1","SULT1E1","GABRA3","MEDAG","GPR39","CASP12","SNTG1","CERCAM",
+  "FKBP9","CDR2L","PTK7","KIF21A","NSG1","ROBO1","CCDC74A")
+
+Hallmark_AR_genes <- c("ABCC4","ABHD2","ACSL3","ACTN1","ADAMTS1","ADRM1","AKAP12","AKT1",
+  "ALDH1A3","ANKH","APPBP2","ARID5B","AZGP1","B2M","B4GALT1","BMPR1B","CAMKK2",
+  "CCND1","CCND3","CDC14B","CDK6","CENPN","DBI","DHCR24","DNAJB9","ELK4","ELL2",
+  "ELOVL5","FADS1","FKBP5","GNAI3","GPD1L","GSR","GUCY1A1","H1-0","HERC3",
+  "HMGCR","HMGCS1","HOMER2","HPGD","HSD17B14","IDI1","INPP4B","INSIG1","IQGAP2",
+  "ITGAV","KLK2","KLK3","KRT19","KRT8","LIFR","LMAN1","MAF","MAK","MAP7",
+  "MERTK","MYL12A","NCOA4","NDRG1","NGLY1","NKX3-1","PA2G4","PDLIM5","PGM3",
+  "PIAS1","PLPP1","PMEPA1","PTK2B","PTPN21","RAB4A","RPS6KA3","RRP12","SAT1",
+  "SCD","SEC24D","SELENOP","SGK1","SLC26A2","SLC38A2","SMS","SORD","SPCS3",
+  "SPDEF","SRF","SRP19","STEAP4","STK39","TARP","TMEM50A","TMPRSS2","TNFAIP8",
+  "TPD52","TSC22D1","UAP1","UBE2I","UBE2J1","VAPA","XRCC5","XRCC6","ZBTB10","ZMIZ1")
+
+NEPC_Beltran_UP <- c("ASXL3","CAND2","ETV5","GPX2","JAKMIP2","KIAA0408","SOGA3","TRIM9",
+  "BRINP1","C7orf76","GNAO1","KCNB2","KCND2","LRRC16B","MAP10","NRSN1","PCSK1",
+  "PROX1","RGS7","SCG3","SEC11C","SEZ6","ST8SIA3","SVOP","SYT11","AURKA","DNMT1",
+  "EZH2","MYCN")
+
+NEPC_Beltran_DOWN <- c("AR","CCND1","CIITA","CREBBP","CSDE1","CYLD","DICER1","FHIT",
+  "FOXP1","HERPUD1","MMP2","MYH9","NUP93","PAX8","RBBP6","TRIM33","GATA2",
+  "MAPKAPK3","SPDEF","ARHGAP8","CATSPERB","EFNA4","EPN3","EVPL","HOXB13","KLK3",
+  "KLK4","LMAN1L","NKX3-1","OPHN1","PIEZO1","PRR5-ARHGAP8","PSCA","RAB27B",
+  "RGS10","RIPK2","SLC25A37","SLC44A4","TC2N","UPK2","RB1")
+
+# --- Ligand-Receptor pairs (ASPC ligand -> Cancer receptor) ---
+LR_pairs <- data.frame(
+  Ligand   = c("FGF2","FGF2","GAS6","GAS6","POSTN","POSTN","POSTN","VCAN",
+               "MDK","MDK","BMP1","CRLF1","SULF1","FAP","THBS2","THBS2",
+               "LAMB1","LAMB1","COL4A1","SPHK1","HAS2","TNFAIP6","CLU",
+               "PDGFRA","S1PR3","FZD2","NOTCH3"),
+  Receptor = c("FGFR1","FGFR2","AXL","MERTK","ITGAV","ITGB3","ITGB5","CD44",
+               "SDC1","PTPRZ1","BMPR1A","LIFR","SULF2","DPP4","CD36","CD47",
+               "ITGA6","ITGB1","ITGA1","S1PR1","CD44","CD44","CLU",
+               "PDGFA","S1P","WNT5A","JAG1"),
+  Pathway  = c("FGF","FGF","TAM_RTK","TAM_RTK","Integrin","Integrin","Integrin","Proteoglycan",
+               "Midkine","Midkine","BMP","CLCF1_CNTFR","Heparan_sulfate","Protease","Thrombospondin","Thrombospondin",
+               "Laminin","Laminin","Collagen","Sphingolipid","Hyaluronan","Hyaluronan","Clusterin",
+               "PDGF","S1P","WNT","NOTCH"),
+  stringsAsFactors = FALSE
+)
+
+# --- ECM gene categories ---
+ECM_collagens <- c("COL3A1","COL4A1","COL5A1","COL5A2","COL5A3","COL6A5","COL11A1")
+ECM_MMPs      <- c("MMP3","MMP11","MMP15","MMP2")
+ECM_crosslink <- c("LOXL2","LOXL3")
+ECM_proteogly <- c("VCAN","GPC6")
+ECM_matricell <- c("POSTN","THBS2","THBS3","FBLN7")
+
+# --- EMT signature (Hallmark) ---
+EMT_genes <- c("ABI3BP","ACTA2","ADAM12","ANPEP","APLP1","AREG","BASP1","BDNF",
+  "BGN","BMP1","CADM1","CALD1","CALU","CAP2","CAPG","CD44","CD59","CDH11",
+  "CDH2","CDH6","COL1A1","COL1A2","COL3A1","COL4A1","COL4A2","COL5A1",
+  "COL5A2","COL5A3","COL6A2","COL6A3","COL7A1","COL8A2","COL11A1","COL12A1",
+  "COL16A1","COMP","COPA","CRLF1","CCN2","CTHRC1","CXCL1","CXCL12","CXCL6",
+  "CYR61","DAB2","DCN","DKK1","DPYSL3","DST","ECM1","ECM2","EDIL3","EFEMP2",
+  "ELN","EMP3","ENO2","FAP","FAS","FBLN1","FBLN2","FBLN5","FBN1","FBN2",
+  "FERMT2","FGF2","FLNA","FMOD","FN1","FOXC2","FSTL1","FSTL3","FUCA1",
+  "FZD8","GADD45A","GADD45B","GAS1","GEM","GJA1","GLIPR1","GPC1","GPX7",
+  "GREM1","HTRA1","ID2","IGFBP2","IGFBP3","IGFBP4","IL15","IL32","IL6",
+  "INHBA","ITGA2","ITGA5","ITGAV","ITGB1","ITGB3","ITGB5","JUN",
+  "LAMC1","LAMC2","LGALS1","LOX","LOXL1","LOXL2","LRP1","LRRC15",
+  "LUM","MAGEE1","MATN2","MATN3","MCM7","MEST","MFAP5","MGP","MMP1",
+  "MMP2","MMP3","MMP14","MSX1","MXRA5","MYL9","MYLK","NID2","NNMT",
+  "NOTCH2","NT5E","NTM","OXTR","PCOLCE","PCOLCE2","PDGFRB","PDLIM4",
+  "PFN2","PLAUR","PLOD1","PLOD2","PLOD3","PMEPA1","PMP22","POSTN",
+  "PPIB","PRRX1","PRSS2","PTHLH","PTX3","PVR","QSOX1","RGS4","RHOB",
+  "SAT1","SCG2","SDC1","SDC4","SERPINE1","SERPINE2","SERPINH1","SFRP1",
+  "SFRP4","SGCB","SGCD","SLC6A8","SLIT2","SLIT3","SNAI2","SNTB1",
+  "SPARC","SPOCK1","SPP1","TAGLN","TFPI2","TGFB1","TGFBI","TGFBR3",
+  "TGM2","THBS1","THBS2","THY1","TIMP1","TIMP3","TNC","TNFAIP3",
+  "TNFRSF11B","TNFRSF12A","TPM1","TPM2","TPM4","VCAM1","VCAN","VIM",
+  "WIPF1","WNT5A")
+
+cat("Gene signatures and L-R pairs defined\n")
+
+# ==============================================================================
+# 3. MAIN LOOP — Process each sample
+# ==============================================================================
+completed_samples  <- c()
+skipped_samples    <- c()
+cross_sample_table <- list()
+
+for (s in samples) {
+
+  sample_name  <- s$name
+  base_dir     <- s$dir
+  disease_grp  <- s$group
+
+  cat("\n\n##############################################################\n")
+  cat(paste0("  Processing: ", sample_name, " [", disease_grp, "]\n"))
+  cat(paste0("  Directory:  ", base_dir, "\n"))
+  cat("##############################################################\n")
+
+  # --------------------------------------------------------------------------
+  # 3a. Auto-detect files by suffix
+  # --------------------------------------------------------------------------
+  barcodes_file     <- find_file(base_dir, "barcodes.tsv.gz")
+  features_file     <- find_file(base_dir, "features.tsv.gz")
+  matrix_file       <- find_file(base_dir, "matrix.mtx.gz")
+  positions_file    <- find_file(base_dir, "tissue_positions_list.csv")
+  scalefactors_file <- find_file(base_dir, "scalefactors_json.json")
+  hires_image_file  <- find_file(base_dir, "tissue_hires_image.png")
+  lowres_image_file <- find_file(base_dir, "tissue_lowres_image.png")
+
+  output_dir <- base_dir
+  plots_dir  <- file.path(output_dir, "plots")
+  dir.create(plots_dir, showWarnings = FALSE, recursive = TRUE)
+
+  all_req_files <- c(barcodes_file, features_file, matrix_file,
+                     positions_file, scalefactors_file, hires_image_file, lowres_image_file)
+
+  any_missing <- FALSE
+  for (f in all_req_files) {
+    if (is.na(f) || !file.exists(f)) {
+      cat(paste0("  MISSING: ", f, "\n"))
+      any_missing <- TRUE
+    } else {
+      cat(paste0("  OK: ", basename(f), "\n"))
+    }
+  }
+  if (any_missing) {
+    cat(paste0("  *** Skipping ", sample_name, " — required files missing ***\n"))
+    skipped_samples <- c(skipped_samples, sample_name)
+    next
+  }
+
+  # --------------------------------------------------------------------------
+  # 3b. Load Expression Matrix
+  # --------------------------------------------------------------------------
+  cat("\n=== Loading expression matrix ===\n")
+  barcodes <- readLines(gzfile(barcodes_file))
+  features <- read.delim(gzfile(features_file), header = FALSE, stringsAsFactors = FALSE)
+  mat      <- readMM(gzfile(matrix_file))
+
+  colnames(mat) <- barcodes
+  gene_names <- features$V2
+  dup <- duplicated(gene_names) | gene_names == ""
+  gene_names[dup] <- paste0(gene_names[dup], "_", features$V1[dup])
+  rownames(mat) <- gene_names
+  cat(paste0("  Matrix: ", nrow(mat), " genes x ", ncol(mat), " spots\n"))
+
+  # --------------------------------------------------------------------------
+  # 3c. Load Spatial Coordinates
+  # --------------------------------------------------------------------------
+  cat("\n=== Loading spatial coordinates ===\n")
+  positions <- read.csv(positions_file, header = FALSE, stringsAsFactors = FALSE)
+  if (positions$V1[1] == "barcode" || grepl("barcode", positions$V1[1], ignore.case = TRUE)) {
+    colnames(positions) <- positions[1, ]
+    positions <- positions[-1, ]
+    colnames(positions) <- c("barcode","in_tissue","array_row","array_col","pxl_row_fullres","pxl_col_fullres")
+  } else {
+    colnames(positions) <- c("barcode","in_tissue","array_row","array_col","pxl_row_fullres","pxl_col_fullres")
+  }
+  positions$in_tissue       <- as.integer(positions$in_tissue)
+  positions$array_row       <- as.integer(positions$array_row)
+  positions$array_col       <- as.integer(positions$array_col)
+  positions$pxl_row_fullres <- as.numeric(positions$pxl_row_fullres)
+  positions$pxl_col_fullres <- as.numeric(positions$pxl_col_fullres)
+  rownames(positions) <- positions$barcode
+
+  cat(paste0("  Positions: ", nrow(positions), " total, ", sum(positions$in_tissue == 1), " in tissue\n"))
+
+  scale_factors <- fromJSON(scalefactors_file)
+  lowres_sf <- scale_factors$tissue_lowres_scalef
+
+  # --------------------------------------------------------------------------
+  # 3d. Create Seurat Object
+  # --------------------------------------------------------------------------
+  cat("\n=== Creating Seurat object ===\n")
+  common_bc    <- intersect(barcodes, positions$barcode)
+  mat_filt     <- mat[, common_bc]
+  pos_filt     <- positions[common_bc, ]
+  in_tissue_bc <- pos_filt$barcode[pos_filt$in_tissue == 1]
+  mat_tissue   <- mat_filt[, in_tissue_bc]
+  pos_tissue   <- pos_filt[in_tissue_bc, ]
+
+  sobj <- CreateSeuratObject(counts = mat_tissue, assay = "Spatial", project = sample_name)
+  sobj$spatial_x       <- pos_tissue[Cells(sobj), "pxl_col_fullres"]
+  sobj$spatial_y       <- pos_tissue[Cells(sobj), "pxl_row_fullres"]
+  sobj$in_tissue       <- pos_tissue[Cells(sobj), "in_tissue"]
+  sobj$array_row       <- pos_tissue[Cells(sobj), "array_row"]
+  sobj$array_col       <- pos_tissue[Cells(sobj), "array_col"]
+  sobj$spatial_x_lowres <- sobj$spatial_x * lowres_sf
+  sobj$spatial_y_lowres <- sobj$spatial_y * lowres_sf
+  sobj$spatial_x_hires  <- sobj$spatial_x * scale_factors$tissue_hires_scalef
+  sobj$spatial_y_hires  <- sobj$spatial_y * scale_factors$tissue_hires_scalef
+  sobj$disease_group    <- disease_grp
+
+  cat(paste0("  Seurat object: ", ncol(sobj), " spots x ", nrow(sobj), " genes\n"))
+
+  # --------------------------------------------------------------------------
+  # 3e. QC & Normalization
+  # --------------------------------------------------------------------------
+  cat("\n=== QC & Normalization ===\n")
+  sobj[["percent.mt"]]   <- PercentageFeatureSet(sobj, pattern = "^MT-")
+  sobj[["percent.ribo"]] <- PercentageFeatureSet(sobj, pattern = "^RPS|^RPL")
+  median_mt <- median(sobj$percent.mt)
+
+  if (median_mt > 30) {
+    mt_mad    <- mad(sobj$percent.mt, constant = 1)
+    mt_thresh <- min(100, median_mt + 1.5 * mt_mad)
+  } else {
+    mt_thresh <- 30
+  }
+
+  nfeat_min <- 200
+  n_pass <- sum(sobj$nFeature_Spatial > 200 & sobj$percent.mt < mt_thresh)
+  if (n_pass < 50) { nfeat_min <- 100 }
+  if (sum(sobj$nFeature_Spatial > nfeat_min & sobj$percent.mt < mt_thresh) < 50) { nfeat_min <- 50 }
+
+  sobj <- subset(sobj, nFeature_Spatial > nfeat_min & nFeature_Spatial < 10000 & percent.mt < mt_thresh)
+  cat(paste0("  After QC: ", ncol(sobj), " spots (MT thresh=", round(mt_thresh,1), "%, nFeat>", nfeat_min, ")\n"))
+
+  if (ncol(sobj) < 20) {
+    cat("  *** Too few spots after QC — skipping ***\n")
+    skipped_samples <- c(skipped_samples, sample_name)
+    next
+  }
+
+  # QC diagnostic plot
+  qc_df <- data.frame(nFeature = sobj$nFeature_Spatial, nCount = sobj$nCount_Spatial, percent_mt = sobj$percent.mt)
+  p_qc <- (
+    ggplot(qc_df, aes(x=nFeature)) + geom_histogram(bins=50,fill="#3498DB",alpha=0.7) +
+      geom_vline(xintercept=nfeat_min,linetype="dashed",color="red") + theme_minimal() + ggtitle("nFeature") |
+    ggplot(qc_df, aes(x=percent_mt)) + geom_histogram(bins=50,fill="#E74C3C",alpha=0.7) +
+      geom_vline(xintercept=mt_thresh,linetype="dashed",color="red") + theme_minimal() + ggtitle("MT%") |
+    ggplot(qc_df, aes(x=nFeature,y=percent_mt)) + geom_point(size=0.3,alpha=0.5) +
+      geom_hline(yintercept=mt_thresh,linetype="dashed",color="red") +
+      geom_vline(xintercept=nfeat_min,linetype="dashed",color="red") + theme_minimal() + ggtitle("nFeat vs MT%")
+  ) + plot_annotation(title = paste0(sample_name, " — QC (", ncol(sobj), " spots)"))
+  ggsave(file.path(plots_dir, "00_QC_diagnostics.png"), p_qc, width=18, height=5, dpi=200, bg="white")
+
+  # Normalize & cluster
+  sobj <- SCTransform(sobj, assay = "Spatial", verbose = FALSE)
+  sobj <- RunPCA(sobj, verbose = FALSE)
+  np <- min(30, ncol(Embeddings(sobj, "pca")))
+  sobj <- FindNeighbors(sobj, dims = 1:np, verbose = FALSE)
+  sobj <- FindClusters(sobj, resolution = 0.8, verbose = FALSE)
+  sobj <- RunUMAP(sobj, dims = 1:np, verbose = FALSE)
+  cat(paste0("  Clusters: ", length(unique(Idents(sobj))), "\n"))
+
+  # --------------------------------------------------------------------------
+  # 3f. Compute ALL Module Scores
+  # --------------------------------------------------------------------------
+  cat("\n=== Computing Module Scores ===\n")
+
+  ctrl_size <- min(100, floor(nrow(sobj) / 4))
+  nbin_use  <- max(5, min(24, ncol(sobj) - 1))
+
+  safe_AddModuleScore <- function(obj, features, name, ctrl, nbin) {
+    tryCatch({
+      obj <- AddModuleScore(obj, features = features, name = name, ctrl = ctrl, nbin = nbin)
+      return(list(obj = obj, success = TRUE))
+    }, error = function(e1) {
+      tryCatch({
+        obj <- AddModuleScore(obj, features = features, name = name, ctrl = ctrl, nbin = max(3, floor(nbin/2)))
+        return(list(obj = obj, success = TRUE))
+      }, error = function(e2) {
+        tryCatch({
+          obj <- AddModuleScore(obj, features = features, name = name, ctrl = ctrl, nbin = 3)
+          return(list(obj = obj, success = TRUE))
+        }, error = function(e3) {
+          return(list(obj = obj, success = FALSE))
+        })
+      })
+    })
+  }
+
+  # FIXED: manual_module_score uses safe_GetAssayData (layer= instead of slot=)
+  manual_module_score <- function(obj, gene_list, score_name) {
+    avail <- gene_list[gene_list %in% rownames(obj)]
+    if (length(avail) == 0) { obj[[score_name]] <- 0; return(obj) }
+    expr_mat <- safe_GetAssayData(obj, "data")
+    scores <- colMeans(as.matrix(expr_mat[avail, , drop = FALSE]))
+    set.seed(42)
+    bg <- sample(setdiff(rownames(obj), avail), size = min(ctrl_size, length(setdiff(rownames(obj), avail))))
+    if (length(bg) > 0) scores <- scores - colMeans(as.matrix(expr_mat[bg, , drop = FALSE]))
+    obj[[score_name]] <- scores
+    return(obj)
+  }
+
+  compute_score <- function(obj, gene_list, score_prefix) {
+    avail <- gene_list[gene_list %in% rownames(obj)]
+    if (length(avail) >= 5) {
+      res <- safe_AddModuleScore(obj, list(avail), score_prefix, ctrl_size, nbin_use)
+      if (res$success) return(list(obj = res$obj, success = TRUE, n = length(avail)))
+      obj <- manual_module_score(obj, avail, paste0(score_prefix, "1"))
+      return(list(obj = obj, success = TRUE, n = length(avail)))
+    }
+    return(list(obj = obj, success = FALSE, n = length(avail)))
+  }
+
+  # Core signatures
+  r1 <- compute_score(sobj, ASPC_genes, "ASPC_score")
+  sobj <- r1$obj; has_aspc <- r1$success
+  r2 <- compute_score(sobj, Hallmark_AR_genes, "HallmarkAR_score")
+  sobj <- r2$obj; has_ha <- r2$success
+  r3 <- compute_score(sobj, NEPC_Beltran_UP, "NEPC_UP_score")
+  sobj <- r3$obj; has_nepc_up <- r3$success
+  r4 <- compute_score(sobj, NEPC_Beltran_DOWN, "NEPC_DN_score")
+  sobj <- r4$obj; has_nepc_dn <- r4$success
+
+  has_nepc_composite <- FALSE
+  if (has_nepc_up && has_nepc_dn) {
+    sobj$NEPC_Beltran_composite <- sobj$NEPC_UP_score1 - sobj$NEPC_DN_score1
+    has_nepc_composite <- TRUE
+  }
+
+  # EMT signature
+  r5 <- compute_score(sobj, EMT_genes, "EMT_score")
+  sobj <- r5$obj; has_emt <- r5$success
+
+  # ECM sub-signatures
+  ecm_cats <- list(Collagen = ECM_collagens, MMP = ECM_MMPs, Crosslinker = ECM_crosslink,
+                   Proteoglycan = ECM_proteogly, Matricellular = ECM_matricell)
+  has_ecm <- list()
+  for (ec_name in names(ecm_cats)) {
+    rc <- compute_score(sobj, ecm_cats[[ec_name]], paste0("ECM_", ec_name, "_score"))
+    sobj <- rc$obj
+    has_ecm[[ec_name]] <- rc$success
+    if (rc$success) cat(paste0("  ECM_", ec_name, " score computed (", rc$n, " genes)\n"))
+  }
+
+  cat(paste0("  ASPC=", has_aspc, " AR=", has_ha, " NEPC_comp=", has_nepc_composite, " EMT=", has_emt, "\n"))
+
+  # --------------------------------------------------------------------------
+  # 3g. Ligand-Receptor Interaction Scoring
+  # FIXED: uses safe_GetAssayData() for Seurat v5 compatibility
+  # --------------------------------------------------------------------------
+  cat("\n=== Ligand-Receptor Interaction Analysis ===\n")
+
+  all_genes <- rownames(sobj)
+  expr_data <- safe_GetAssayData(sobj, "data")
+
+  lr_results <- data.frame()
+  for (i in 1:nrow(LR_pairs)) {
+    lig <- LR_pairs$Ligand[i]
+    rec <- LR_pairs$Receptor[i]
+    pw  <- LR_pairs$Pathway[i]
+
+    lig_present <- lig %in% all_genes
+    rec_present <- rec %in% all_genes
+
+    if (lig_present && rec_present) {
+      lig_expr <- as.numeric(expr_data[lig, ])
+      rec_expr <- as.numeric(expr_data[rec, ])
+      interaction_score <- sqrt(pmax(lig_expr, 0) * pmax(rec_expr, 0))
+      col_name <- paste0("LR_", lig, "_", rec)
+      sobj[[col_name]] <- interaction_score
+
+      lr_results <- rbind(lr_results, data.frame(
+        Ligand = lig, Receptor = rec, Pathway = pw,
+        Ligand_present = TRUE, Receptor_present = TRUE,
+        Mean_interaction = round(mean(interaction_score), 4),
+        Pct_coexpressed  = round(mean(lig_expr > 0 & rec_expr > 0) * 100, 1),
+        Cor_LR           = round(cor(lig_expr, rec_expr, method = "spearman"), 4),
+        stringsAsFactors = FALSE
+      ))
+    } else {
+      lr_results <- rbind(lr_results, data.frame(
+        Ligand = lig, Receptor = rec, Pathway = pw,
+        Ligand_present = lig_present, Receptor_present = rec_present,
+        Mean_interaction = NA, Pct_coexpressed = NA, Cor_LR = NA,
+        stringsAsFactors = FALSE
+      ))
+    }
+  }
+  write.csv(lr_results, file.path(output_dir, paste0(sample_name, "_LR_interaction_scores.csv")), row.names = FALSE)
+  cat(paste0("  L-R pairs scored: ", sum(!is.na(lr_results$Mean_interaction)), "/", nrow(lr_results), "\n"))
+
+  # Top LR interaction spatial plot
+  lr_active <- lr_results %>% filter(!is.na(Mean_interaction)) %>% arrange(desc(Mean_interaction))
+  if (nrow(lr_active) > 0) {
+    top_lr <- lr_active[1, ]
+    top_col <- paste0("LR_", top_lr$Ligand, "_", top_lr$Receptor)
+    md_temp <- sobj@meta.data
+    if (top_col %in% colnames(md_temp)) {
+      p_lr <- ggplot(md_temp, aes_string(x = "spatial_x", y = "-spatial_y", color = top_col)) +
+        geom_point(size = 0.8, alpha = 0.85) +
+        scale_color_gradient(low = "grey90", high = "#E74C3C", name = "Interaction\nScore") +
+        coord_equal() + theme_minimal(base_size = 13) +
+        ggtitle(paste0(sample_name, " — Top L-R: ", top_lr$Ligand, "->", top_lr$Receptor, " (", top_lr$Pathway, ")")) +
+        theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+              axis.title = element_blank(), axis.text = element_blank(),
+              axis.ticks = element_blank(), panel.grid = element_blank())
+      ggsave(file.path(plots_dir, "10_top_LR_interaction_spatial.png"), p_lr, width = 10, height = 10, dpi = 200, bg = "white")
+    }
+  }
+
+  # LR barplot
+  if (nrow(lr_active) >= 3) {
+    lr_for_heat <- lr_active %>%
+      mutate(LR_label = paste0(Ligand, "->", Receptor)) %>%
+      select(LR_label, Mean_interaction, Pct_coexpressed, Cor_LR)
+
+    p_lr_bar <- ggplot(lr_for_heat[1:min(15, nrow(lr_for_heat)), ],
+                       aes(x = reorder(LR_label, Mean_interaction), y = Mean_interaction)) +
+      geom_col(fill = "#E74C3C", alpha = 0.8) +
+      coord_flip() + theme_minimal(base_size = 12) +
+      ggtitle(paste0(sample_name, " — Top L-R Interaction Scores")) +
+      xlab("") + ylab("Mean Interaction Score (sqrt(L*R))")
+    ggsave(file.path(plots_dir, "11_LR_interaction_barplot.png"), p_lr_bar, width = 10, height = 7, dpi = 200, bg = "white")
+  }
+
+  # --------------------------------------------------------------------------
+  # 3h. Spatial Co-localization Analysis
+  # --------------------------------------------------------------------------
+  cat("\n=== Spatial Co-localization Analysis ===\n")
+
+  md <- sobj@meta.data
+  coloc_results <- data.frame(Sample = sample_name, Group = disease_grp, N_spots = nrow(md))
+
+  if (has_aspc && has_ha) {
+    coloc_results$ASPC_AR_pearson   <- round(cor(md$ASPC_score1, md$HallmarkAR_score1, method = "pearson"), 4)
+    coloc_results$ASPC_AR_spearman  <- round(cor(md$ASPC_score1, md$HallmarkAR_score1, method = "spearman"), 4)
+    coloc_results$Pct_ASPC_pos      <- round(mean(md$ASPC_score1 > 0) * 100, 1)
+    coloc_results$Pct_AR_pos        <- round(mean(md$HallmarkAR_score1 > 0) * 100, 1)
+    coloc_results$Pct_colocalized   <- round(mean(md$ASPC_score1 > 0 & md$HallmarkAR_score1 > 0) * 100, 1)
+    coloc_results$Pct_ASPC_only     <- round(mean(md$ASPC_score1 > 0 & md$HallmarkAR_score1 <= 0) * 100, 1)
+    coloc_results$Pct_AR_only       <- round(mean(md$ASPC_score1 <= 0 & md$HallmarkAR_score1 > 0) * 100, 1)
+  }
+
+  if (has_aspc && has_nepc_composite) {
+    coloc_results$ASPC_NEPC_spearman <- round(cor(md$ASPC_score1, md$NEPC_Beltran_composite, method = "spearman"), 4)
+  }
+  if (has_ha && has_nepc_composite) {
+    coloc_results$AR_NEPC_spearman <- round(cor(md$HallmarkAR_score1, md$NEPC_Beltran_composite, method = "spearman"), 4)
+  }
+
+  # Interface zone
+  if (has_aspc && has_ha) {
+    md$zone <- ifelse(md$ASPC_score1 > 0 & md$HallmarkAR_score1 > 0, "Interface",
+               ifelse(md$ASPC_score1 > 0, "ASPC_only",
+               ifelse(md$HallmarkAR_score1 > 0, "AR_only", "Neither")))
+    md$zone <- factor(md$zone, levels = c("Neither", "ASPC_only", "AR_only", "Interface"))
+
+    zone_colors <- c("Neither" = "#E0E0E0", "ASPC_only" = "#27AE60",
+                     "AR_only" = "#2980B9", "Interface" = "#E74C3C")
+
+    p_zone <- ggplot(md, aes(x = spatial_x, y = -spatial_y, color = zone)) +
+      geom_point(size = 0.8, alpha = 0.85) +
+      scale_color_manual(values = zone_colors, name = "Zone") +
+      coord_equal() + theme_minimal(base_size = 13) +
+      ggtitle(paste0(sample_name, " — ASPC-AR Interface Zones")) +
+      theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+            axis.title = element_blank(), axis.text = element_blank(),
+            axis.ticks = element_blank(), panel.grid = element_blank(),
+            panel.background = element_rect(fill = "white", color = NA))
+    ggsave(file.path(plots_dir, "12_ASPC_AR_interface_zones.png"), p_zone, width = 10, height = 10, dpi = 200, bg = "white")
+
+    p_coloc_scatter <- ggplot(md, aes(x = ASPC_score1, y = HallmarkAR_score1, color = zone)) +
+      geom_point(size = 0.5, alpha = 0.6) +
+      scale_color_manual(values = zone_colors) +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+      geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.5) +
+      theme_minimal(base_size = 13) +
+      ggtitle(paste0(sample_name, " — ASPC vs AR Co-localization (r=",
+                     coloc_results$ASPC_AR_spearman, ")")) +
+      xlab("ASPC Score") + ylab("Hallmark AR Score")
+    ggsave(file.path(plots_dir, "13_ASPC_AR_colocalization_scatter.png"),
+           p_coloc_scatter, width = 8, height = 7, dpi = 200, bg = "white")
+
+    zone_stats <- md %>% group_by(zone) %>% summarize(N = n(), .groups = "drop") %>%
+      mutate(Pct = round(N / sum(N) * 100, 1))
+    write.csv(zone_stats, file.path(output_dir, paste0(sample_name, "_interface_zone_stats.csv")), row.names = FALSE)
+  }
+
+  write.csv(coloc_results, file.path(output_dir, paste0(sample_name, "_colocalization_stats.csv")), row.names = FALSE)
+
+  # --------------------------------------------------------------------------
+  # 3i. Nearest-Neighbor Distance Analysis
+  # --------------------------------------------------------------------------
+  cat("\n=== Nearest-Neighbor Distance Analysis ===\n")
+
+  if (has_aspc && has_ha) {
+    aspc_spots <- md[md$ASPC_score1 > 0 & md$HallmarkAR_score1 <= 0, ]
+    ar_spots   <- md[md$HallmarkAR_score1 > 0 & md$ASPC_score1 <= 0, ]
+
+    if (nrow(aspc_spots) >= 5 && nrow(ar_spots) >= 5) {
+      aspc_coords <- as.matrix(aspc_spots[, c("spatial_x", "spatial_y")])
+      ar_coords   <- as.matrix(ar_spots[, c("spatial_x", "spatial_y")])
+
+      nn_dists <- apply(aspc_coords, 1, function(pt) {
+        dists <- sqrt((ar_coords[,1] - pt[1])^2 + (ar_coords[,2] - pt[2])^2)
+        min(dists)
+      })
+
+      coloc_results$ASPC_to_AR_mean_dist   <- round(mean(nn_dists), 1)
+      coloc_results$ASPC_to_AR_median_dist <- round(median(nn_dists), 1)
+
+      p_nndist <- ggplot(data.frame(dist = nn_dists), aes(x = dist)) +
+        geom_histogram(bins = 40, fill = "#8E44AD", alpha = 0.7) +
+        geom_vline(xintercept = median(nn_dists), linetype = "dashed", color = "red") +
+        theme_minimal(base_size = 13) +
+        ggtitle(paste0(sample_name, " — ASPC->AR NN Distance (median=",
+                       round(median(nn_dists), 0), " px)")) +
+        xlab("Distance to Nearest AR Spot (pixels)") + ylab("Count")
+      ggsave(file.path(plots_dir, "14_ASPC_to_AR_NN_distance.png"), p_nndist, width = 8, height = 5, dpi = 200, bg = "white")
+      cat(paste0("  ASPC->AR median distance: ", round(median(nn_dists), 0), " px\n"))
+    } else {
+      cat("  Not enough ASPC-only or AR-only spots for NN analysis\n")
+    }
+    write.csv(coloc_results, file.path(output_dir, paste0(sample_name, "_colocalization_stats.csv")), row.names = FALSE)
+  }
+
+  # --------------------------------------------------------------------------
+  # 3j. ECM Remodeling Spatial Maps
+  # --------------------------------------------------------------------------
+  cat("\n=== ECM Remodeling Analysis ===\n")
+
+  ecm_plot_list <- list()
+  for (ec_name in names(has_ecm)) {
+    if (has_ecm[[ec_name]]) {
+      sc_col <- paste0("ECM_", ec_name, "_score1")
+      if (sc_col %in% colnames(md)) {
+        p_ecm <- ggplot(md, aes_string(x = "spatial_x", y = "-spatial_y", color = sc_col)) +
+          geom_point(size = 0.8, alpha = 0.85) +
+          scale_color_gradient2(low = "#2166AC", mid = "white", high = "#D6604D", midpoint = 0,
+                                name = paste0(ec_name, "\nScore")) +
+          coord_equal() + theme_minimal(base_size = 12) +
+          ggtitle(paste0(ec_name)) +
+          theme(plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+                axis.title = element_blank(), axis.text = element_blank(),
+                axis.ticks = element_blank(), panel.grid = element_blank(),
+                panel.background = element_rect(fill = "white", color = NA))
+        ecm_plot_list[[ec_name]] <- p_ecm
+      }
+    }
+  }
+
+  if (length(ecm_plot_list) >= 2) {
+    p_ecm_combo <- wrap_plots(ecm_plot_list, ncol = min(3, length(ecm_plot_list))) +
+      plot_annotation(title = paste0(sample_name, " — ECM Remodeling Spatial Maps"),
+                      theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5)))
+    ggsave(file.path(plots_dir, "15_ECM_remodeling_spatial.png"), p_ecm_combo,
+           width = 10 * min(3, length(ecm_plot_list)), height = 10, dpi = 200, bg = "white")
+    cat("  ECM spatial maps saved\n")
+  }
+
+  # ECM scores in interface zones
+  if (has_aspc && has_ha && any(unlist(has_ecm)) && "zone" %in% colnames(md)) {
+    ecm_score_cols <- grep("^ECM_.*_score1$", colnames(md), value = TRUE)
+    if (length(ecm_score_cols) > 0) {
+      ecm_zone_data <- md[, c("zone", ecm_score_cols), drop = FALSE]
+      ecm_zone_long <- ecm_zone_data %>%
+        pivot_longer(-zone, names_to = "ECM_type", values_to = "Score") %>%
+        mutate(ECM_type = gsub("ECM_|_score1", "", ECM_type))
+
+      p_ecm_zone <- ggplot(ecm_zone_long, aes(x = zone, y = Score, fill = zone)) +
+        geom_boxplot(outlier.size = 0.3, alpha = 0.7) +
+        facet_wrap(~ECM_type, scales = "free_y") +
+        scale_fill_manual(values = c("Neither"="#E0E0E0","ASPC_only"="#27AE60",
+                                     "AR_only"="#2980B9","Interface"="#E74C3C")) +
+        theme_minimal(base_size = 11) +
+        ggtitle(paste0(sample_name, " — ECM Scores by Interface Zone")) +
+        theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+              axis.text.x = element_text(angle = 45, hjust = 1))
+      ggsave(file.path(plots_dir, "16_ECM_by_interface_zone.png"), p_ecm_zone,
+             width = 14, height = 8, dpi = 200, bg = "white")
+    }
+  }
+
+  # --------------------------------------------------------------------------
+  # 3k. Phenotypic Transition & Plasticity Analysis
+  # --------------------------------------------------------------------------
+  cat("\n=== Phenotypic Plasticity Analysis ===\n")
+
+  if (has_aspc && has_ha && has_nepc_composite) {
+
+    md$phenotype <- ifelse(
+      md$HallmarkAR_score1 > 0 & md$NEPC_Beltran_composite <= 0, "Luminal_AR",
+    ifelse(
+      md$NEPC_Beltran_composite > 0 & md$HallmarkAR_score1 <= 0, "NEPC",
+    ifelse(
+      md$HallmarkAR_score1 > 0 & md$NEPC_Beltran_composite > 0, "AR_NEPC_transition",
+    ifelse(
+      md$ASPC_score1 > 0 & md$HallmarkAR_score1 <= 0 & md$NEPC_Beltran_composite <= 0, "Stromal_ASPC",
+      "Other"))))
+
+    md$phenotype <- factor(md$phenotype,
+      levels = c("Luminal_AR", "NEPC", "AR_NEPC_transition", "Stromal_ASPC", "Other"))
+
+    pheno_colors <- c("Luminal_AR" = "#2980B9", "NEPC" = "#E74C3C",
+                      "AR_NEPC_transition" = "#F39C12", "Stromal_ASPC" = "#27AE60",
+                      "Other" = "#BDC3C7")
+
+    p_pheno <- ggplot(md, aes(x = spatial_x, y = -spatial_y, color = phenotype)) +
+      geom_point(size = 0.8, alpha = 0.85) +
+      scale_color_manual(values = pheno_colors, name = "Phenotype") +
+      coord_equal() + theme_minimal(base_size = 13) +
+      ggtitle(paste0(sample_name, " — Phenotypic Classification")) +
+      theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+            axis.title = element_blank(), axis.text = element_blank(),
+            axis.ticks = element_blank(), panel.grid = element_blank(),
+            panel.background = element_rect(fill = "white", color = NA))
+    ggsave(file.path(plots_dir, "17_phenotype_classification_spatial.png"),
+           p_pheno, width = 10, height = 10, dpi = 200, bg = "white")
+
+    pheno_counts <- as.data.frame(table(md$phenotype))
+    colnames(pheno_counts) <- c("Phenotype", "N_Spots")
+    pheno_counts$Pct <- round(pheno_counts$N_Spots / sum(pheno_counts$N_Spots) * 100, 1)
+    write.csv(pheno_counts, file.path(output_dir, paste0(sample_name, "_phenotype_counts.csv")), row.names = FALSE)
+
+    coloc_results$Pct_Luminal_AR    <- pheno_counts$Pct[pheno_counts$Phenotype == "Luminal_AR"]
+    coloc_results$Pct_NEPC          <- pheno_counts$Pct[pheno_counts$Phenotype == "NEPC"]
+    coloc_results$Pct_AR_NEPC_trans <- pheno_counts$Pct[pheno_counts$Phenotype == "AR_NEPC_transition"]
+    coloc_results$Pct_Stromal_ASPC  <- pheno_counts$Pct[pheno_counts$Phenotype == "Stromal_ASPC"]
+
+    # Plasticity gradient
+    p_plast <- ggplot(md, aes(x = HallmarkAR_score1, y = NEPC_Beltran_composite)) +
+      geom_point(aes(color = ASPC_score1), size = 0.5, alpha = 0.6) +
+      scale_color_gradient2(low = "grey80", mid = "white", high = "#27AE60", midpoint = 0, name = "ASPC") +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      geom_vline(xintercept = 0, linetype = "dashed") +
+      theme_minimal(base_size = 13) +
+      ggtitle(paste0(sample_name, " — AR<->NEPC Plasticity (colored by ASPC)")) +
+      xlab("Hallmark AR Score") + ylab("NEPC Beltran Composite")
+    ggsave(file.path(plots_dir, "18_plasticity_AR_vs_NEPC.png"), p_plast, width = 8, height = 7, dpi = 200, bg = "white")
+
+    # Transition vs EMT
+    if (has_emt && "EMT_score1" %in% colnames(md)) {
+      md$transition_index <- md$NEPC_Beltran_composite - md$HallmarkAR_score1
+      p_trans_emt <- ggplot(md, aes(x = transition_index, y = EMT_score1, color = ASPC_score1)) +
+        geom_point(size = 0.5, alpha = 0.5) +
+        scale_color_gradient2(low = "grey80", mid = "white", high = "#27AE60", midpoint = 0, name = "ASPC") +
+        geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.5) +
+        theme_minimal(base_size = 13) +
+        ggtitle(paste0(sample_name, " — Transition Index vs EMT (colored by ASPC)")) +
+        xlab("Transition Index (NEPC - AR)") + ylab("EMT Score")
+      ggsave(file.path(plots_dir, "19_transition_vs_EMT.png"), p_trans_emt, width = 8, height = 7, dpi = 200, bg = "white")
+    }
+  }
+
+  # --------------------------------------------------------------------------
+  # 3l. Spatial Heterogeneity & Zonation
+  # --------------------------------------------------------------------------
+  cat("\n=== Spatial Heterogeneity & Zonation ===\n")
+
+  if (has_aspc && has_ha) {
+    coords <- as.matrix(md[, c("array_row", "array_col")])
+    n_spots_local <- nrow(md)
+
+    if (n_spots_local > 50) {
+      local_ar_sd   <- rep(NA, n_spots_local)
+      local_aspc_sd <- rep(NA, n_spots_local)
+      for (j in 1:n_spots_local) {
+        dists <- sqrt((coords[,1] - coords[j,1])^2 + (coords[,2] - coords[j,2])^2)
+        neighbors <- which(dists <= 3 & dists > 0)
+        if (length(neighbors) >= 3) {
+          local_ar_sd[j]   <- sd(md$HallmarkAR_score1[neighbors])
+          local_aspc_sd[j] <- sd(md$ASPC_score1[neighbors])
+        }
+      }
+      md$local_AR_heterogeneity   <- local_ar_sd
+      md$local_ASPC_heterogeneity <- local_aspc_sd
+
+      p_hetero <- ggplot(md[!is.na(md$local_AR_heterogeneity), ],
+                         aes(x = spatial_x, y = -spatial_y, color = local_AR_heterogeneity)) +
+        geom_point(size = 0.8, alpha = 0.85) +
+        scale_color_gradient(low = "white", high = "#8E44AD", name = "Local AR\nHeterogeneity") +
+        coord_equal() + theme_minimal(base_size = 13) +
+        ggtitle(paste0(sample_name, " — Local AR Signaling Heterogeneity")) +
+        theme(plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+              axis.title = element_blank(), axis.text = element_blank(),
+              axis.ticks = element_blank(), panel.grid = element_blank(),
+              panel.background = element_rect(fill = "white", color = NA))
+      ggsave(file.path(plots_dir, "20_local_AR_heterogeneity.png"), p_hetero,
+             width = 10, height = 10, dpi = 200, bg = "white")
+
+      md_noNA <- md[!is.na(md$local_AR_heterogeneity), ]
+      if (nrow(md_noNA) > 20) {
+        cor_aspc_hetero <- cor(md_noNA$ASPC_score1, md_noNA$local_AR_heterogeneity,
+                               method = "spearman", use = "complete.obs")
+        coloc_results$ASPC_vs_AR_heterogeneity_cor <- round(cor_aspc_hetero, 4)
+        cat(paste0("  ASPC vs local AR heterogeneity correlation: ", round(cor_aspc_hetero, 4), "\n"))
+      }
+    }
+  }
+
+  # --------------------------------------------------------------------------
+  # 3m. Core Spatial Plots
+  # --------------------------------------------------------------------------
+  cat("\n=== Generating core spatial plots ===\n")
+
+  img <- NULL
+  tryCatch({ img <- readPNG(lowres_image_file) }, error = function(e) {})
+  has_image <- !is.null(img)
+
+  make_spatial_plot <- function(md, color_col, color_scale, title, img = NULL, sf = NULL, pt_size = 1.0) {
+    p_overlay <- NULL
+    if (!is.null(img) && !is.null(sf)) {
+      p_overlay <- ggplot() +
+        annotation_raster(img, xmin=0, xmax=ncol(img), ymin=-nrow(img), ymax=0) +
+        geom_point(data=md, aes_string(x="spatial_x_lowres", y="-spatial_y_lowres", color=color_col),
+                   size=pt_size, alpha=0.85) + color_scale + coord_equal() +
+        theme_minimal(base_size=14) + ggtitle(paste0(title, " (H&E)")) +
+        theme(plot.title=element_text(size=14, face="bold", hjust=0.5),
+              axis.title=element_blank(), axis.text=element_blank(),
+              axis.ticks=element_blank(), panel.grid=element_blank())
+    }
+    p_noimage <- ggplot() +
+      geom_point(data=md, aes_string(x="spatial_x", y="-spatial_y", color=color_col),
+                 size=pt_size, alpha=0.85) + color_scale + coord_equal() +
+      theme_minimal(base_size=14) + ggtitle(title) +
+      theme(plot.title=element_text(size=14, face="bold", hjust=0.5),
+            axis.title=element_blank(), axis.text=element_blank(),
+            axis.ticks=element_blank(), panel.grid=element_blank(),
+            panel.background=element_rect(fill="white", color=NA))
+    return(list(overlay=p_overlay, noimage=p_noimage))
+  }
+
+  save_both <- function(plot_list, base_name, w=10, h=10) {
+    ggsave(file.path(plots_dir, paste0(base_name, "_noimage.png")),
+           plot_list$noimage, width=w, height=h, dpi=200, bg="white")
+    if (!is.null(plot_list$overlay))
+      ggsave(file.path(plots_dir, paste0(base_name, "_overlay.png")),
+             plot_list$overlay, width=w, height=h, dpi=200, bg="white")
+  }
+
+  # Refresh md from sobj (has all module score columns)
+  md <- sobj@meta.data
+
+  pl_clust <- make_spatial_plot(md, "seurat_clusters",
+    scale_color_manual(values=colorRampPalette(RColorBrewer::brewer.pal(12,"Set3"))(
+      length(unique(md$seurat_clusters))), name="Cluster"),
+    paste0(sample_name, " — Clusters"), img=img, sf=lowres_sf)
+  save_both(pl_clust, "01_spatial_clusters")
+
+  if (has_aspc) {
+    pl_aspc <- make_spatial_plot(md, "ASPC_score1",
+      scale_color_gradient2(low="#2166AC", mid="white", high="#1B7837", midpoint=0, name="ASPC"),
+      paste0(sample_name, " — ASPC Score"), img=img, sf=lowres_sf)
+    save_both(pl_aspc, "02_spatial_ASPC_score")
+  }
+
+  if (has_ha) {
+    pl_ar <- make_spatial_plot(md, "HallmarkAR_score1",
+      scale_color_gradient2(low="#D73027", mid="white", high="#4575B4", midpoint=0, name="AR"),
+      paste0(sample_name, " — Hallmark AR Score"), img=img, sf=lowres_sf)
+    save_both(pl_ar, "03_spatial_HallmarkAR_score")
+  }
+
+  if (has_nepc_composite) {
+    pl_nepc <- make_spatial_plot(md, "NEPC_Beltran_composite",
+      scale_color_gradient2(low="#4575B4", mid="white", high="#D73027", midpoint=0, name="NEPC"),
+      paste0(sample_name, " — NEPC Beltran Composite"), img=img, sf=lowres_sf)
+    save_both(pl_nepc, "04_spatial_NEPC_composite")
+  }
+
+  if (has_emt) {
+    pl_emt <- make_spatial_plot(md, "EMT_score1",
+      scale_color_gradient2(low="#4575B4", mid="white", high="#F39C12", midpoint=0, name="EMT"),
+      paste0(sample_name, " — EMT Score"), img=img, sf=lowres_sf)
+    save_both(pl_emt, "05_spatial_EMT_score")
+  }
+
+  # --------------------------------------------------------------------------
+  # 3n. Comprehensive Per-Spot Output
+  # --------------------------------------------------------------------------
+  cat("\n=== Saving per-spot data ===\n")
+
+  spot_output <- data.frame(
+    Spot = Cells(sobj), Cluster = as.character(Idents(sobj)),
+    spatial_x = sobj$spatial_x, spatial_y = sobj$spatial_y,
+    disease_group = disease_grp
+  )
+  if (has_aspc)           spot_output$ASPC_score             <- sobj$ASPC_score1
+  if (has_ha)             spot_output$HallmarkAR_score       <- sobj$HallmarkAR_score1
+  if (has_nepc_up)        spot_output$NEPC_UP_score          <- sobj$NEPC_UP_score1
+  if (has_nepc_dn)        spot_output$NEPC_DN_score          <- sobj$NEPC_DN_score1
+  if (has_nepc_composite) spot_output$NEPC_Beltran_composite <- sobj$NEPC_Beltran_composite
+  if (has_emt)            spot_output$EMT_score              <- sobj$EMT_score1
+
+  for (ec_name in names(has_ecm)) {
+    sc_col <- paste0("ECM_", ec_name, "_score1")
+    if (has_ecm[[ec_name]] && sc_col %in% colnames(sobj@meta.data))
+      spot_output[[paste0("ECM_", ec_name)]] <- sobj@meta.data[[sc_col]]
+  }
+
+  write.csv(spot_output, file.path(output_dir, paste0(sample_name, "_full_spot_data.csv")), row.names = FALSE)
+
+  # --------------------------------------------------------------------------
+  # 3o. Save Seurat Object & Finalize
+  # --------------------------------------------------------------------------
+  saveRDS(sobj, file.path(output_dir, paste0(sample_name, "_seurat_scored.rds")))
+  write.csv(coloc_results, file.path(output_dir, paste0(sample_name, "_colocalization_stats.csv")), row.names = FALSE)
+
+  cross_sample_table[[sample_name]] <- coloc_results
+  completed_samples <- c(completed_samples, sample_name)
+
+  cat("\n==============================================================\n")
+  cat(paste0("  ", sample_name, " [", disease_grp, "] — COMPLETE\n"))
+  cat(paste0("  Spots: ", ncol(sobj), " | Genes: ", nrow(sobj),
+             " | Clusters: ", length(unique(Idents(sobj))), "\n"))
+  cat("==============================================================\n")
+
+}  # end main loop
+
+# ==============================================================================
+# 4. CROSS-SAMPLE ANALYSIS
+# ==============================================================================
+cat("\n\n")
+cat("##############################################################\n")
+cat("  CROSS-SAMPLE ANALYSIS\n")
+cat("##############################################################\n")
+
+cs_plots_dir <- file.path(cross_sample_dir, "plots")
+dir.create(cs_plots_dir, showWarnings = FALSE, recursive = TRUE)
+
+if (length(cross_sample_table) > 0) {
+
+  cs_df <- bind_rows(cross_sample_table)
+  cs_df$Group <- factor(cs_df$Group, levels = c("BPH", "TRNA", "NEADT", "CRPC", "MET"))
+  write.csv(cs_df, file.path(cross_sample_dir, "cross_sample_colocalization_stats.csv"), row.names = FALSE)
+  cat("  Cross-sample stats saved\n")
+
+  group_colors <- c("BPH" = "#2ECC71", "TRNA" = "#3498DB", "NEADT" = "#9B59B6",
+                    "CRPC" = "#E67E22", "MET" = "#E74C3C")
+
+  # --- 4a. ASPC-AR Co-localization across disease groups ---
+  if ("Pct_colocalized" %in% colnames(cs_df)) {
+    cs_plot_data <- cs_df[!is.na(cs_df$Pct_colocalized), ]
+    if (nrow(cs_plot_data) > 0) {
+      p_coloc_group <- ggplot(cs_plot_data, aes(x = Group, y = Pct_colocalized, fill = Group)) +
+        geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+        geom_jitter(width = 0.2, size = 1.5, alpha = 0.6) +
+        scale_fill_manual(values = group_colors) +
+        theme_minimal(base_size = 14) +
+        ggtitle("ASPC-AR Co-localization Across Disease Groups") +
+        ylab("% Spots with Both ASPC+ and AR+") +
+        theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+      tryCatch({
+        p_coloc_group <- p_coloc_group + stat_compare_means(method = "kruskal.test", label.y.npc = 0.95)
+      }, error = function(e) {})
+      ggsave(file.path(cs_plots_dir, "01_ASPC_AR_colocalization_by_group.png"),
+             p_coloc_group, width = 10, height = 7, dpi = 200, bg = "white")
+      cat("  [1] ASPC-AR co-localization by group\n")
+    }
+  }
+
+  # --- 4b. ASPC-AR correlation across groups ---
+  if ("ASPC_AR_spearman" %in% colnames(cs_df)) {
+    cs_cor_data <- cs_df[!is.na(cs_df$ASPC_AR_spearman), ]
+    if (nrow(cs_cor_data) > 0) {
+      p_cor_group <- ggplot(cs_cor_data, aes(x = Group, y = ASPC_AR_spearman, fill = Group)) +
+        geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+        geom_jitter(width = 0.2, size = 1.5, alpha = 0.6) +
+        geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+        scale_fill_manual(values = group_colors) +
+        theme_minimal(base_size = 14) +
+        ggtitle("ASPC-AR Spatial Correlation Across Disease Groups") +
+        ylab("Spearman Correlation (ASPC vs AR)") +
+        theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+      ggsave(file.path(cs_plots_dir, "02_ASPC_AR_correlation_by_group.png"),
+             p_cor_group, width = 10, height = 7, dpi = 200, bg = "white")
+      cat("  [2] ASPC-AR correlation by group\n")
+    }
+  }
+
+  # --- 4c. Phenotype proportions across groups ---
+  pheno_cols <- c("Pct_Luminal_AR", "Pct_NEPC", "Pct_AR_NEPC_trans", "Pct_Stromal_ASPC")
+  pheno_avail <- pheno_cols[pheno_cols %in% colnames(cs_df)]
+
+  if (length(pheno_avail) >= 2) {
+    cs_pheno <- cs_df %>%
+      select(Sample, Group, all_of(pheno_avail)) %>%
+      pivot_longer(cols = all_of(pheno_avail), names_to = "Phenotype", values_to = "Pct") %>%
+      mutate(Phenotype = gsub("Pct_", "", Phenotype))
+
+    p_pheno_group <- ggplot(cs_pheno, aes(x = Group, y = Pct, fill = Phenotype)) +
+      geom_boxplot(alpha = 0.7, position = position_dodge(width = 0.8)) +
+      scale_fill_manual(values = c("Luminal_AR"="#2980B9", "NEPC"="#E74C3C",
+                                   "AR_NEPC_trans"="#F39C12", "Stromal_ASPC"="#27AE60")) +
+      theme_minimal(base_size = 14) +
+      ggtitle("Phenotype Composition Across Disease Groups") +
+      ylab("% of Spots") +
+      theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+    ggsave(file.path(cs_plots_dir, "03_phenotype_composition_by_group.png"),
+           p_pheno_group, width = 14, height = 7, dpi = 200, bg = "white")
+    cat("  [3] Phenotype composition by group\n")
+  }
+
+  # --- 4d. Nearest-neighbor distance across groups ---
+  if ("ASPC_to_AR_median_dist" %in% colnames(cs_df)) {
+    cs_dist_data <- cs_df[!is.na(cs_df$ASPC_to_AR_median_dist), ]
+    if (nrow(cs_dist_data) > 0) {
+      p_dist_group <- ggplot(cs_dist_data, aes(x = Group, y = ASPC_to_AR_median_dist, fill = Group)) +
+        geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+        geom_jitter(width = 0.2, size = 1.5, alpha = 0.6) +
+        scale_fill_manual(values = group_colors) +
+        theme_minimal(base_size = 14) +
+        ggtitle("ASPC->AR Nearest-Neighbor Distance Across Groups") +
+        ylab("Median Distance (pixels)") +
+        theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+      ggsave(file.path(cs_plots_dir, "04_ASPC_AR_distance_by_group.png"),
+             p_dist_group, width = 10, height = 7, dpi = 200, bg = "white")
+      cat("  [4] ASPC-AR distance by group\n")
+    }
+  }
+
+  # --- 4e. Multi-score heatmap ---
+  score_cols <- c("ASPC_AR_spearman", "ASPC_NEPC_spearman", "AR_NEPC_spearman",
+                  "Pct_colocalized", "Pct_ASPC_pos", "Pct_AR_pos")
+  score_avail <- score_cols[score_cols %in% colnames(cs_df)]
+
+  if (length(score_avail) >= 3) {
+    heat_data <- cs_df %>% filter(!is.na(ASPC_AR_spearman)) %>% select(Sample, Group, all_of(score_avail))
+    if (nrow(heat_data) >= 3) {
+      heat_rownames <- heat_data$Sample
+      anno_df <- data.frame(Group = heat_data$Group, row.names = heat_rownames)
+      heat_mat <- as.data.frame(lapply(heat_data[, score_avail], as.numeric))
+      rownames(heat_mat) <- heat_rownames
+
+      tryCatch({
+        png(file.path(cs_plots_dir, "05_cross_sample_heatmap.png"), width = 1200, height = 1800, res = 150)
+        pheatmap(as.matrix(heat_mat),
+                 annotation_row = anno_df,
+                 annotation_colors = list(Group = group_colors),
+                 scale = "column",
+                 clustering_method = "ward.D2",
+                 fontsize_row = 7,
+                 fontsize_col = 10,
+                 main = "Cross-Sample Score Heatmap (column-scaled)")
+        dev.off()
+        cat("  [5] Cross-sample heatmap\n")
+      }, error = function(e) cat(paste0("  Heatmap error: ", e$message, "\n")))
+    }
+  }
+
+  # --- 4f. Aggregate L-R analysis ---
+  cat("\n  Aggregating L-R data across samples...\n")
+  all_lr_files <- list.files(base_root, pattern = "_LR_interaction_scores\\.csv$",
+                             recursive = TRUE, full.names = TRUE)
+  if (length(all_lr_files) > 0) {
+    all_lr <- lapply(all_lr_files, function(f) {
+      d <- read.csv(f, stringsAsFactors = FALSE)
+      d$Sample <- gsub("_LR_interaction_scores\\.csv$", "", basename(f))
+      d
+    })
+    all_lr_df <- bind_rows(all_lr)
+
+    sample_group_map <- data.frame(
+      Sample = sapply(samples, function(x) x$name),
+      Group  = sapply(samples, function(x) x$group),
+      stringsAsFactors = FALSE
+    )
+    all_lr_df <- merge(all_lr_df, sample_group_map, by = "Sample", all.x = TRUE)
+    write.csv(all_lr_df, file.path(cross_sample_dir, "all_samples_LR_interactions.csv"), row.names = FALSE)
+
+    lr_summary <- all_lr_df %>%
+      filter(!is.na(Mean_interaction)) %>%
+      group_by(Ligand, Receptor, Pathway) %>%
+      summarize(
+        N_samples           = n(),
+        Mean_interaction_avg = round(mean(Mean_interaction, na.rm = TRUE), 4),
+        Mean_pct_coexpr     = round(mean(Pct_coexpressed, na.rm = TRUE), 1),
+        Mean_cor            = round(mean(Cor_LR, na.rm = TRUE), 4),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(Mean_interaction_avg))
+    write.csv(lr_summary, file.path(cross_sample_dir, "LR_summary_across_samples.csv"), row.names = FALSE)
+
+    if (nrow(lr_summary) >= 3) {
+      top_n <- min(20, nrow(lr_summary))
+      lr_top <- lr_summary[1:top_n, ] %>% mutate(LR_label = paste0(Ligand, "->", Receptor))
+
+      p_lr_cross <- ggplot(lr_top, aes(x = reorder(LR_label, Mean_interaction_avg),
+                                        y = Mean_interaction_avg, fill = Pathway)) +
+        geom_col(alpha = 0.8) + coord_flip() +
+        theme_minimal(base_size = 12) +
+        ggtitle("Top ASPC->Cancer L-R Interactions (All Samples)") +
+        xlab("") + ylab("Mean Interaction Score") +
+        theme(plot.title = element_text(size = 15, face = "bold", hjust = 0.5))
+      ggsave(file.path(cs_plots_dir, "06_top_LR_interactions_cross_sample.png"),
+             p_lr_cross, width = 12, height = 8, dpi = 200, bg = "white")
+      cat("  [6] Cross-sample L-R bar plot\n")
+    }
+
+    # L-R by disease group
+    lr_by_group <- all_lr_df %>%
+      filter(!is.na(Mean_interaction)) %>%
+      group_by(Ligand, Receptor, Pathway, Group) %>%
+      summarize(Mean_interaction_avg = mean(Mean_interaction, na.rm = TRUE), .groups = "drop")
+
+    if (nrow(lr_summary) >= 5) {
+      top5_pairs <- lr_summary[1:min(5, nrow(lr_summary)), ]
+      lr_top5_data <- lr_by_group %>%
+        inner_join(top5_pairs %>% select(Ligand, Receptor), by = c("Ligand", "Receptor")) %>%
+        mutate(LR_label = paste0(Ligand, "->", Receptor))
+
+      if (nrow(lr_top5_data) > 0) {
+        lr_top5_data$Group <- factor(lr_top5_data$Group, levels = c("BPH","TRNA","NEADT","CRPC","MET"))
+        p_lr_group <- ggplot(lr_top5_data, aes(x = Group, y = Mean_interaction_avg, fill = Group)) +
+          geom_col(alpha = 0.8, position = "dodge") +
+          facet_wrap(~LR_label, scales = "free_y") +
+          scale_fill_manual(values = group_colors) +
+          theme_minimal(base_size = 11) +
+          ggtitle("Top L-R Interactions Across Disease Groups") +
+          ylab("Mean Interaction Score") +
+          theme(plot.title = element_text(size = 15, face = "bold", hjust = 0.5))
+        ggsave(file.path(cs_plots_dir, "07_top_LR_by_disease_group.png"),
+               p_lr_group, width = 16, height = 10, dpi = 200, bg = "white")
+        cat("  [7] Top L-R by disease group\n")
+      }
+    }
+  }
+
+  # --- 4g. Disease progression summary ---
+  if ("Pct_colocalized" %in% colnames(cs_df) && "ASPC_AR_spearman" %in% colnames(cs_df)) {
+    prog_summary <- cs_df %>%
+      group_by(Group) %>%
+      summarize(
+        N_samples              = n(),
+        Mean_ASPC_AR_coloc_pct = round(mean(Pct_colocalized, na.rm = TRUE), 1),
+        SD_coloc_pct           = round(sd(Pct_colocalized, na.rm = TRUE), 1),
+        Mean_ASPC_AR_cor       = round(mean(ASPC_AR_spearman, na.rm = TRUE), 4),
+        Mean_Pct_ASPC          = round(mean(Pct_ASPC_pos, na.rm = TRUE), 1),
+        Mean_Pct_AR            = round(mean(Pct_AR_pos, na.rm = TRUE), 1),
+        .groups = "drop"
+      )
+
+    for (pc in pheno_avail) {
+      if (pc %in% colnames(cs_df)) {
+        vals <- cs_df %>% group_by(Group) %>%
+          summarize(val = round(mean(.data[[pc]], na.rm = TRUE), 1), .groups = "drop")
+        prog_summary[[paste0("Mean_", pc)]] <- vals$val[match(prog_summary$Group, vals$Group)]
+      }
+    }
+
+    write.csv(prog_summary, file.path(cross_sample_dir, "disease_progression_summary.csv"), row.names = FALSE)
+    cat("  Disease progression summary saved\n")
+
+    prog_summary$Group <- factor(prog_summary$Group, levels = c("BPH","TRNA","NEADT","CRPC","MET"))
+    # Handle NA SDs for single-sample groups
+    prog_summary$SD_coloc_pct[is.na(prog_summary$SD_coloc_pct)] <- 0
+
+    p_prog <- ggplot(prog_summary, aes(x = Group, y = Mean_ASPC_AR_coloc_pct, group = 1)) +
+      geom_line(color = "#E74C3C", linewidth = 1.2) +
+      geom_point(size = 4, color = "#E74C3C") +
+      geom_errorbar(aes(ymin = pmax(0, Mean_ASPC_AR_coloc_pct - SD_coloc_pct),
+                        ymax = Mean_ASPC_AR_coloc_pct + SD_coloc_pct),
+                    width = 0.2, color = "#E74C3C") +
+      theme_minimal(base_size = 14) +
+      ggtitle("ASPC-AR Co-localization Across Disease Progression") +
+      ylab("Mean % Co-localized Spots (+/-SD)") + xlab("Disease Group") +
+      theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+    ggsave(file.path(cs_plots_dir, "08_disease_progression_coloc.png"),
+           p_prog, width = 10, height = 7, dpi = 200, bg = "white")
+    cat("  [8] Disease progression plot\n")
+  }
+
+} else {
+  cat("  No samples completed — skipping cross-sample analysis\n")
+}
+
+# ==============================================================================
+# 5. FINAL REPORT
+# ==============================================================================
+cat("\n\n")
+cat("##############################################################\n")
+cat(paste0("  ALL ", length(samples), " SAMPLES PROCESSING FINISHED\n"))
+cat("##############################################################\n")
+cat(paste0("  Completed: ", length(completed_samples), " / ", length(samples), "\n"))
+if (length(completed_samples) > 0)
+  cat(paste0("    ", paste(completed_samples, collapse = ", "), "\n"))
+if (length(skipped_samples) > 0) {
+  cat(paste0("  Skipped: ", length(skipped_samples), "\n"))
+  cat(paste0("    ", paste(skipped_samples, collapse = ", "), "\n"))
+}
+cat(paste0("\n  Cross-sample output: ", cross_sample_dir, "\n"))
+cat("\n  PER-SAMPLE outputs (in each sample folder):\n")
+cat("    Plots: 00-05 (core), 10-11 (L-R), 12-14 (co-localization),\n")
+cat("           15-16 (ECM), 17-19 (plasticity), 20 (heterogeneity)\n")
+cat("    Tables: *_full_spot_data.csv, *_colocalization_stats.csv,\n")
+cat("            *_LR_interaction_scores.csv, *_interface_zone_stats.csv,\n")
+cat("            *_phenotype_counts.csv, *_seurat_scored.rds\n")
+cat("\n  CROSS-SAMPLE outputs (in Cross_Sample_Analysis/):\n")
+cat("    cross_sample_colocalization_stats.csv\n")
+cat("    all_samples_LR_interactions.csv, LR_summary_across_samples.csv\n")
+cat("    disease_progression_summary.csv\n")
+cat("    Plots: 01-08 (group comparisons, heatmap, progression)\n")
+cat("##############################################################\n")
