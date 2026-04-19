@@ -1,6 +1,6 @@
 # ==============================================================================
 # GSE278936 Visium — FULL Spatial Interaction Analysis (Seurat v5 compatible)
-# ASPC–Cancer Crosstalk, L-R Interactions, ECM, Zonation, Plasticity
+# ASPC–Cancer(not stratified) Crosstalk, L-R Interactions, ECM, Zonation, Plasticity
 # 52 samples: BPH(4), TRNA(17), NEADT(22), CRPC(4), MET(4), + cross-sample
 # ==============================================================================
 
