@@ -1,0 +1,1144 @@
+# ==============================================================================
+# GSE278936 Visium Spatial Transcriptomics — FULL Multi-Sample Pipeline
+# ASPC, Hallmark AR & NEPC Beltran Signatures
+# Processes ALL 52 samples automatically
+# Dynamic spot sizing for optimal gap-free spatial plots
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 0. Install & Load Packages
+# ------------------------------------------------------------------------------
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+pkgs <- c("Seurat", "ggplot2", "patchwork", "dplyr", "Matrix", "scales",
+          "RColorBrewer", "grDevices", "png", "jsonlite", "data.table")
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(Matrix)
+library(scales)
+library(grDevices)
+library(png)
+library(jsonlite)
+library(data.table)
+
+cat("Libraries loaded\n")
+
+# ------------------------------------------------------------------------------
+# 1. Define Paths — Auto-detect all samples & organize GEO-prefixed files
+# ------------------------------------------------------------------------------
+visium_root <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE278936 Visium"
+
+sample_dirs <- c(
+  "GSM8557976_BPH_1",
+  "GSM8557977_BPH_2",
+  "GSM8557978_BPH_3",
+  "GSM8557979_BPH_4",
+  "GSM8557980_TRNA_1",
+  "GSM8557981_TRNA_2",
+  "GSM8557982_TRNA_3",
+  "GSM8557983_TRNA_4",
+  "GSM8557984_TRNA_5",
+  "GSM8557985_TRNA_6",
+  "GSM8557986_TRNA_7",
+  "GSM8557987_TRNA_8",
+  "GSM8557988_TRNA_9",
+  "GSM8557989_TRNA_10",
+  "GSM8557990_TRNA_11",
+  "GSM8557991_TRNA_12",
+  "GSM8557992_TRNA_13",
+  "GSM8557993_TRNA_14",
+  "GSM8557994_TRNA_15",
+  "GSM8557995_TRNA_16",
+  "GSM8557996_TRNA_17",
+  "GSM8557997_NEADT_1",
+  "GSM8557998_NEADT_2",
+  "GSM8557999_NEADT_3",
+  "GSM8558000_NEADT_4",
+  "GSM8558001_NEADT_5",
+  "GSM8558002_NEADT_6",
+  "GSM8558003_NEADT_7",
+  "GSM8558004_NEADT_8",
+  "GSM8558005_NEADT_9",
+  "GSM8558006_NEADT_10",
+  "GSM8558007_NEADT_11",
+  "GSM8558008_NEADT_12",
+  "GSM8558009_NEADT_13",
+  "GSM8558010_NEADT_14",
+  "GSM8558011_NEADT_15",
+  "GSM8558012_NEADT_16",
+  "GSM8558013_NEADT_17",
+  "GSM8558014_NEADT_18",
+  "GSM8558015_NEADT_19",
+  "GSM8558016_NEADT_20",
+  "GSM8558017_NEADT_21",
+  "GSM8558018_NEADT_22",
+  "GSM8558019_CRPC_1",
+  "GSM8558020_CRPC_2",
+  "GSM8558021_CRPC_3",
+  "GSM8558022_CRPC_4",
+  "GSM8558023_CRPC_5",
+  "GSM8558024_MET_A",
+  "GSM8558025_MET_B",
+  "GSM8558026_MET_C",
+  "GSM8558027_MET_D"
+)
+
+# --- Helper: scan a sample directory for GEO-prefixed files by suffix ---
+find_sample_files <- function(sample_path, sample_folder_name) {
+  all_files <- list.files(sample_path, recursive = TRUE, full.names = TRUE)
+
+  find_by_suffix <- function(suffix) {
+    matches <- all_files[grepl(paste0(suffix, "$"), all_files, ignore.case = TRUE)]
+    if (length(matches) == 0) return(NA_character_)
+    return(matches[1])
+  }
+
+  list(
+    barcodes       = find_by_suffix("barcodes\\.tsv\\.gz"),
+    features       = find_by_suffix("features\\.tsv\\.gz"),
+    matrix         = find_by_suffix("matrix\\.mtx\\.gz"),
+    positions      = find_by_suffix("tissue_positions_list\\.csv"),
+    scalefactors   = find_by_suffix("scalefactors_json\\.json"),
+    hires_image    = find_by_suffix("tissue_hires_image\\.png"),
+    lowres_image   = find_by_suffix("tissue_lowres_image\\.png")
+  )
+}
+
+# --- Build the full sample manifest ---
+sample_manifest <- list()
+for (sd in sample_dirs) {
+  sample_path <- file.path(visium_root, sd)
+  if (!dir.exists(sample_path)) {
+    cat(paste0("  WARNING: directory not found — ", sample_path, "\n"))
+    next
+  }
+  sample_name <- sd
+  files <- find_sample_files(sample_path, sd)
+  sample_manifest[[sample_name]] <- list(
+    sample_name = sample_name,
+    base_dir    = sample_path,
+    files       = files
+  )
+}
+
+cat(paste0("\nFound ", length(sample_manifest), " sample directories.\n"))
+
+# Validate all samples
+for (sn in names(sample_manifest)) {
+  sm <- sample_manifest[[sn]]
+  cat(paste0("\n--- ", sn, " ---\n"))
+  for (fn in names(sm$files)) {
+    f <- sm$files[[fn]]
+    if (!is.na(f) && file.exists(f)) {
+      cat(paste0("  OK: ", fn, " -> ", basename(f), "\n"))
+    } else {
+      cat(paste0("  MISSING: ", fn, "\n"))
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# Gene Signatures (Human) — defined once, used for all samples
+# ------------------------------------------------------------------------------
+cat("\n=== Gene Signatures ===\n")
+
+ASPC_genes <- c("LAMA2","THBS3","FGF2","POSTN","THBS2","VCAN","LAMB1","COL4A1","GAS6",
+  "BMPER","COL5A1","COL6A5","COL5A3","ENTPD2","ALDH1A1","MFAP2","COL5A2","LOXL2",
+  "FBLN7","BDH2","COL3A1","GPC6","LGI2","AK1","SRPX2","LOXL3","NOTCH3","CLU",
+  "CTHRC1","FGFR1","C3","DPEP1","SSC5D","NAALAD2","ITGBL1","FOXS1","COL11A1",
+  "NNMT","HEYL","TFCP2L1","PRG4","ZFHX4","BNC2","ADAMTS2","NFASC","CHRD",
+  "PDGFRL","C1QTNF2","ANO1","HOXB7","ADAMTS15","ADAMTS12","IGSF10","DNM1","CHL1",
+  "HAS2","CYGB","NR2F1","ZFPM2","ADAMTS5","CP","SULF1","C2","PCSK5","PTPRD",
+  "FAP","TNFAIP6","S100A16","HSD11B1","TIMP1","BMP1","CACNA2D1","TBX2","RBP1",
+  "NFATC4","GPRC5B","MMP11","DPYSL3","ADAMTSL1","KRT7","FST","ID4","SERPINH1",
+  "MDK","HOXC8","PDGFRA","ANGPT4","HIGD1B","MMP3","GPR153","MEG3","ISL1",
+  "TSPAN11","HOXC9","GJC1","SMIM22","ABCC9","ILDR2","HP","LHFP","NTRK2","FEZ1",
+  "FMO2","FZD2","TMEM45A","MMP15","CRLF1","TENM3","ARHGEF25","FOXC2","PIEZO2",
+  "S1PR3","CADM3","DCLK1","LRRN2","LBP","KCNE4","PLS3","PKDCC","NUMBL","STOX2",
+  "PLCE1","STEAP3","PDE1A","CCDC102B","PRKG1","ARHGAP42","S100A14","ELF3","SPHK1",
+  "NAV3","FXYD1","SULT1E1","GABRA3","MEDAG","GPR39","CASP12","SNTG1","CERCAM",
+  "FKBP9","CDR2L","PTK7","KIF21A","NSG1","ROBO1","CCDC74A")
+
+Hallmark_AR_genes <- c("ABCC4","ABHD2","ACSL3","ACTN1","ADAMTS1","ADRM1","AKAP12","AKT1",
+  "ALDH1A3","ANKH","APPBP2","ARID5B","AZGP1","B2M","B4GALT1","BMPR1B","CAMKK2",
+  "CCND1","CCND3","CDC14B","CDK6","CENPN","DBI","DHCR24","DNAJB9","ELK4","ELL2",
+  "ELOVL5","FADS1","FKBP5","GNAI3","GPD1L","GSR","GUCY1A1","H1-0","HERC3",
+  "HMGCR","HMGCS1","HOMER2","HPGD","HSD17B14","IDI1","INPP4B","INSIG1","IQGAP2",
+  "ITGAV","KLK2","KLK3","KRT19","KRT8","LIFR","LMAN1","MAF","MAK","MAP7",
+  "MERTK","MYL12A","NCOA4","NDRG1","NGLY1","NKX3-1","PA2G4","PDLIM5","PGM3",
+  "PIAS1","PLPP1","PMEPA1","PTK2B","PTPN21","RAB4A","RPS6KA3","RRP12","SAT1",
+  "SCD","SEC24D","SELENOP","SGK1","SLC26A2","SLC38A2","SMS","SORD","SPCS3",
+  "SPDEF","SRF","SRP19","STEAP4","STK39","TARP","TMEM50A","TMPRSS2","TNFAIP8",
+  "TPD52","TSC22D1","UAP1","UBE2I","UBE2J1","VAPA","XRCC5","XRCC6","ZBTB10","ZMIZ1")
+
+NEPC_Beltran_UP <- c("ASXL3","CAND2","ETV5","GPX2","JAKMIP2","KIAA0408","SOGA3","TRIM9",
+  "BRINP1","C7orf76","GNAO1","KCNB2","KCND2","LRRC16B","MAP10","NRSN1","PCSK1",
+  "PROX1","RGS7","SCG3","SEC11C","SEZ6","ST8SIA3","SVOP","SYT11","AURKA","DNMT1",
+  "EZH2","MYCN")
+
+NEPC_Beltran_DOWN <- c("AR","CCND1","CIITA","CREBBP","CSDE1","CYLD","DICER1","FHIT",
+  "FOXP1","HERPUD1","MMP2","MYH9","NUP93","PAX8","RBBP6","TRIM33","GATA2",
+  "MAPKAPK3","SPDEF","ARHGAP8","CATSPERB","EFNA4","EPN3","EVPL","HOXB13","KLK3",
+  "KLK4","LMAN1L","NKX3-1","OPHN1","PIEZO1","PRR5-ARHGAP8","PSCA","RAB27B",
+  "RGS10","RIPK2","SLC25A37","SLC44A4","TC2N","UPK2","RB1")
+
+# ==============================================================================
+# Helper: compute optimal spot size based on actual spot spacing per sample
+# ==============================================================================
+compute_optimal_pt_size <- function(md, x_col = "spatial_x", y_col = "spatial_y",
+                                    target_plot_width = 10, dpi = 200) {
+  x_range <- diff(range(md[[x_col]], na.rm = TRUE))
+  y_range <- diff(range(md[[y_col]], na.rm = TRUE))
+  coord_range <- max(x_range, y_range)
+
+  if (coord_range == 0 || nrow(md) < 2) return(2.8)
+
+  if ("array_row" %in% colnames(md) && "array_col" %in% colnames(md)) {
+    row_vals <- sort(unique(md$array_row))
+    if (length(row_vals) >= 2) {
+      rows_in_range <- length(row_vals)
+      if (rows_in_range > 1) {
+        pixel_per_array_unit <- y_range / (max(row_vals) - min(row_vals))
+        row_spacing_array <- median(diff(row_vals))
+        spot_spacing_px <- pixel_per_array_unit * row_spacing_array
+      } else {
+        spot_spacing_px <- coord_range / sqrt(nrow(md))
+      }
+    } else {
+      spot_spacing_px <- coord_range / sqrt(nrow(md))
+    }
+  } else {
+    spot_spacing_px <- coord_range / sqrt(nrow(md))
+  }
+
+  plot_width_mm <- target_plot_width * 25.4
+  mm_per_data_unit <- plot_width_mm / coord_range
+  spot_size_mm <- spot_spacing_px * mm_per_data_unit
+
+  # 1.15x overlap factor to eliminate gaps between spots
+  optimal_size <- spot_size_mm * 1.15
+
+  # Clamp to reasonable range
+  optimal_size <- max(0.5, min(optimal_size, 8.0))
+
+  return(round(optimal_size, 2))
+}
+
+# ==============================================================================
+# Dual-Mode Spatial Plotting Helper
+# Accepts separate pt_size for full-res (no-image) and lowres (overlay)
+# Uses aes() + .data pronoun (no deprecated aes_string)
+# stroke = 0, shape = 16 for minimal gaps
+# ==============================================================================
+make_spatial_plot <- function(md, color_col, color_scale, title,
+                              img = NULL, sf = NULL,
+                              pt_size = 2.8, pt_size_overlay = NULL) {
+
+  if (is.null(pt_size_overlay)) pt_size_overlay <- pt_size
+
+  p_overlay <- NULL
+  if (!is.null(img) && !is.null(sf)) {
+    p_overlay <- ggplot() +
+      annotation_raster(img,
+                        xmin = 0, xmax = ncol(img),
+                        ymin = -nrow(img), ymax = 0) +
+      geom_point(data = md,
+                 aes(x = .data[["spatial_x_lowres"]],
+                     y = -.data[["spatial_y_lowres"]],
+                     color = .data[[color_col]]),
+                 size = pt_size_overlay, stroke = 0, shape = 16, alpha = 0.85) +
+      color_scale +
+      coord_equal() +
+      theme_minimal(base_size = 14) +
+      ggtitle(paste0(title, " (H&E overlay)")) +
+      theme(plot.title   = element_text(size = 15, face = "bold", hjust = 0.5),
+            legend.title = element_text(size = 11),
+            legend.text  = element_text(size = 9),
+            axis.title   = element_blank(),
+            axis.text    = element_blank(),
+            axis.ticks   = element_blank(),
+            panel.grid   = element_blank())
+  }
+
+  p_noimage <- ggplot() +
+    geom_point(data = md,
+               aes(x = .data[["spatial_x"]],
+                   y = -.data[["spatial_y"]],
+                   color = .data[[color_col]]),
+               size = pt_size, stroke = 0, shape = 16, alpha = 0.85) +
+    color_scale +
+    coord_equal() +
+    theme_minimal(base_size = 14) +
+    ggtitle(title) +
+    theme(plot.title   = element_text(size = 15, face = "bold", hjust = 0.5),
+          legend.title = element_text(size = 11),
+          legend.text  = element_text(size = 9),
+          axis.title   = element_blank(),
+          axis.text    = element_blank(),
+          axis.ticks   = element_blank(),
+          panel.grid   = element_blank(),
+          panel.background = element_rect(fill = "white", color = NA))
+
+  return(list(overlay = p_overlay, noimage = p_noimage))
+}
+
+save_both <- function(plot_list, base_name, plots_dir, w = 10, h = 10) {
+  fp_no <- file.path(plots_dir, paste0(base_name, "_noimage.png"))
+  ggsave(fp_no, plot_list$noimage, width = w, height = h, dpi = 200, bg = "white")
+  cat(paste0("    saved: ", base_name, "_noimage.png\n"))
+
+  if (!is.null(plot_list$overlay)) {
+    fp_ov <- file.path(plots_dir, paste0(base_name, "_overlay.png"))
+    ggsave(fp_ov, plot_list$overlay, width = w, height = h, dpi = 200, bg = "white")
+    cat(paste0("    saved: ", base_name, "_overlay.png\n"))
+  }
+}
+
+# Safe wrapper for AddModuleScore that catches binning errors
+safe_AddModuleScore <- function(obj, features, name, ctrl, nbin) {
+  tryCatch({
+    obj <- AddModuleScore(obj, features = features, name = name,
+                          ctrl = ctrl, nbin = nbin)
+    return(list(obj = obj, success = TRUE))
+  }, error = function(e1) {
+    reduced_nbin <- max(3, floor(nbin / 2))
+    cat(paste0("    Warning: nbin=", nbin, " failed, retrying with nbin=", reduced_nbin, "\n"))
+    tryCatch({
+      obj <- AddModuleScore(obj, features = features, name = name,
+                            ctrl = ctrl, nbin = reduced_nbin)
+      return(list(obj = obj, success = TRUE))
+    }, error = function(e2) {
+      cat(paste0("    Warning: nbin=", reduced_nbin, " also failed, trying nbin=3\n"))
+      tryCatch({
+        obj <- AddModuleScore(obj, features = features, name = name,
+                              ctrl = ctrl, nbin = 3)
+        return(list(obj = obj, success = TRUE))
+      }, error = function(e3) {
+        cat(paste0("    ERROR: AddModuleScore failed completely: ", e3$message, "\n"))
+        cat(paste0("    Falling back to manual mean-expression scoring.\n"))
+        return(list(obj = obj, success = FALSE))
+      })
+    })
+  })
+}
+
+# Manual fallback: simple mean of scaled gene expression
+manual_module_score <- function(obj, gene_list, score_name, ctrl_size) {
+  avail <- gene_list[gene_list %in% rownames(obj)]
+  if (length(avail) == 0) return(obj)
+  expr_mat <- GetAssayData(obj, slot = "data")
+  gene_expr <- expr_mat[avail, , drop = FALSE]
+  scores <- colMeans(as.matrix(gene_expr))
+  set.seed(42)
+  bg_genes <- sample(setdiff(rownames(obj), avail),
+                     size = min(ctrl_size, length(setdiff(rownames(obj), avail))))
+  if (length(bg_genes) > 0) {
+    bg_expr <- colMeans(as.matrix(expr_mat[bg_genes, , drop = FALSE]))
+    scores <- scores - bg_expr
+  }
+  obj[[score_name]] <- scores
+  return(obj)
+}
+
+# ==============================================================================
+# Helper: safely close all stale gzfile connections (avoids connection leak)
+# ==============================================================================
+close_stale_gz_connections <- function() {
+  open_cons <- getAllConnections()
+  for (con_id in open_cons) {
+    tryCatch({
+      con_info <- summary.connection(getConnection(con_id))
+      if (grepl("\\.gz$", con_info$description, ignore.case = TRUE)) {
+        close(getConnection(con_id))
+      }
+    }, error = function(e) NULL)
+  }
+}
+
+
+# ##############################################################################
+# MAIN LOOP: Process each sample
+# ##############################################################################
+
+for (sample_name in names(sample_manifest)) {
+
+  sm <- sample_manifest[[sample_name]]
+  base_dir   <- sm$base_dir
+  sf         <- sm$files
+
+  cat("\n\n")
+  cat("################################################################\n")
+  cat(paste0("# Processing: ", sample_name, "\n"))
+  cat("################################################################\n")
+
+  # Check required files
+  required <- c("barcodes", "features", "matrix", "positions", "scalefactors")
+  missing_req <- required[sapply(sf[required], function(x) is.na(x) || !file.exists(x))]
+  if (length(missing_req) > 0) {
+    cat(paste0("  SKIPPING — missing required files: ", paste(missing_req, collapse = ", "), "\n"))
+    next
+  }
+
+  barcodes_file     <- sf$barcodes
+  features_file     <- sf$features
+  matrix_file       <- sf$matrix
+  positions_file    <- sf$positions
+  scalefactors_file <- sf$scalefactors
+  hires_image_file  <- sf$hires_image
+  lowres_image_file <- sf$lowres_image
+
+  output_dir <- base_dir
+  plots_dir  <- file.path(output_dir, "plots")
+  dir.create(plots_dir, showWarnings = FALSE, recursive = TRUE)
+
+  # Verify the plots directory is writable
+  test_file <- file.path(plots_dir, ".write_test.tmp")
+  tryCatch({
+    writeLines("test", test_file)
+    file.remove(test_file)
+    cat(paste0("  Plots directory OK: ", plots_dir, "\n"))
+  }, error = function(e) {
+    cat(paste0("  WARNING: Cannot write to plots directory: ", plots_dir, "\n"))
+    cat(paste0("  Error: ", e$message, "\n"))
+    plots_dir <<- file.path(path.expand("~"), "GSE278936_output", sample_name, "plots")
+    dir.create(plots_dir, showWarnings = FALSE, recursive = TRUE)
+    cat(paste0("  Using fallback: ", plots_dir, "\n"))
+  })
+
+  # --------------------------------------------------------------------------
+  # 2. Load Expression Matrix
+  # Explicit open/close of gzfile connections to prevent connection leak
+  # --------------------------------------------------------------------------
+  cat("\n=== Loading expression matrix ===\n")
+
+  con_bc <- gzfile(barcodes_file, open = "rt")
+  barcodes <- readLines(con_bc)
+  close(con_bc)
+
+  con_ft <- gzfile(features_file, open = "rt")
+  features <- read.delim(con_ft, header = FALSE, stringsAsFactors = FALSE)
+  close(con_ft)
+
+  con_mx <- gzfile(matrix_file, open = "rb")
+  mat <- readMM(con_mx)
+  close(con_mx)
+
+  colnames(mat) <- barcodes
+  gene_names <- features$V2
+  dup <- duplicated(gene_names) | gene_names == ""
+  gene_names[dup] <- paste0(gene_names[dup], "_", features$V1[dup])
+  rownames(mat) <- gene_names
+
+  cat(paste0("  Matrix: ", nrow(mat), " genes x ", ncol(mat), " spots\n"))
+
+  # --------------------------------------------------------------------------
+  # 3. Load Spatial Coordinates
+  # --------------------------------------------------------------------------
+  cat("\n=== Loading spatial coordinates ===\n")
+
+  positions <- read.csv(positions_file, header = FALSE, stringsAsFactors = FALSE)
+
+  if (positions$V1[1] == "barcode" || grepl("barcode", positions$V1[1], ignore.case = TRUE)) {
+    colnames(positions) <- positions[1, ]
+    positions <- positions[-1, ]
+    colnames(positions) <- c("barcode", "in_tissue", "array_row", "array_col",
+                             "pxl_row_fullres", "pxl_col_fullres")
+  } else {
+    colnames(positions) <- c("barcode", "in_tissue", "array_row", "array_col",
+                             "pxl_row_fullres", "pxl_col_fullres")
+  }
+
+  positions$in_tissue       <- as.integer(positions$in_tissue)
+  positions$array_row       <- as.integer(positions$array_row)
+  positions$array_col       <- as.integer(positions$array_col)
+  positions$pxl_row_fullres <- as.numeric(positions$pxl_row_fullres)
+  positions$pxl_col_fullres <- as.numeric(positions$pxl_col_fullres)
+  rownames(positions) <- positions$barcode
+
+  cat(paste0("  Positions: ", nrow(positions), " spots total, ",
+             sum(positions$in_tissue == 1), " in tissue\n"))
+
+  scale_factors <- fromJSON(scalefactors_file)
+  cat(paste0("  Scale factors: spot_diameter=", round(scale_factors$spot_diameter_fullres, 1),
+             ", hires_sf=", round(scale_factors$tissue_hires_scalef, 4),
+             ", lowres_sf=", round(scale_factors$tissue_lowres_scalef, 4), "\n"))
+
+  # --------------------------------------------------------------------------
+  # 4. Create Seurat Object
+  # --------------------------------------------------------------------------
+  cat("\n=== Creating Seurat object ===\n")
+
+  common_bc <- intersect(barcodes, positions$barcode)
+  cat(paste0("  Common barcodes: ", length(common_bc), "\n"))
+
+  mat_filt <- mat[, common_bc]
+  pos_filt <- positions[common_bc, ]
+
+  in_tissue_bc <- pos_filt$barcode[pos_filt$in_tissue == 1]
+  mat_tissue   <- mat_filt[, in_tissue_bc]
+  pos_tissue   <- pos_filt[in_tissue_bc, ]
+
+  cat(paste0("  In-tissue spots: ", length(in_tissue_bc), "\n"))
+
+  sobj <- CreateSeuratObject(
+    counts  = mat_tissue,
+    assay   = "Spatial",
+    project = sample_name
+  )
+
+  sobj$spatial_x <- pos_tissue[Cells(sobj), "pxl_col_fullres"]
+  sobj$spatial_y <- pos_tissue[Cells(sobj), "pxl_row_fullres"]
+  sobj$in_tissue <- pos_tissue[Cells(sobj), "in_tissue"]
+  sobj$array_row <- pos_tissue[Cells(sobj), "array_row"]
+  sobj$array_col <- pos_tissue[Cells(sobj), "array_col"]
+
+  sobj$spatial_x_lowres <- sobj$spatial_x * scale_factors$tissue_lowres_scalef
+  sobj$spatial_y_lowres <- sobj$spatial_y * scale_factors$tissue_lowres_scalef
+  sobj$spatial_x_hires  <- sobj$spatial_x * scale_factors$tissue_hires_scalef
+  sobj$spatial_y_hires  <- sobj$spatial_y * scale_factors$tissue_hires_scalef
+
+  cat(paste0("  Seurat object: ", ncol(sobj), " spots x ", nrow(sobj), " genes\n"))
+
+  # --------------------------------------------------------------------------
+  # 5. QC & Normalization (ADAPTIVE MT THRESHOLD)
+  # --------------------------------------------------------------------------
+  cat("\n=== QC & Normalization ===\n")
+
+  sobj[["percent.mt"]]   <- PercentageFeatureSet(sobj, pattern = "^MT-")
+  sobj[["percent.ribo"]] <- PercentageFeatureSet(sobj, pattern = "^RPS|^RPL")
+
+  median_mt <- median(sobj$percent.mt)
+  cat(paste0("  Median nCount: ", median(sobj$nCount_Spatial),
+             "  Median nFeature: ", median(sobj$nFeature_Spatial),
+             "  Median %MT: ", round(median_mt, 1), "\n"))
+
+  if (median_mt > 30) {
+    mt_mad     <- mad(sobj$percent.mt, constant = 1)
+    mt_thresh  <- min(100, median_mt + 1.5 * mt_mad)
+    cat(paste0("\n  *** HIGH MT% DETECTED (median=", round(median_mt, 1), "%) ***\n"))
+    cat(paste0("  This is typical of FFPE or degraded tissue.\n"))
+    cat(paste0("  Adaptive MT threshold: ", round(mt_thresh, 1), "%\n"))
+    cat(paste0("  (Standard 30% threshold would remove ALL or most spots)\n\n"))
+  } else {
+    mt_thresh <- 30
+  }
+
+  nfeat_min <- 200
+  n_pass_200 <- sum(sobj$nFeature_Spatial > 200 & sobj$percent.mt < mt_thresh)
+  if (n_pass_200 < 50) {
+    nfeat_min <- 100
+    cat(paste0("  Relaxed nFeature minimum to ", nfeat_min,
+               " (only ", n_pass_200, " spots pass nFeature>200)\n"))
+    n_pass_100 <- sum(sobj$nFeature_Spatial > 100 & sobj$percent.mt < mt_thresh)
+    if (n_pass_100 < 50) {
+      nfeat_min <- 50
+      cat(paste0("  Further relaxed nFeature minimum to ", nfeat_min, "\n"))
+    }
+  }
+
+  sobj <- subset(sobj, nFeature_Spatial > nfeat_min & nFeature_Spatial < 10000 & percent.mt < mt_thresh)
+  cat(paste0("  After QC filter: ", ncol(sobj), " spots\n"))
+  cat(paste0("  QC thresholds used: nFeature > ", nfeat_min,
+             ", nFeature < 10000, percent.mt < ", round(mt_thresh, 1), "\n"))
+
+  qc_df <- data.frame(
+    nFeature   = sobj$nFeature_Spatial,
+    nCount     = sobj$nCount_Spatial,
+    percent_mt = sobj$percent.mt
+  )
+
+  p_qc1 <- ggplot(qc_df, aes(x = nFeature)) +
+    geom_histogram(bins = 50, fill = "#3498DB", alpha = 0.7) +
+    geom_vline(xintercept = nfeat_min, linetype = "dashed", color = "red") +
+    theme_minimal() + ggtitle("nFeature Distribution") +
+    xlab("Number of Genes") + ylab("Count")
+
+  p_qc2 <- ggplot(qc_df, aes(x = percent_mt)) +
+    geom_histogram(bins = 50, fill = "#E74C3C", alpha = 0.7) +
+    geom_vline(xintercept = mt_thresh, linetype = "dashed", color = "red") +
+    theme_minimal() + ggtitle(paste0("MT% Distribution (threshold=", round(mt_thresh, 1), "%)")) +
+    xlab("Percent Mitochondrial") + ylab("Count")
+
+  p_qc3 <- ggplot(qc_df, aes(x = nFeature, y = percent_mt)) +
+    geom_point(size = 0.5, alpha = 0.5) +
+    geom_hline(yintercept = mt_thresh, linetype = "dashed", color = "red") +
+    geom_vline(xintercept = nfeat_min, linetype = "dashed", color = "red") +
+    theme_minimal() + ggtitle("nFeature vs MT%") +
+    xlab("Number of Genes") + ylab("Percent Mitochondrial")
+
+  p_qc <- (p_qc1 | p_qc2 | p_qc3) +
+    plot_annotation(
+      title = paste0(sample_name, " — QC Diagnostics (", ncol(sobj), " spots retained)"),
+      subtitle = paste0("Median MT%=", round(median_mt, 1),
+                        "% | Threshold=", round(mt_thresh, 1),
+                        "% | nFeature min=", nfeat_min),
+      theme = theme(plot.title = element_text(size = 16, face = "bold"),
+                    plot.subtitle = element_text(size = 12, color = "grey30")))
+
+  ggsave(file.path(plots_dir, "00_QC_diagnostics.png"), p_qc,
+         width = 18, height = 6, dpi = 200, bg = "white")
+  cat("  QC diagnostic plot saved\n")
+
+  sobj <- SCTransform(sobj, assay = "Spatial", verbose = FALSE)
+  cat("  SCTransform done\n")
+
+  sobj <- RunPCA(sobj, verbose = FALSE)
+  np <- min(30, ncol(Embeddings(sobj, "pca")))
+  sobj <- FindNeighbors(sobj, dims = 1:np, verbose = FALSE)
+  sobj <- FindClusters(sobj, resolution = 0.8, verbose = FALSE)
+  sobj <- RunUMAP(sobj, dims = 1:np, verbose = FALSE)
+  cat(paste0("  Clusters: ", length(unique(Idents(sobj))), "\n"))
+
+  # --------------------------------------------------------------------------
+  # 6b. Check gene availability for this sample
+  # --------------------------------------------------------------------------
+  cat("\n=== Gene Signature Availability ===\n")
+
+  aspc_avail    <- ASPC_genes[ASPC_genes %in% rownames(sobj)]
+  hall_avail    <- Hallmark_AR_genes[Hallmark_AR_genes %in% rownames(sobj)]
+  nepc_up_avail <- NEPC_Beltran_UP[NEPC_Beltran_UP %in% rownames(sobj)]
+  nepc_dn_avail <- NEPC_Beltran_DOWN[NEPC_Beltran_DOWN %in% rownames(sobj)]
+
+  cat(paste0("  ASPC genes available: ", length(aspc_avail), "/", length(ASPC_genes), "\n"))
+  cat(paste0("  Hallmark AR genes available: ", length(hall_avail), "/", length(Hallmark_AR_genes), "\n"))
+  cat(paste0("  NEPC Beltran UP available: ", length(nepc_up_avail), "/", length(NEPC_Beltran_UP), "\n"))
+  cat(paste0("  NEPC Beltran DOWN available: ", length(nepc_dn_avail), "/", length(NEPC_Beltran_DOWN), "\n"))
+
+  gene_avail <- rbind(
+    data.frame(Signature = "ASPC", Gene = ASPC_genes,
+               Available = ASPC_genes %in% rownames(sobj)),
+    data.frame(Signature = "Hallmark_AR", Gene = Hallmark_AR_genes,
+               Available = Hallmark_AR_genes %in% rownames(sobj)),
+    data.frame(Signature = "NEPC_Beltran_UP", Gene = NEPC_Beltran_UP,
+               Available = NEPC_Beltran_UP %in% rownames(sobj)),
+    data.frame(Signature = "NEPC_Beltran_DOWN", Gene = NEPC_Beltran_DOWN,
+               Available = NEPC_Beltran_DOWN %in% rownames(sobj))
+  )
+  write.csv(gene_avail, file.path(output_dir, "gene_signature_availability.csv"), row.names = FALSE)
+
+  # --------------------------------------------------------------------------
+  # 7. Compute Module Scores (ADAPTIVE nbin & ctrl)
+  # --------------------------------------------------------------------------
+  cat("\n=== Computing Module Scores ===\n")
+
+  has_aspc <- FALSE; has_ha <- FALSE; has_nepc_up <- FALSE; has_nepc_dn <- FALSE
+
+  ctrl_size <- min(100, floor(nrow(sobj) / 4))
+  n_spots  <- ncol(sobj)
+  nbin_use <- max(5, min(24, n_spots - 1))
+
+  cat(paste0("  Spots: ", n_spots, "\n"))
+  cat(paste0("  Using ctrl size: ", ctrl_size, " (total genes: ", nrow(sobj), ")\n"))
+  cat(paste0("  Using nbin: ", nbin_use, " (default=24, limited by spot count)\n"))
+
+  if (length(aspc_avail) >= 5) {
+    res <- safe_AddModuleScore(sobj, list(aspc_avail), "ASPC_score", ctrl_size, nbin_use)
+    if (res$success) {
+      sobj <- res$obj
+    } else {
+      sobj <- manual_module_score(sobj, aspc_avail, "ASPC_score1", ctrl_size)
+    }
+    has_aspc <- TRUE
+    cat(paste0("  ASPC score computed (", length(aspc_avail), " genes)\n"))
+  }
+
+  if (length(hall_avail) >= 5) {
+    res <- safe_AddModuleScore(sobj, list(hall_avail), "HallmarkAR_score", ctrl_size, nbin_use)
+    if (res$success) {
+      sobj <- res$obj
+    } else {
+      sobj <- manual_module_score(sobj, hall_avail, "HallmarkAR_score1", ctrl_size)
+    }
+    has_ha <- TRUE
+    cat(paste0("  Hallmark AR score computed (", length(hall_avail), " genes)\n"))
+  }
+
+  if (length(nepc_up_avail) >= 5) {
+    res <- safe_AddModuleScore(sobj, list(nepc_up_avail), "NEPC_UP_score", ctrl_size, nbin_use)
+    if (res$success) {
+      sobj <- res$obj
+    } else {
+      sobj <- manual_module_score(sobj, nepc_up_avail, "NEPC_UP_score1", ctrl_size)
+    }
+    has_nepc_up <- TRUE
+    cat(paste0("  NEPC Beltran UP score computed (", length(nepc_up_avail), " genes)\n"))
+  }
+
+  if (length(nepc_dn_avail) >= 5) {
+    res <- safe_AddModuleScore(sobj, list(nepc_dn_avail), "NEPC_DN_score", ctrl_size, nbin_use)
+    if (res$success) {
+      sobj <- res$obj
+    } else {
+      sobj <- manual_module_score(sobj, nepc_dn_avail, "NEPC_DN_score1", ctrl_size)
+    }
+    has_nepc_dn <- TRUE
+    cat(paste0("  NEPC Beltran DOWN score computed (", length(nepc_dn_avail), " genes)\n"))
+  }
+
+  has_nepc_composite <- FALSE
+  if (has_nepc_up && has_nepc_dn) {
+    sobj$NEPC_Beltran_composite <- sobj$NEPC_UP_score1 - sobj$NEPC_DN_score1
+    has_nepc_composite <- TRUE
+    cat("  NEPC Beltran composite (UP - DOWN) computed\n")
+  }
+
+  score_summary <- data.frame(
+    Spot    = Cells(sobj),
+    Cluster = as.character(Idents(sobj)),
+    spatial_x = sobj$spatial_x,
+    spatial_y = sobj$spatial_y
+  )
+  if (has_aspc)           score_summary$ASPC_score             <- sobj$ASPC_score1
+  if (has_ha)             score_summary$HallmarkAR_score       <- sobj$HallmarkAR_score1
+  if (has_nepc_up)        score_summary$NEPC_UP_score          <- sobj$NEPC_UP_score1
+  if (has_nepc_dn)        score_summary$NEPC_DN_score          <- sobj$NEPC_DN_score1
+  if (has_nepc_composite) score_summary$NEPC_Beltran_composite <- sobj$NEPC_Beltran_composite
+  write.csv(score_summary, file.path(output_dir, paste0(sample_name, "_signature_scores_per_spot.csv")), row.names = FALSE)
+
+  # --------------------------------------------------------------------------
+  # 8. Load Tissue Image
+  # --------------------------------------------------------------------------
+  cat("\n=== Loading tissue image ===\n")
+
+  img <- NULL
+  if (!is.na(lowres_image_file) && file.exists(lowres_image_file)) {
+    tryCatch({
+      img <- readPNG(lowres_image_file)
+      cat(paste0("  Image loaded: ", ncol(img), " x ", nrow(img), " px\n"))
+    }, error = function(e) {
+      cat(paste0("  Could not load image: ", e$message, " — will plot without overlay\n"))
+    })
+  } else {
+    cat("  Low-res image not found — will plot without overlay\n")
+  }
+
+  has_image <- !is.null(img)
+  lowres_sf <- scale_factors$tissue_lowres_scalef
+
+  md <- sobj@meta.data
+
+  # --------------------------------------------------------------------------
+  # 8c. Compute DYNAMIC spot sizes for this sample
+  # --------------------------------------------------------------------------
+  pt_size_fullres <- compute_optimal_pt_size(md, x_col = "spatial_x",
+                                              y_col = "spatial_y",
+                                              target_plot_width = 10)
+  pt_size_lowres  <- compute_optimal_pt_size(md, x_col = "spatial_x_lowres",
+                                              y_col = "spatial_y_lowres",
+                                              target_plot_width = 10)
+  cat(paste0("  Dynamic pt_size: fullres=", pt_size_fullres,
+             ", lowres=", pt_size_lowres, "\n"))
+
+  # ==========================================================================
+  # 9. INDIVIDUAL SPATIAL PLOTS (both with and without tissue image)
+  # ==========================================================================
+  cat("\n=== Generating individual spatial plots (overlay + no-image) ===\n")
+
+  cat("  [1] Spatial clusters\n")
+  pl_clust <- make_spatial_plot(
+    md, "seurat_clusters",
+    scale_color_manual(values = colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(
+      length(unique(md$seurat_clusters))), name = "Cluster"),
+    paste0(sample_name, " — Spatial Clusters"),
+    img = img, sf = lowres_sf,
+    pt_size = pt_size_fullres, pt_size_overlay = pt_size_lowres)
+  save_both(pl_clust, "01_spatial_clusters", plots_dir)
+
+  if (has_aspc) {
+    cat("  [2] ASPC score\n")
+    pl_aspc <- make_spatial_plot(
+      md, "ASPC_score1",
+      scale_color_gradient2(low = "#2166AC", mid = "white", high = "#1B7837",
+                            midpoint = 0, name = "ASPC\nScore"),
+      paste0(sample_name, " — ASPC Score"),
+      img = img, sf = lowres_sf,
+      pt_size = pt_size_fullres, pt_size_overlay = pt_size_lowres)
+    save_both(pl_aspc, "02_spatial_ASPC_score", plots_dir)
+  }
+
+  if (has_ha) {
+    cat("  [3] Hallmark AR score\n")
+    pl_ar <- make_spatial_plot(
+      md, "HallmarkAR_score1",
+      scale_color_gradient2(low = "#D73027", mid = "white", high = "#4575B4",
+                            midpoint = 0, name = "Hallmark\nAR Score"),
+      paste0(sample_name, " — Hallmark Androgen Response Score"),
+      img = img, sf = lowres_sf,
+      pt_size = pt_size_fullres, pt_size_overlay = pt_size_lowres)
+    save_both(pl_ar, "03_spatial_HallmarkAR_score", plots_dir)
+  }
+
+  if (has_nepc_composite) {
+    cat("  [4] NEPC Beltran composite\n")
+    pl_nepc <- make_spatial_plot(
+      md, "NEPC_Beltran_composite",
+      scale_color_gradient2(low = "#4575B4", mid = "white", high = "#D73027",
+                            midpoint = 0, name = "NEPC\nBeltran"),
+      paste0(sample_name, " — NEPC Beltran Composite Score (UP - DOWN)"),
+      img = img, sf = lowres_sf,
+      pt_size = pt_size_fullres, pt_size_overlay = pt_size_lowres)
+    save_both(pl_nepc, "04_spatial_NEPC_Beltran_composite", plots_dir)
+  }
+
+  # ==========================================================================
+  # 10. COMBINED PANEL: Side-by-Side (All Three Scores)
+  # ==========================================================================
+  cat("\n=== Combined spatial panels ===\n")
+
+  if (has_aspc && has_ha && has_nepc_composite) {
+
+    p_combo_no <- (pl_aspc$noimage + ggtitle("ASPC")) +
+      (pl_ar$noimage + ggtitle("Hallmark AR")) +
+      (pl_nepc$noimage + ggtitle("NEPC Beltran")) +
+      plot_layout(ncol = 3) +
+      plot_annotation(
+        title    = paste0(sample_name, " — ASPC vs Hallmark AR vs NEPC Beltran (no image)"),
+        subtitle = "Each panel: same tissue section, different signature score",
+        theme    = theme(
+          plot.title    = element_text(size = 20, face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(size = 13, hjust = 0.5, color = "grey30")
+        )
+      )
+    ggsave(file.path(plots_dir, "05_spatial_3scores_sidebyside_noimage.png"),
+           p_combo_no, width = 30, height = 10, dpi = 200, bg = "white")
+    cat("  [5] Three-score side-by-side (no image)\n")
+
+    if (has_image) {
+      p_combo_ov <- (pl_aspc$overlay + ggtitle("ASPC")) +
+        (pl_ar$overlay + ggtitle("Hallmark AR")) +
+        (pl_nepc$overlay + ggtitle("NEPC Beltran")) +
+        plot_layout(ncol = 3) +
+        plot_annotation(
+          title    = paste0(sample_name, " — ASPC vs Hallmark AR vs NEPC Beltran (H&E overlay)"),
+          subtitle = "Each panel: same tissue section, different signature score",
+          theme    = theme(
+            plot.title    = element_text(size = 20, face = "bold", hjust = 0.5),
+            plot.subtitle = element_text(size = 13, hjust = 0.5, color = "grey30")
+          )
+        )
+      ggsave(file.path(plots_dir, "05_spatial_3scores_sidebyside_overlay.png"),
+             p_combo_ov, width = 30, height = 10, dpi = 200, bg = "white")
+      cat("  [5] Three-score side-by-side (overlay)\n")
+    }
+
+    if (has_image) {
+      p_stacked <- (
+        (pl_aspc$overlay + ggtitle("ASPC\n(H&E)")) +
+          (pl_ar$overlay + ggtitle("Hallmark AR\n(H&E)")) +
+          (pl_nepc$overlay + ggtitle("NEPC Beltran\n(H&E)"))
+      ) / (
+        (pl_aspc$noimage + ggtitle("ASPC\n(no image)")) +
+          (pl_ar$noimage + ggtitle("Hallmark AR\n(no image)")) +
+          (pl_nepc$noimage + ggtitle("NEPC Beltran\n(no image)"))
+      ) +
+        plot_annotation(
+          title = paste0(sample_name, " — Three Signatures: H&E Overlay (top) vs Clean (bottom)"),
+          theme = theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5))
+        )
+      ggsave(file.path(plots_dir, "05_spatial_3scores_stacked_overlay_vs_clean.png"),
+             p_stacked, width = 30, height = 20, dpi = 200, bg = "white")
+      cat("  [5] Three-score stacked (overlay vs clean)\n")
+    }
+  }
+
+  # ==========================================================================
+  # 11. RGB BLEND: All Three Scores in ONE Spatial Graph
+  # Uses dynamic pt_size_fullres and pt_size_lowres
+  # ==========================================================================
+  cat("\n=== RGB blend spatial plot ===\n")
+
+  if (has_aspc && has_ha && has_nepc_composite) {
+
+    clamp01 <- function(x) pmin(pmax(x, 0), 1)
+
+    r_vals <- clamp01(scales::rescale(
+      md$NEPC_Beltran_composite, to = c(0, 1),
+      from = as.numeric(quantile(md$NEPC_Beltran_composite, probs = c(0.02, 0.98), na.rm = TRUE))))
+
+    g_vals <- clamp01(scales::rescale(
+      md$ASPC_score1, to = c(0, 1),
+      from = as.numeric(quantile(md$ASPC_score1, probs = c(0.02, 0.98), na.rm = TRUE))))
+
+    b_vals <- clamp01(scales::rescale(
+      md$HallmarkAR_score1, to = c(0, 1),
+      from = as.numeric(quantile(md$HallmarkAR_score1, probs = c(0.02, 0.98), na.rm = TRUE))))
+
+    md$RGB_color <- rgb(red = r_vals, green = g_vals, blue = b_vals)
+
+    rgb_title <- paste0(sample_name, " — ASPC + Hallmark AR + NEPC Beltran\n(RGB: Red=NEPC, Green=ASPC, Blue=AR)")
+
+    p_rgb_no <- ggplot() +
+      geom_point(data = md,
+                 aes(x = spatial_x, y = -spatial_y, color = RGB_color),
+                 size = pt_size_fullres, stroke = 0, shape = 16, alpha = 0.9) +
+      scale_color_identity() +
+      coord_equal() +
+      theme_minimal(base_size = 14) +
+      ggtitle(rgb_title) +
+      theme(plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+            axis.title = element_blank(), axis.text = element_blank(),
+            axis.ticks = element_blank(), panel.grid = element_blank(),
+            panel.background = element_rect(fill = "white", color = NA))
+
+    p_rgb_ov <- NULL
+    if (has_image) {
+      p_rgb_ov <- ggplot() +
+        annotation_raster(img, xmin = 0, xmax = ncol(img),
+                          ymin = -nrow(img), ymax = 0) +
+        geom_point(data = md,
+                   aes(x = spatial_x_lowres, y = -spatial_y_lowres, color = RGB_color),
+                   size = pt_size_lowres, stroke = 0, shape = 16, alpha = 0.9) +
+        scale_color_identity() +
+        coord_equal() +
+        theme_minimal(base_size = 14) +
+        ggtitle(paste0(rgb_title, " — H&E overlay")) +
+        theme(plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+              axis.title = element_blank(), axis.text = element_blank(),
+              axis.ticks = element_blank(), panel.grid = element_blank())
+    }
+
+    key_df <- expand.grid(NEPC = c(0, 0.5, 1), ASPC = c(0, 0.5, 1), AR = c(0, 0.5, 1))
+    key_df$col <- rgb(key_df$NEPC, key_df$ASPC, key_df$AR)
+
+    p_key <- ggplot(key_df, aes(x = NEPC, y = ASPC)) +
+      geom_point(aes(color = col), size = 8, shape = 15) +
+      facet_wrap(~AR, labeller = labeller(AR = function(x) paste0("Hallmark AR (blue) = ", x))) +
+      scale_color_identity() +
+      theme_minimal(base_size = 12) +
+      ggtitle("RGB Color Key") +
+      xlab("NEPC Beltran (red)") + ylab("ASPC (green)") +
+      theme(plot.title       = element_text(size = 14, face = "bold", hjust = 0.5),
+            strip.text       = element_text(size = 11, face = "bold"),
+            panel.grid.minor = element_blank())
+
+    p_rgb_no_full <- (p_rgb_no / p_key) +
+      plot_layout(heights = c(3, 1)) +
+      plot_annotation(
+        title = paste0(sample_name, " — Three Signatures in One Graph (RGB, no image)"),
+        theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+      )
+    ggsave(file.path(plots_dir, "06_spatial_RGB_blend_noimage.png"),
+           p_rgb_no_full, width = 12, height = 16, dpi = 200, bg = "white")
+    cat("  [6] RGB blend (no image)\n")
+
+    if (has_image) {
+      p_rgb_ov_full <- (p_rgb_ov / p_key) +
+        plot_layout(heights = c(3, 1)) +
+        plot_annotation(
+          title = paste0(sample_name, " — Three Signatures in One Graph (RGB, H&E overlay)"),
+          theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5))
+        )
+      ggsave(file.path(plots_dir, "06_spatial_RGB_blend_overlay.png"),
+             p_rgb_ov_full, width = 12, height = 16, dpi = 200, bg = "white")
+      cat("  [6] RGB blend (overlay)\n")
+    }
+  }
+
+  # ==========================================================================
+  # 12. CATEGORICAL OVERLAY: Dominant Signature per Spot
+  # ==========================================================================
+  cat("\n=== Dominant signature overlay ===\n")
+
+  if (has_aspc && has_ha && has_nepc_composite) {
+
+    md$dominant_sig <- ifelse(
+      md$ASPC_score1 > 0 & md$HallmarkAR_score1 > 0 & md$NEPC_Beltran_composite > 0, "All High",
+    ifelse(
+      md$NEPC_Beltran_composite > 0 & md$NEPC_Beltran_composite >= md$ASPC_score1 &
+        md$NEPC_Beltran_composite >= md$HallmarkAR_score1, "NEPC Dominant",
+    ifelse(
+      md$ASPC_score1 > 0 & md$ASPC_score1 >= md$HallmarkAR_score1 &
+        md$ASPC_score1 >= md$NEPC_Beltran_composite, "ASPC Dominant",
+    ifelse(
+      md$HallmarkAR_score1 > 0 & md$HallmarkAR_score1 >= md$ASPC_score1 &
+        md$HallmarkAR_score1 >= md$NEPC_Beltran_composite, "Hallmark AR Dominant",
+      "All Low"))))
+
+    md$dominant_sig <- factor(md$dominant_sig,
+      levels = c("All Low", "ASPC Dominant", "Hallmark AR Dominant", "NEPC Dominant", "All High"))
+
+    md_ord <- md[order(md$dominant_sig), ]
+
+    dom_colors <- c("All Low"              = "#E0E0E0",
+                    "ASPC Dominant"         = "#27AE60",
+                    "Hallmark AR Dominant"  = "#2980B9",
+                    "NEPC Dominant"         = "#E74C3C",
+                    "All High"             = "#8E44AD")
+
+    pl_dom <- make_spatial_plot(
+      md_ord, "dominant_sig",
+      scale_color_manual(values = dom_colors, name = "Dominant\nSignature"),
+      paste0(sample_name, " — Dominant Signature per Spot"),
+      img = img, sf = lowres_sf,
+      pt_size = pt_size_fullres, pt_size_overlay = pt_size_lowres)
+    save_both(pl_dom, "07_spatial_dominant_signature", plots_dir)
+    cat("  [7] Dominant signature\n")
+
+    dom_counts <- as.data.frame(table(md$dominant_sig))
+    colnames(dom_counts) <- c("Dominant_Signature", "N_Spots")
+    dom_counts$Pct <- round(dom_counts$N_Spots / sum(dom_counts$N_Spots) * 100, 1)
+    write.csv(dom_counts, file.path(output_dir, paste0(sample_name, "_dominant_signature_counts.csv")), row.names = FALSE)
+    cat("  Dominant signature table saved\n")
+  }
+
+  # ==========================================================================
+  # 13. SCATTER PLOTS: Pairwise Score Comparisons
+  # ==========================================================================
+  cat("\n=== Scatter plots ===\n")
+
+  if (has_aspc && has_ha && has_nepc_composite) {
+
+    p_sc1 <- ggplot(md, aes(HallmarkAR_score1, NEPC_Beltran_composite, color = ASPC_score1)) +
+      geom_point(size = 0.5, alpha = 0.6) +
+      scale_color_gradient2(low = "grey80", mid = "white", high = "#27AE60",
+                            midpoint = 0, name = "ASPC") +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+      theme_minimal(base_size = 13) +
+      ggtitle("NEPC vs Hallmark AR (colored by ASPC)") +
+      xlab("Hallmark AR Score") + ylab("NEPC Beltran Composite")
+
+    p_sc2 <- ggplot(md, aes(ASPC_score1, NEPC_Beltran_composite, color = HallmarkAR_score1)) +
+      geom_point(size = 0.5, alpha = 0.6) +
+      scale_color_gradient2(low = "grey80", mid = "white", high = "#2980B9",
+                            midpoint = 0, name = "Hallmark AR") +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+      theme_minimal(base_size = 13) +
+      ggtitle("NEPC vs ASPC (colored by Hallmark AR)") +
+      xlab("ASPC Score") + ylab("NEPC Beltran Composite")
+
+    p_sc3 <- ggplot(md, aes(ASPC_score1, HallmarkAR_score1, color = NEPC_Beltran_composite)) +
+      geom_point(size = 0.5, alpha = 0.6) +
+      scale_color_gradient2(low = "grey80", mid = "white", high = "#E74C3C",
+                            midpoint = 0, name = "NEPC Beltran") +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+      geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+      theme_minimal(base_size = 13) +
+      ggtitle("Hallmark AR vs ASPC (colored by NEPC)") +
+      xlab("ASPC Score") + ylab("Hallmark AR Score")
+
+    p_scatters <- (p_sc1 | p_sc2 | p_sc3) +
+      plot_annotation(title = paste0(sample_name, " — Pairwise Score Scatter Plots"),
+                      theme = theme(plot.title = element_text(size = 18, face = "bold", hjust = 0.5)))
+
+    ggsave(file.path(plots_dir, "08_scatter_pairwise_scores.png"),
+           p_scatters, width = 24, height = 8, dpi = 200, bg = "white")
+    cat("  [8] Pairwise scatter plots\n")
+  }
+
+  # ==========================================================================
+  # 14. VIOLIN PLOTS: Score Distributions by Cluster
+  # ==========================================================================
+  cat("\n=== Violin plots ===\n")
+
+  score_features <- c()
+  if (has_aspc)           score_features <- c(score_features, "ASPC_score1")
+  if (has_ha)             score_features <- c(score_features, "HallmarkAR_score1")
+  if (has_nepc_composite) score_features <- c(score_features, "NEPC_Beltran_composite")
+
+  if (length(score_features) > 0) {
+    p_vln <- VlnPlot(sobj, features = score_features, pt.size = 0.05,
+                      ncol = length(score_features)) +
+      plot_annotation(title = paste0(sample_name, " — Signature Scores by Cluster"))
+    ggsave(file.path(plots_dir, "09_violin_scores_by_cluster.png"),
+           p_vln, width = 5 * length(score_features), height = 6, dpi = 200, bg = "white")
+    cat("  [9] Violin plots\n")
+  }
+
+  # ==========================================================================
+  # 15. Score Summary Tables
+  # ==========================================================================
+  cat("\n=== Summary statistics ===\n")
+
+  if (has_aspc && has_ha && has_nepc_composite) {
+    score_stats <- md %>%
+      summarize(
+        N_spots                 = n(),
+        ASPC_mean               = round(mean(ASPC_score1), 4),
+        ASPC_median             = round(median(ASPC_score1), 4),
+        ASPC_pct_positive       = round(mean(ASPC_score1 > 0) * 100, 1),
+        HallmarkAR_mean         = round(mean(HallmarkAR_score1), 4),
+        HallmarkAR_median       = round(median(HallmarkAR_score1), 4),
+        HallmarkAR_pct_positive = round(mean(HallmarkAR_score1 > 0) * 100, 1),
+        NEPC_mean               = round(mean(NEPC_Beltran_composite), 4),
+        NEPC_median             = round(median(NEPC_Beltran_composite), 4),
+        NEPC_pct_positive       = round(mean(NEPC_Beltran_composite > 0) * 100, 1)
+      )
+    write.csv(score_stats, file.path(output_dir, paste0(sample_name, "_score_summary.csv")), row.names = FALSE)
+
+    cluster_stats <- md %>%
+      group_by(seurat_clusters) %>%
+      summarize(
+        N                   = n(),
+        ASPC_mean           = round(mean(ASPC_score1), 4),
+        ASPC_pct_pos        = round(mean(ASPC_score1 > 0) * 100, 1),
+        HallmarkAR_mean     = round(mean(HallmarkAR_score1), 4),
+        HallmarkAR_pct_pos  = round(mean(HallmarkAR_score1 > 0) * 100, 1),
+        NEPC_mean           = round(mean(NEPC_Beltran_composite), 4),
+        NEPC_pct_pos        = round(mean(NEPC_Beltran_composite > 0) * 100, 1),
+        .groups = "drop"
+      )
+    write.csv(cluster_stats, file.path(output_dir, paste0(sample_name, "_scores_per_cluster.csv")), row.names = FALSE)
+    cat("  Summary tables saved\n")
+  }
+
+  # ==========================================================================
+  # 16. Save Seurat Object
+  # ==========================================================================
+  cat("\n=== Saving ===\n")
+  saveRDS(sobj, file.path(output_dir, paste0(sample_name, "_seurat_scored.rds")))
+  cat("  Seurat object saved\n")
+
+  # ==========================================================================
+  # 17. Final Report for this sample
+  # ==========================================================================
+  cat("\n")
+  cat("==============================================================\n")
+  cat(paste0("  ", sample_name, " Visium Analysis Complete\n"))
+  cat("==============================================================\n")
+  cat(paste0("  Spots analyzed: ", ncol(sobj), "\n"))
+  cat(paste0("  Genes: ", nrow(sobj), "\n"))
+  cat(paste0("  Clusters: ", length(unique(Idents(sobj))), "\n"))
+  cat(paste0("  Tissue image: ", ifelse(has_image, "YES", "NO"), "\n"))
+  cat(paste0("  MT% threshold used: ", round(mt_thresh, 1), "%\n"))
+  cat(paste0("  nFeature minimum used: ", nfeat_min, "\n"))
+  cat(paste0("  nbin used for AddModuleScore: ", nbin_use, "\n"))
+  cat(paste0("  Dynamic pt_size: fullres=", pt_size_fullres,
+             ", lowres=", pt_size_lowres, "\n"))
+  cat(paste0("\n  Output directory: ", output_dir, "\n"))
+  cat(paste0("  Plots directory:  ", plots_dir, "\n"))
+  cat("\n  Generated plots (each has _overlay + _noimage variants):\n")
+  cat("    00 - QC diagnostics\n")
+  cat("    01 - Spatial clusters\n")
+  cat("    02 - ASPC score\n")
+  cat("    03 - Hallmark AR score\n")
+  cat("    04 - NEPC Beltran composite\n")
+  cat("    05 - Three scores side-by-side (+ stacked comparison)\n")
+  cat("    06 - RGB blend (all three in one graph)\n")
+  cat("    07 - Dominant signature categorical overlay\n")
+  cat("    08 - Pairwise scatter plots\n")
+  cat("    09 - Violin plots by cluster\n")
+  cat("\n  Generated tables:\n")
+  cat(paste0("    gene_signature_availability.csv\n"))
+  cat(paste0("    ", sample_name, "_signature_scores_per_spot.csv\n"))
+  cat(paste0("    ", sample_name, "_dominant_signature_counts.csv\n"))
+  cat(paste0("    ", sample_name, "_score_summary.csv\n"))
+  cat(paste0("    ", sample_name, "_scores_per_cluster.csv\n"))
+  cat(paste0("    ", sample_name, "_seurat_scored.rds\n"))
+  cat("==============================================================\n")
+
+  # --- Clean up memory and close stale gz connections between samples ---
+  rm(sobj, md, mat, mat_filt, mat_tissue, pos_filt, pos_tissue, img)
+  close_stale_gz_connections()
+  gc()
+
+}  # END of main sample loop
+
+cat("\n\n")
+cat("################################################################\n")
+cat("#  ALL 52 SAMPLES PROCESSED SUCCESSFULLY                      #\n")
+cat("################################################################\n")
