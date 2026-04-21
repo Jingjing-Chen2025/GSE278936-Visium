@@ -19,6 +19,10 @@
 #       Control 2: Random-spot permutation
 #                  (niche around random spots vs ASPC spots, 100 permutations)
 #
+# v2 — Absolute NE_like threshold calibrated from known NEPC (NEADT) samples
+#       to eliminate BPH false positives. Per-sample quantile thresholds are
+#       retained for all OTHER cell types (niche composition analysis).
+#
 # L-R DATABASE: CellChat (CellChatDB) + Curated Nerve→Stroma supplement
 # SAMPLES: 4 BPH + 17 TRNA + 22 NEADT + 5 CRPC + 4 MET = 52
 # ==============================================================================
@@ -434,16 +438,119 @@ clamp_h <- function(h, min_h = 4, max_h = 48) {
 }
 
 # ==============================================================================
+# CALIBRATE NE_like ABSOLUTE THRESHOLD FROM KNOWN NEPC (NEADT) SAMPLES
+# ==============================================================================
+cat("\n========== CALIBRATING NE_like THRESHOLD FROM NEADT SAMPLES ==========\n\n")
+
+neadt_dirs <- sample_dirs[grepl("NEADT", sample_dirs)]
+calib_dirs <- neadt_dirs[1:min(5, length(neadt_dirs))]
+calib_ne_scores <- c()
+calib_ne_per_sample <- list()   # store per-sample scores for Fig 10
+
+NE_like_genes <- cell_sigs[["NE_like"]]
+
+for (cd in calib_dirs) {
+  bd_cal <- file.path(base_root, cd)
+  nm_cal <- sub("^GSM[0-9]+_", "", cd)
+  if (!dir.exists(bd_cal)) { cat(paste0("  ", nm_cal, ": not found, skip\n")); next }
+  cat(paste0("  Calibrating from: ", nm_cal, " ... "))
+
+  f_bc_c  <- find_file(bd_cal, "barcodes.tsv.gz")
+  f_ft_c  <- find_file(bd_cal, "features.tsv.gz")
+  f_mx_c  <- find_file(bd_cal, "matrix.mtx.gz")
+  f_pos_c <- find_file(bd_cal, "tissue_positions_list.csv")
+  if (is.na(f_pos_c)) f_pos_c <- find_file(bd_cal, "tissue_positions.csv")
+  f_sf_c  <- find_file(bd_cal, "scalefactors_json.json")
+  req_c <- c(f_bc_c, f_ft_c, f_mx_c, f_pos_c, f_sf_c)
+  if (any(is.na(req_c))) { cat("missing files, skip\n"); next }
+
+  err_c <- FALSE
+  tryCatch({con<-gzfile(f_bc_c,"rt"); barcodes_c<-readLines(con); close(con)},
+    error=function(e){err_c<<-TRUE})
+  if(err_c) { cat("barcodes error, skip\n"); next }
+  tryCatch({con<-gzfile(f_ft_c,"rt"); features_c<-read.delim(con,header=F,stringsAsFactors=F); close(con)},
+    error=function(e){err_c<<-TRUE})
+  if(err_c) { cat("features error, skip\n"); next }
+  tryCatch({con<-gzfile(f_mx_c,"rb"); mat_c<-readMM(con); close(con)},
+    error=function(e){err_c<<-TRUE})
+  if(err_c) { cat("matrix error, skip\n"); next }
+  tryCatch({pos_c<-read.csv(f_pos_c, header=F, stringsAsFactors=F)},
+    error=function(e){err_c<<-TRUE})
+  if(err_c) { cat("positions error, skip\n"); next }
+
+  colnames(mat_c) <- barcodes_c
+  gn_c <- features_c$V2; dup_c <- duplicated(gn_c) | gn_c == ""
+  gn_c[dup_c] <- paste0(gn_c[dup_c], "_", features_c$V1[dup_c]); rownames(mat_c) <- gn_c
+
+  if(grepl("barcode", pos_c$V1[1], ignore.case=T)) pos_c <- pos_c[-1,]
+  colnames(pos_c) <- c("barcode","in_tissue","array_row","array_col","pxl_row","pxl_col")
+  pos_c$in_tissue <- as.integer(pos_c$in_tissue)
+  rownames(pos_c) <- pos_c$barcode
+
+  it_bc_c <- intersect(barcodes_c, pos_c$barcode[pos_c$in_tissue == 1])
+  if (length(it_bc_c) < 50) { cat("too few spots, skip\n"); next }
+
+  sobj_c <- CreateSeuratObject(counts = mat_c[, it_bc_c], assay = "Spatial", project = nm_cal)
+  sobj_c[["pct_mt"]] <- PercentageFeatureSet(sobj_c, pattern = "^MT-")
+  med_mt_c <- median(sobj_c$pct_mt)
+  mt_th_c <- if (med_mt_c > 30) min(100, med_mt_c + 1.5 * mad(sobj_c$pct_mt, constant = 1)) else 30
+  nf_min_c <- 200
+  if (sum(sobj_c$nFeature_Spatial > 200 & sobj_c$pct_mt < mt_th_c) < 50) nf_min_c <- 100
+  if (sum(sobj_c$nFeature_Spatial > nf_min_c & sobj_c$pct_mt < mt_th_c) < 50) nf_min_c <- 50
+  sobj_c <- subset(sobj_c, nFeature_Spatial > nf_min_c & nFeature_Spatial < 10000 & pct_mt < mt_th_c)
+  if (ncol(sobj_c) < 30) { cat("too few spots after QC, skip\n"); next }
+
+  sobj_c <- SCTransform(sobj_c, assay = "Spatial", verbose = FALSE)
+
+  ctrl_sz_c <- min(100, floor(nrow(sobj_c) / 4)); nb_c <- max(5, min(24, ncol(sobj_c) - 1))
+  av_c <- NE_like_genes[NE_like_genes %in% rownames(sobj_c)]
+  if (length(av_c) >= 2) {
+    sobj_c <- tryCatch({
+      AddModuleScore(sobj_c, features = list(av_c), name = "NE_like_", ctrl = ctrl_sz_c, nbin = nb_c)
+    }, error = function(e) {
+      em_c <- as.matrix(safe_GetAssayData(sobj_c, "data"))
+      sc_c <- colMeans(em_c[av_c, , drop = FALSE])
+      bg_c <- sample(setdiff(rownames(sobj_c), av_c), min(ctrl_sz_c, nrow(sobj_c) - length(av_c)))
+      if (length(bg_c) > 0) sc_c <- sc_c - colMeans(em_c[bg_c, , drop = FALSE])
+      sobj_c[["NE_like_1"]] <- sc_c
+      sobj_c
+    })
+    calib_ne_scores <- c(calib_ne_scores, sobj_c$NE_like_1)
+    calib_ne_per_sample[[nm_cal]] <- sobj_c$NE_like_1
+    cat(paste0(ncol(sobj_c), " spots scored (", sum(sobj_c$NE_like_1 > 0), " positive)\n"))
+  } else {
+    cat("too few NE_like genes detected, skip\n")
+  }
+
+  rm(sobj_c, mat_c, pos_c, barcodes_c, features_c); gc(verbose = FALSE)
+}
+
+if (length(calib_ne_scores) > 50) {
+  NE_LIKE_THRESHOLD <- as.numeric(quantile(calib_ne_scores, 0.75, na.rm = TRUE))
+  if (NE_LIKE_THRESHOLD < 0.05) NE_LIKE_THRESHOLD <- 0.10
+  cat(paste0("\n  >>> NE_LIKE_THRESHOLD = ", round(NE_LIKE_THRESHOLD, 4),
+             " (75th percentile of ", length(calib_ne_scores), " NEADT spots)\n"))
+} else {
+  NE_LIKE_THRESHOLD <- 0.15
+  cat(paste0("\n  >>> NE_LIKE_THRESHOLD = 0.15 (fallback — insufficient calibration data)\n"))
+}
+cat(paste0("  >>> Spots must have NE_like_1 >= ", round(NE_LIKE_THRESHOLD, 4),
+           " to be called NE_like_hi\n"))
+cat("  >>> This eliminates BPH false positives from random score noise\n")
+cat("  >>> Other cell types retain per-sample quantile(0.75) thresholds\n\n")
+
+# ==============================================================================
 # MAIN LOOP
 # ==============================================================================
 cat("\n========== PROCESSING 52 SAMPLES ==========\n\n")
 
 all_niche <- list()
-all_niche_bgcorr <- list()       # Control 1: background-corrected
-all_niche_perm <- list()          # Control 2: permutation results
+all_niche_bgcorr <- list()
+all_niche_perm <- list()
 all_lr_niche_ct <- list()
 all_lr_global <- list()
 all_sample_meta <- list()
+all_ne_scores_by_group <- list()   # collect NE scores per group for Fig 8
 
 for (sd in sample_dirs) {
   bd <- file.path(base_root, sd)
@@ -556,14 +663,28 @@ for (sd in sample_dirs) {
   n_aspc <- sum(md$ASPC_hi)
   if (n_aspc < 5) { cat("  SKIP (<5 ASPC-hi)\n"); rm(sobj,ed,mat); gc(verbose=F); next }
 
+  # -----------------------------------------------------------------------
+  # Cell-type _hi classification (v2: absolute threshold for NE_like)
+  # -----------------------------------------------------------------------
   ct_hi_cols <- c()
   for (ct in names(cell_sigs)) {
     sc <- paste0(ct, "_1")
     if (sc %in% colnames(md)) {
       hi_col <- paste0(ct, "_hi")
-      md[[hi_col]] <- md[[sc]] >= quantile(md[[sc]], 0.75)
+      if (ct == "NE_like") {
+        md[[hi_col]] <- md[[sc]] >= NE_LIKE_THRESHOLD
+      } else {
+        md[[hi_col]] <- md[[sc]] >= quantile(md[[sc]], 0.75)
+      }
       ct_hi_cols <- c(ct_hi_cols, ct)
     }
+  }
+
+  # Collect NE_like scores per group for Fig 8
+  if ("NE_like_1" %in% colnames(md)) {
+    all_ne_scores_by_group[[nm]] <- data.frame(
+      NE_like_score = md$NE_like_1, sample = nm, group = grp,
+      stringsAsFactors = FALSE)
   }
 
   n_total_spots <- nrow(md)
@@ -571,7 +692,7 @@ for (sd in sample_dirs) {
   pct_ne_hi <- n_ne_hi / n_total_spots
 
   # ==================================================================
-  # NICHE ANALYSIS + CONTROL 1 (Background-corrected) + CONTROL 2 (Permutation)
+  # NICHE ANALYSIS + CONTROL 1 + CONTROL 2
   # ==================================================================
   cat("  Niche+Ctrl...")
   sr <- sf_json$spot_diameter_fullres * 3
@@ -590,7 +711,6 @@ for (sd in sample_dirs) {
     sc <- paste0(ct, "_1")
     ct_hi_idx <- which(md[[paste0(ct, "_hi")]])
 
-    # --- Raw niche: neighbors of ASPC-hi spots ---
     nbr_aspc <- vapply(aspc_idx, function(i) {
       nb <- nbl[[i]]
       if(length(nb) < 1) NA_real_ else mean(md[[sc]][nb])
@@ -610,7 +730,6 @@ for (sd in sample_dirs) {
       any(nbl[[i]] %in% ct_hi_idx)
     }, logical(1)))
 
-    # Raw niche row (same as before)
     niche_rows[[ct]] <- data.frame(
       CellType = ct,
       Nbr_ASPC_mean = round(m_aspc, 5), Nbr_BG_mean = round(m_bg, 5),
@@ -618,16 +737,11 @@ for (sd in sample_dirs) {
       N_CT_near_ASPC = n_ct_near_aspc, N_ASPC_spots = n_aspc,
       sample = nm, group = grp, stringsAsFactors = FALSE)
 
-    # ============================================================
-    # CONTROL 1: Background-corrected niche enrichment
-    # Global average CT score across ALL spots in the sample
-    # Specific_enrichment = Niche_around_ASPC - Global_sample_average
-    # This removes tissue composition confounding
-    # ============================================================
+    # CONTROL 1
     global_mean_ct <- mean(md[[sc]], na.rm = TRUE)
-    bgcorr_aspc <- m_aspc - global_mean_ct     # ASPC niche above global
-    bgcorr_bg   <- m_bg - global_mean_ct        # non-ASPC niche above global
-    bgcorr_enrichment <- bgcorr_aspc - bgcorr_bg # ASPC-specific enrichment
+    bgcorr_aspc <- m_aspc - global_mean_ct
+    bgcorr_bg   <- m_bg - global_mean_ct
+    bgcorr_enrichment <- bgcorr_aspc - bgcorr_bg
 
     niche_bgcorr_rows[[ct]] <- data.frame(
       CellType = ct,
@@ -640,12 +754,7 @@ for (sd in sample_dirs) {
       Raw_enrichment = round(enrichment, 4),
       sample = nm, group = grp, stringsAsFactors = FALSE)
 
-    # ============================================================
-    # CONTROL 2: Random-spot permutation
-    # Draw N_PERMUTATIONS sets of random spots (same count as ASPC-hi)
-    # Compute niche around random spots → null distribution
-    # Compare ASPC niche to null → empirical p-value and Z-score
-    # ============================================================
+    # CONTROL 2
     perm_means <- numeric(N_PERMUTATIONS)
     for (p in 1:N_PERMUTATIONS) {
       rand_idx <- sample(all_spot_idx, n_aspc, replace = FALSE)
@@ -658,7 +767,6 @@ for (sd in sample_dirs) {
     perm_mean_null <- mean(perm_means)
     perm_sd_null <- sd(perm_means)
     perm_zscore <- if (perm_sd_null > 0) (m_aspc - perm_mean_null) / perm_sd_null else 0
-    # Empirical p-value: fraction of permutations >= observed (two-sided)
     perm_p_greater <- (sum(perm_means >= m_aspc) + 1) / (N_PERMUTATIONS + 1)
     perm_p_lesser  <- (sum(perm_means <= m_aspc) + 1) / (N_PERMUTATIONS + 1)
     perm_p <- 2 * min(perm_p_greater, perm_p_lesser)
@@ -795,6 +903,7 @@ for (sd in sample_dirs) {
     Mean_ASPC = round(mean(md$ASPC_1), 4),
     Mean_NEPC = round(mean(md$NEPC_composite), 4),
     Mean_AR = round(mean(md$AR_1), 4),
+    NE_like_threshold = round(NE_LIKE_THRESHOLD, 4),
     stringsAsFactors = FALSE)
 
   cat(paste0(" NE_hi=", n_ne_hi, " (", round(pct_ne_hi*100,1), "%)")  )
@@ -814,6 +923,7 @@ niche_perm_df <- bind_rows(all_niche_perm)
 lr_ct_df <- bind_rows(all_lr_niche_ct)
 lr_df <- bind_rows(all_lr_global)
 meta_df <- bind_rows(all_sample_meta)
+ne_scores_df <- bind_rows(all_ne_scores_by_group)
 
 write.csv(niche_df, file.path(out_root, "01_QC", "niche_all_samples.csv"), row.names=FALSE)
 write.csv(niche_bgcorr_df, file.path(out_root, "06_Controls", "Control1_bgcorr_niche_all_samples.csv"), row.names=FALSE)
@@ -828,6 +938,7 @@ cat(paste0("  BgCorr rows: ", nrow(niche_bgcorr_df), "\n"))
 cat(paste0("  Perm rows: ", nrow(niche_perm_df), "\n"))
 cat(paste0("  L-R per-CT rows: ", nrow(lr_ct_df), "\n"))
 cat(paste0("  L-R global rows: ", nrow(lr_df), "\n"))
+cat(paste0("  NE_like absolute threshold: ", round(NE_LIKE_THRESHOLD, 4), "\n"))
 
 if (nrow(lr_ct_df) > 0) {
   detected_rec <- unique(lr_ct_df$Receptor)
@@ -846,8 +957,6 @@ if (nrow(lr_ct_df) > 0) {
     nerve_pairs <- unique(paste0(nerve_detected$Ligand, "->", nerve_detected$Receptor))
     cat(paste0("\n  *** NERVE-SPECIFIC L-R pairs detected: ", length(nerve_pairs), " ***\n"))
     for (np in nerve_pairs) cat(paste0("    ", np, "\n"))
-  } else {
-    cat("\n  NOTE: No nerve-specific supplement L-R pairs detected\n")
   }
 }
 
@@ -865,8 +974,8 @@ if (nrow(meta_df) > 0) {
     meta_df$group %in% c("CRPC","MET") ~ "Advanced",
     TRUE ~ "Other")
 
-  cat(paste0("  NEPC classification rule: NE_like_hi spots > ",
-    NEPC_SPOT_THRESHOLD * 100, "% of total spots\n\n"))
+  cat(paste0("  NE_LIKE_THRESHOLD = ", round(NE_LIKE_THRESHOLD, 4), "\n"))
+  cat(paste0("  NEPC rule: NE_like_hi spots > ", NEPC_SPOT_THRESHOLD * 100, "%\n\n"))
   for (i in 1:nrow(meta_df)) {
     cat(paste0("    ", sprintf("%-12s", meta_df$sample[i]),
       " [", meta_df$group[i], "]",
@@ -874,10 +983,8 @@ if (nrow(meta_df) > 0) {
       " (", meta_df$Pct_NE_hi[i], "%)",
       " -> ", meta_df$NEPC_class[i], "\n"))
   }
-  cat("\n  NEPC classification summary:\n")
+  cat("\n  Summary:\n")
   print(table(meta_df$NEPC_class, meta_df$group))
-  cat(paste0("\n  NEPC_like: ", sum(meta_df$NEPC_class == "NEPC_like"), "\n"))
-  cat(paste0("  Adeno_like: ", sum(meta_df$NEPC_class == "Adeno_like"), "\n"))
   write.csv(meta_df, file.path(out_root, "01_QC", "sample_metadata_classified.csv"), row.names=FALSE)
 }
 
@@ -885,7 +992,6 @@ if (nrow(meta_df) > 0) {
 # NICHE: NEPC vs ADENO (raw)
 # ==============================================================================
 cat("\n========== NICHE: NEPC vs ADENO ==========\n\n")
-
 niche_df <- merge(niche_df, meta_df[, c("sample","NEPC_class")], by = "sample")
 
 niche_stats <- list()
@@ -903,27 +1009,16 @@ niche_stats_df$FDR <- p.adjust(niche_stats_df$P, method="BH")
 niche_stats_df <- niche_stats_df[order(-niche_stats_df$Diff), ]
 write.csv(niche_stats_df, file.path(out_root, "02_Niche", "niche_NEPC_vs_Adeno_stats.csv"), row.names=FALSE)
 
-cat("  Raw Niche around ASPC (NEPC vs Adeno):\n")
-for (i in 1:nrow(niche_stats_df)) {
-  sig <- if (!is.na(niche_stats_df$FDR[i]) && niche_stats_df$FDR[i] < 0.05) " *" else ""
-  cat(paste0("    ", sprintf("%-18s", niche_stats_df$CellType[i]),
-    " Diff=", sprintf("%+.3f", niche_stats_df$Diff[i]),
-    " FDR=", niche_stats_df$FDR[i], sig, "\n"))
-}
-
 # ==============================================================================
 # CONTROL 1: Background-corrected niche — NEPC vs ADENO
 # ==============================================================================
 cat("\n========== CONTROL 1: BACKGROUND-CORRECTED NICHE ==========\n\n")
-
 niche_bgcorr_df <- merge(niche_bgcorr_df, meta_df[, c("sample","NEPC_class")], by = "sample")
 
 bgcorr_stats <- list()
 for (ct in unique(niche_bgcorr_df$CellType)) {
-  nv <- niche_bgcorr_df$BgCorr_enrichment[niche_bgcorr_df$CellType == ct &
-    niche_bgcorr_df$NEPC_class == "NEPC_like"]
-  av <- niche_bgcorr_df$BgCorr_enrichment[niche_bgcorr_df$CellType == ct &
-    niche_bgcorr_df$NEPC_class == "Adeno_like"]
+  nv <- niche_bgcorr_df$BgCorr_enrichment[niche_bgcorr_df$CellType == ct & niche_bgcorr_df$NEPC_class == "NEPC_like"]
+  av <- niche_bgcorr_df$BgCorr_enrichment[niche_bgcorr_df$CellType == ct & niche_bgcorr_df$NEPC_class == "Adeno_like"]
   pv <- tryCatch(wilcox.test(nv, av)$p.value, error=function(e) NA_real_)
   bgcorr_stats[[ct]] <- data.frame(CellType = ct,
     BgCorr_NEPC = mean(nv, na.rm=TRUE), BgCorr_Adeno = mean(av, na.rm=TRUE),
@@ -933,46 +1028,28 @@ for (ct in unique(niche_bgcorr_df$CellType)) {
 bgcorr_stats_df <- bind_rows(bgcorr_stats)
 bgcorr_stats_df$FDR <- p.adjust(bgcorr_stats_df$P, method="BH")
 bgcorr_stats_df <- bgcorr_stats_df[order(-bgcorr_stats_df$BgCorr_Diff), ]
-write.csv(bgcorr_stats_df, file.path(out_root, "06_Controls",
-  "Control1_bgcorr_NEPC_vs_Adeno_stats.csv"), row.names=FALSE)
-
-cat("  Background-corrected niche (NEPC vs Adeno):\n")
-cat("  (ASPC-niche minus global sample average, then compare NEPC vs Adeno)\n\n")
-for (i in 1:nrow(bgcorr_stats_df)) {
-  sig <- if (!is.na(bgcorr_stats_df$FDR[i]) && bgcorr_stats_df$FDR[i] < 0.05) " *" else ""
-  cat(paste0("    ", sprintf("%-18s", bgcorr_stats_df$CellType[i]),
-    " BgCorr_Diff=", sprintf("%+.4f", bgcorr_stats_df$BgCorr_Diff[i]),
-    " FDR=", bgcorr_stats_df$FDR[i], sig, "\n"))
-}
+write.csv(bgcorr_stats_df, file.path(out_root, "06_Controls", "Control1_bgcorr_NEPC_vs_Adeno_stats.csv"), row.names=FALSE)
 
 # ==============================================================================
 # CONTROL 2: Permutation — NEPC vs ADENO
 # ==============================================================================
 cat("\n========== CONTROL 2: PERMUTATION NICHE ==========\n\n")
-
 niche_perm_df <- merge(niche_perm_df, meta_df[, c("sample","NEPC_class")], by = "sample")
 
-# Per-sample: is the ASPC niche significantly above random? (Perm_P < 0.05)
 perm_sig_summary <- niche_perm_df %>%
   group_by(CellType, NEPC_class) %>%
   summarize(
-    N_samples = n(),
-    N_sig = sum(Perm_P < 0.05, na.rm=TRUE),
+    N_samples = n(), N_sig = sum(Perm_P < 0.05, na.rm=TRUE),
     Pct_sig = round(N_sig / N_samples * 100, 1),
     Mean_Zscore = round(mean(Perm_Zscore, na.rm=TRUE), 3),
     Mean_above_null = round(mean(ASPC_above_null, na.rm=TRUE), 5),
     .groups = "drop")
+write.csv(perm_sig_summary, file.path(out_root, "06_Controls", "Control2_permutation_summary_by_class.csv"), row.names=FALSE)
 
-write.csv(perm_sig_summary, file.path(out_root, "06_Controls",
-  "Control2_permutation_summary_by_class.csv"), row.names=FALSE)
-
-# Compare permutation Z-scores between NEPC and Adeno
 perm_stats <- list()
 for (ct in unique(niche_perm_df$CellType)) {
-  nv <- niche_perm_df$Perm_Zscore[niche_perm_df$CellType == ct &
-    niche_perm_df$NEPC_class == "NEPC_like"]
-  av <- niche_perm_df$Perm_Zscore[niche_perm_df$CellType == ct &
-    niche_perm_df$NEPC_class == "Adeno_like"]
+  nv <- niche_perm_df$Perm_Zscore[niche_perm_df$CellType == ct & niche_perm_df$NEPC_class == "NEPC_like"]
+  av <- niche_perm_df$Perm_Zscore[niche_perm_df$CellType == ct & niche_perm_df$NEPC_class == "Adeno_like"]
   pv <- tryCatch(wilcox.test(nv, av)$p.value, error=function(e) NA_real_)
   perm_stats[[ct]] <- data.frame(CellType = ct,
     Zscore_NEPC = mean(nv, na.rm=TRUE), Zscore_Adeno = mean(av, na.rm=TRUE),
@@ -982,41 +1059,13 @@ for (ct in unique(niche_perm_df$CellType)) {
 perm_stats_df <- bind_rows(perm_stats)
 perm_stats_df$FDR <- p.adjust(perm_stats_df$P, method="BH")
 perm_stats_df <- perm_stats_df[order(-perm_stats_df$Zscore_Diff), ]
-write.csv(perm_stats_df, file.path(out_root, "06_Controls",
-  "Control2_permutation_NEPC_vs_Adeno_stats.csv"), row.names=FALSE)
-
-cat("  Permutation Z-scores (NEPC vs Adeno):\n")
-cat(paste0("  (", N_PERMUTATIONS, " random-spot sets per sample; Z = (ASPC - null) / SD_null)\n\n"))
-for (i in 1:nrow(perm_stats_df)) {
-  sig <- if (!is.na(perm_stats_df$FDR[i]) && perm_stats_df$FDR[i] < 0.05) " *" else ""
-  cat(paste0("    ", sprintf("%-18s", perm_stats_df$CellType[i]),
-    " Z_Diff=", sprintf("%+.3f", perm_stats_df$Zscore_Diff[i]),
-    " (NEPC Z=", sprintf("%.2f", perm_stats_df$Zscore_NEPC[i]),
-    " Adeno Z=", sprintf("%.2f", perm_stats_df$Zscore_Adeno[i]), ")",
-    " FDR=", perm_stats_df$FDR[i], sig, "\n"))
-}
-
-cat("\n  Permutation significance summary (% samples where ASPC niche > random):\n\n")
-for (cls in c("NEPC_like","Adeno_like")) {
-  sub <- perm_sig_summary[perm_sig_summary$NEPC_class == cls, , drop=FALSE]
-  if (nrow(sub) > 0) {
-    cat(paste0("    --- ", cls, " ---\n"))
-    sub <- sub[order(-sub$Mean_Zscore), , drop=FALSE]
-    for (j in 1:nrow(sub)) {
-      cat(paste0("      ", sprintf("%-18s", sub$CellType[j]),
-        " ", sub$N_sig[j], "/", sub$N_samples[j],
-        " (", sub$Pct_sig[j], "%) sig | mean Z=",
-        sprintf("%.2f", sub$Mean_Zscore[j]), "\n"))
-    }
-  }
-}
+write.csv(perm_stats_df, file.path(out_root, "06_Controls", "Control2_permutation_NEPC_vs_Adeno_stats.csv"), row.names=FALSE)
 
 # ==============================================================================
 # COMBINED NICHE VALIDATION TABLE
 # ==============================================================================
 cat("\n========== COMBINED NICHE VALIDATION ==========\n\n")
 
-# Merge raw, bgcorr, and perm stats into one table
 validation_df <- merge(
   niche_stats_df[, c("CellType","Diff","FDR")],
   bgcorr_stats_df[, c("CellType","BgCorr_Diff","FDR")],
@@ -1024,50 +1073,22 @@ validation_df <- merge(
 validation_df <- merge(validation_df,
   perm_stats_df[, c("CellType","Zscore_Diff","FDR")],
   by = "CellType")
-colnames(validation_df) <- c("CellType",
-  "Raw_Diff","Raw_FDR",
-  "BgCorr_Diff","BgCorr_FDR",
-  "Perm_Zscore_Diff","Perm_FDR")
+colnames(validation_df) <- c("CellType","Raw_Diff","Raw_FDR","BgCorr_Diff","BgCorr_FDR","Perm_Zscore_Diff","Perm_FDR")
 
-# Consensus: significant in ALL three tests?
 validation_df$Sig_raw <- !is.na(validation_df$Raw_FDR) & validation_df$Raw_FDR < 0.05
 validation_df$Sig_bgcorr <- !is.na(validation_df$BgCorr_FDR) & validation_df$BgCorr_FDR < 0.05
 validation_df$Sig_perm <- !is.na(validation_df$Perm_FDR) & validation_df$Perm_FDR < 0.05
 validation_df$Consensus <- validation_df$Sig_raw & validation_df$Sig_bgcorr & validation_df$Sig_perm
-# Direction consistent?
 validation_df$Direction_consistent <-
   sign(validation_df$Raw_Diff) == sign(validation_df$BgCorr_Diff) &
   sign(validation_df$Raw_Diff) == sign(validation_df$Perm_Zscore_Diff)
 validation_df$Validated <- validation_df$Consensus & validation_df$Direction_consistent
 
 validation_df <- validation_df[order(-validation_df$Raw_Diff), ]
-write.csv(validation_df, file.path(out_root, "06_Controls",
-  "Niche_validation_raw_bgcorr_perm.csv"), row.names=FALSE)
+write.csv(validation_df, file.path(out_root, "06_Controls", "Niche_validation_raw_bgcorr_perm.csv"), row.names=FALSE)
 
-cat("  Combined validation (Raw + BgCorr + Permutation):\n\n")
-cat(paste0("  ", sprintf("%-18s", "CellType"),
-  sprintf("%8s", "Raw_D"), sprintf("%8s", "BgC_D"), sprintf("%8s", "PermZ_D"),
-  sprintf("%7s", "R_FDR"), sprintf("%7s", "B_FDR"), sprintf("%7s", "P_FDR"),
-  "  Valid?\n"))
-cat(paste0("  ", paste(rep("-", 75), collapse=""), "\n"))
-for (i in 1:nrow(validation_df)) {
-  vflag <- if (validation_df$Validated[i]) " <<<" else ""
-  cat(paste0("  ", sprintf("%-18s", validation_df$CellType[i]),
-    sprintf("%+8.3f", validation_df$Raw_Diff[i]),
-    sprintf("%+8.4f", validation_df$BgCorr_Diff[i]),
-    sprintf("%+8.3f", validation_df$Perm_Zscore_Diff[i]),
-    sprintf("%7.3f", validation_df$Raw_FDR[i]),
-    sprintf("%7.3f", validation_df$BgCorr_FDR[i]),
-    sprintf("%7.3f", validation_df$Perm_FDR[i]),
-    vflag, "\n"))
-}
 n_valid <- sum(validation_df$Validated)
-cat(paste0("\n  Validated cell types (FDR < 0.05 in all 3, consistent direction): ",
-  n_valid, " / ", nrow(validation_df), "\n"))
-if (n_valid > 0) {
-  valid_cts <- validation_df$CellType[validation_df$Validated]
-  cat(paste0("    ", paste(valid_cts, collapse = ", "), "\n"))
-}
+valid_cts <- if (n_valid > 0) validation_df$CellType[validation_df$Validated] else character(0)
 
 # ==============================================================================
 # L-R PER NICHE CT: NEPC vs ADENO
@@ -1095,17 +1116,13 @@ lr_ct_wide <- lr_ct_agg %>%
     values_from = c(M_int_near, M_int_enrich, M_lig_near, M_rec_aspc),
     values_fill = 0)
 
-if ("M_int_near_NEPC_like" %in% colnames(lr_ct_wide) &&
-    "M_int_near_Adeno_like" %in% colnames(lr_ct_wide))
+if ("M_int_near_NEPC_like" %in% colnames(lr_ct_wide) && "M_int_near_Adeno_like" %in% colnames(lr_ct_wide))
   lr_ct_wide$Int_Diff <- lr_ct_wide$M_int_near_NEPC_like - lr_ct_wide$M_int_near_Adeno_like
-if ("M_int_enrich_NEPC_like" %in% colnames(lr_ct_wide) &&
-    "M_int_enrich_Adeno_like" %in% colnames(lr_ct_wide))
+if ("M_int_enrich_NEPC_like" %in% colnames(lr_ct_wide) && "M_int_enrich_Adeno_like" %in% colnames(lr_ct_wide))
   lr_ct_wide$Enrich_Diff <- lr_ct_wide$M_int_enrich_NEPC_like - lr_ct_wide$M_int_enrich_Adeno_like
-if ("M_lig_near_NEPC_like" %in% colnames(lr_ct_wide) &&
-    "M_lig_near_Adeno_like" %in% colnames(lr_ct_wide))
+if ("M_lig_near_NEPC_like" %in% colnames(lr_ct_wide) && "M_lig_near_Adeno_like" %in% colnames(lr_ct_wide))
   lr_ct_wide$Lig_Diff <- lr_ct_wide$M_lig_near_NEPC_like - lr_ct_wide$M_lig_near_Adeno_like
-if ("M_rec_aspc_NEPC_like" %in% colnames(lr_ct_wide) &&
-    "M_rec_aspc_Adeno_like" %in% colnames(lr_ct_wide))
+if ("M_rec_aspc_NEPC_like" %in% colnames(lr_ct_wide) && "M_rec_aspc_Adeno_like" %in% colnames(lr_ct_wide))
   lr_ct_wide$Rec_Diff <- lr_ct_wide$M_rec_aspc_NEPC_like - lr_ct_wide$M_rec_aspc_Adeno_like
 
 lr_ct_wide$LR_pair <- paste0(lr_ct_wide$Ligand, "->", lr_ct_wide$Receptor)
@@ -1127,9 +1144,7 @@ lr_ct_wide <- merge(lr_ct_wide, lr_ct_stats_df, by=c("Ligand","Receptor","Source
 if ("Enrich_Diff" %in% colnames(lr_ct_wide))
   lr_ct_wide <- lr_ct_wide[order(-lr_ct_wide$Enrich_Diff), , drop=FALSE]
 rownames(lr_ct_wide) <- NULL
-
 write.csv(lr_ct_wide, file.path(out_root, "03_LR", "LR_per_niche_CT_NEPC_vs_Adeno.csv"), row.names=FALSE)
-cat(paste0("  L-R x CT combos: ", nrow(lr_ct_wide), "\n"))
 
 # ==============================================================================
 # L-R GLOBAL (best source): NEPC vs ADENO
@@ -1154,14 +1169,11 @@ lr_global_wide <- lr_global_agg %>%
     values_from = c(M_lig, M_rec, M_int),
     values_fill = 0)
 
-if ("M_int_NEPC_like" %in% colnames(lr_global_wide) &&
-    "M_int_Adeno_like" %in% colnames(lr_global_wide))
+if ("M_int_NEPC_like" %in% colnames(lr_global_wide) && "M_int_Adeno_like" %in% colnames(lr_global_wide))
   lr_global_wide$Int_Diff <- lr_global_wide$M_int_NEPC_like - lr_global_wide$M_int_Adeno_like
-if ("M_lig_NEPC_like" %in% colnames(lr_global_wide) &&
-    "M_lig_Adeno_like" %in% colnames(lr_global_wide))
+if ("M_lig_NEPC_like" %in% colnames(lr_global_wide) && "M_lig_Adeno_like" %in% colnames(lr_global_wide))
   lr_global_wide$Lig_Diff <- lr_global_wide$M_lig_NEPC_like - lr_global_wide$M_lig_Adeno_like
-if ("M_rec_NEPC_like" %in% colnames(lr_global_wide) &&
-    "M_rec_Adeno_like" %in% colnames(lr_global_wide))
+if ("M_rec_NEPC_like" %in% colnames(lr_global_wide) && "M_rec_Adeno_like" %in% colnames(lr_global_wide))
   lr_global_wide$Rec_Diff <- lr_global_wide$M_rec_NEPC_like - lr_global_wide$M_rec_Adeno_like
 
 lr_src <- lr_df %>% group_by(Ligand, Receptor) %>%
@@ -1172,10 +1184,8 @@ lr_global_wide$LR_pair <- paste0(lr_global_wide$Ligand, "->", lr_global_wide$Rec
 lr_g_stats <- list()
 for (i in 1:nrow(lr_global_wide)) {
   lig <- lr_global_wide$Ligand[i]; rec <- lr_global_wide$Receptor[i]
-  nv <- lr_df$Interaction[lr_df$Ligand == lig & lr_df$Receptor == rec &
-    lr_df$NEPC_class == "NEPC_like"]
-  av <- lr_df$Interaction[lr_df$Ligand == lig & lr_df$Receptor == rec &
-    lr_df$NEPC_class == "Adeno_like"]
+  nv <- lr_df$Interaction[lr_df$Ligand == lig & lr_df$Receptor == rec & lr_df$NEPC_class == "NEPC_like"]
+  av <- lr_df$Interaction[lr_df$Ligand == lig & lr_df$Receptor == rec & lr_df$NEPC_class == "Adeno_like"]
   pv <- tryCatch(wilcox.test(nv, av)$p.value, error=function(e) NA_real_)
   lr_g_stats[[i]] <- data.frame(Ligand=lig, Receptor=rec, P=pv, stringsAsFactors=FALSE)
 }
@@ -1186,7 +1196,6 @@ lr_global_wide <- merge(lr_global_wide, lr_g_stats_df, by=c("Ligand","Receptor")
 if ("Int_Diff" %in% colnames(lr_global_wide))
   lr_global_wide <- lr_global_wide[order(-lr_global_wide$Int_Diff), , drop=FALSE]
 rownames(lr_global_wide) <- NULL
-
 write.csv(lr_global_wide, file.path(out_root, "03_LR", "LR_global_NEPC_vs_Adeno.csv"), row.names=FALSE)
 
 top_nepc_lr <- lr_global_wide[!is.na(lr_global_wide$Int_Diff) & lr_global_wide$Int_Diff > 0, , drop=FALSE]
@@ -1194,35 +1203,10 @@ top_nepc_lr <- top_nepc_lr[order(-top_nepc_lr$Int_Diff), , drop=FALSE]
 top_adeno_lr <- lr_global_wide[!is.na(lr_global_wide$Int_Diff) & lr_global_wide$Int_Diff < 0, , drop=FALSE]
 top_adeno_lr <- top_adeno_lr[order(top_adeno_lr$Int_Diff), , drop=FALSE]
 
-cat("  Top 25 NEPC-enriched L-R (CellChat + Nerve supplement):\n")
-for (i in 1:min(25, nrow(top_nepc_lr))) {
-  sig <- if (!is.na(top_nepc_lr$FDR[i]) && top_nepc_lr$FDR[i] < 0.05) " *" else ""
-  pw <- if ("Pathway" %in% colnames(top_nepc_lr) && !is.na(top_nepc_lr$Pathway[i]))
-    paste0(" {", top_nepc_lr$Pathway[i], "}") else ""
-  nerve_flag <- if (!is.na(top_nepc_lr$Annotation[i]) &&
-    grepl("Nerve|curated", top_nepc_lr$Annotation[i], ignore.case=TRUE)) " [NERVE]" else ""
-  cat(paste0("    ", sprintf("%2d", i), ". ",
-    top_nepc_lr$Ligand[i], "->", top_nepc_lr$Receptor[i],
-    " [", top_nepc_lr$Best_source[i], "]", pw, nerve_flag,
-    " Int_D=+", round(top_nepc_lr$Int_Diff[i], 4),
-    " FDR=", top_nepc_lr$FDR[i], sig, "\n"))
-}
-
-cat("\n  Top 15 Adeno-enriched L-R (lost in NEPC):\n")
-for (i in 1:min(15, nrow(top_adeno_lr))) {
-  pw <- if ("Pathway" %in% colnames(top_adeno_lr) && !is.na(top_adeno_lr$Pathway[i]))
-    paste0(" {", top_adeno_lr$Pathway[i], "}") else ""
-  cat(paste0("    ", sprintf("%2d", i), ". ",
-    top_adeno_lr$Ligand[i], "->", top_adeno_lr$Receptor[i],
-    " [", top_adeno_lr$Best_source[i], "]", pw,
-    " Int_D=", round(top_adeno_lr$Int_Diff[i], 4), "\n"))
-}
-
 # --- Pathway summary ---
 pw_summary <- NULL
 if ("Pathway" %in% colnames(lr_global_wide) && "Int_Diff" %in% colnames(lr_global_wide)) {
-  pw_valid <- lr_global_wide[!is.na(lr_global_wide$Pathway) &
-    !is.na(lr_global_wide$Int_Diff), , drop=FALSE]
+  pw_valid <- lr_global_wide[!is.na(lr_global_wide$Pathway) & !is.na(lr_global_wide$Int_Diff), , drop=FALSE]
   if (nrow(pw_valid) > 0) {
     pw_m <- aggregate(pw_valid$Int_Diff, by=list(Pathway=pw_valid$Pathway), FUN=mean, na.rm=TRUE)
     pw_n <- aggregate(pw_valid$Int_Diff, by=list(Pathway=pw_valid$Pathway), FUN=length)
@@ -1230,33 +1214,6 @@ if ("Pathway" %in% colnames(lr_global_wide) && "Int_Diff" %in% colnames(lr_globa
       N_pairs=pw_n$x, stringsAsFactors=FALSE)
     pw_summary <- pw_summary[order(-pw_summary$Mean_Diff), , drop=FALSE]
     write.csv(pw_summary, file.path(out_root, "03_LR", "LR_pathway_NEPC_vs_Adeno.csv"), row.names=FALSE)
-
-    cat("\n  Pathways ranked by NEPC enrichment:\n")
-    for (i in 1:min(30, nrow(pw_summary))) {
-      nerve_flag <- if (pw_summary$Pathway[i] %in% nerve_pws) " <<NERVE>>" else ""
-      cat(paste0("    ", sprintf("%2d", i), ". ", pw_summary$Pathway[i], nerve_flag,
-        " Diff=", sprintf("%+.4f", pw_summary$Mean_Diff[i]),
-        " (n=", pw_summary$N_pairs[i], ")\n"))
-    }
-  }
-}
-
-# --- Per-niche-CT top pairs ---
-cat("\n  Top L-R per niche cell type (NEPC-enriched):\n")
-if ("Enrich_Diff" %in% colnames(lr_ct_wide)) {
-  for (ct in unique(lr_ct_wide$Source_CT)) {
-    sub <- lr_ct_wide[lr_ct_wide$Source_CT == ct & !is.na(lr_ct_wide$Enrich_Diff) &
-      lr_ct_wide$Enrich_Diff > 0, , drop=FALSE]
-    sub <- sub[order(-sub$Enrich_Diff), , drop=FALSE]
-    if (nrow(sub) > 0) {
-      cat(paste0("    --- ", ct, " (", nrow(sub), " NEPC-enriched pairs) ---\n"))
-      for (i in 1:min(5, nrow(sub))) {
-        pw <- if ("Pathway" %in% colnames(sub) && !is.na(sub$Pathway[i]))
-          paste0(" {", sub$Pathway[i], "}") else ""
-        cat(paste0("      ", sub$Ligand[i], "->", sub$Receptor[i], pw,
-          " Enrich_D=+", round(sub$Enrich_Diff[i], 3), "\n"))
-      }
-    }
   }
 }
 
@@ -1305,8 +1262,8 @@ if (nrow(niche_stats_df) >= 3) {
     theme_pub(10) +
     labs(title = "Niche Cells Around ASPC: NEPC vs Adenocarcinoma",
       subtitle = paste0("* = FDR < 0.05 | NEPC = NE_like_hi > ",
-        NEPC_SPOT_THRESHOLD*100, "% | Raw enrichment"), x = "",
-      y = "NEPC - Adeno Enrichment (log2FC)")
+        NEPC_SPOT_THRESHOLD*100, "% | Raw enrichment"),
+      x = "", y = "NEPC - Adeno Enrichment (log2FC)")
   save_fig(p1, "Fig1_niche_NEPC_vs_Adeno_raw", w = 9, h = clamp_h(nrow(niche_stats_df) * 0.45, 5, 12))
 }
 
@@ -1344,7 +1301,7 @@ if (nrow(perm_stats_df) >= 3) {
   save_fig(p1c, "Fig1c_Control2_permutation_niche", w = 9, h = clamp_h(nrow(perm_stats_df) * 0.45, 5, 12))
 }
 
-# --- Fig 1d: Validation comparison (3 panels side by side) ---
+# --- Fig 1d: Validation comparison (3 panels) ---
 if (nrow(validation_df) >= 3) {
   val_long <- validation_df %>%
     select(CellType, Raw_Diff, BgCorr_Diff, Perm_Zscore_Diff, Validated) %>%
@@ -1354,10 +1311,8 @@ if (nrow(validation_df) >= 3) {
       "Raw_Diff" = "Raw",
       "BgCorr_Diff" = "BgCorrected",
       "Perm_Zscore_Diff" = "Permutation Z"))
-
   val_long$Method <- factor(val_long$Method, levels = c("Raw","BgCorrected","Permutation Z"))
   val_long$Direction <- ifelse(val_long$Value > 0, "NEPC > Adeno", "Adeno > NEPC")
-  val_long$Label <- ifelse(val_long$Validated, paste0(val_long$CellType, " *"), val_long$CellType)
 
   p1d <- ggplot(val_long, aes(x = reorder(CellType, Value), y = Value, fill = Direction)) +
     geom_col(width = 0.6, alpha = 0.9) + coord_flip() +
@@ -1518,6 +1473,141 @@ if (nrow(niche_df) >= 10) {
   save_fig(p7, "Fig7_niche_boxplot", w = 10, h = 6)
 }
 
+# --- Fig 8: NE_like Score Violin by Disease Group (v2 diagnostic) ---
+if (nrow(ne_scores_df) > 100) {
+  ne_scores_df$group <- factor(ne_scores_df$group, levels = c("BPH","TRNA","NEADT","CRPC","MET"))
+  p8 <- ggplot(ne_scores_df, aes(x = group, y = NE_like_score, fill = group)) +
+    geom_violin(alpha = 0.7, scale = "width") +
+    geom_boxplot(width = 0.15, outlier.size = 0.3, alpha = 0.8) +
+    geom_hline(yintercept = NE_LIKE_THRESHOLD, linetype = "dashed",
+      color = "red", linewidth = 0.8) +
+    annotate("text", x = 5.4, y = NE_LIKE_THRESHOLD,
+      label = paste0("NE_like threshold = ", round(NE_LIKE_THRESHOLD, 3)),
+      hjust = 1, vjust = -0.5, color = "red", size = 3.5, fontface = "bold") +
+    scale_fill_brewer(palette = "Set2", name = "Group") +
+    theme_pub(10) +
+    labs(title = "NE_like Module Score Distribution by Disease Group",
+      subtitle = paste0("Absolute threshold from NEADT calibration | ",
+        "BPH noise is below cutoff"),
+      x = "Disease Group", y = "NE_like Module Score")
+  save_fig(p8, "Fig8_NE_like_score_violin_by_group", w = 9, h = 6)
+}
+
+# --- Fig 9: % NE_hi Spots per Sample, colored by group ---
+if (nrow(meta_df) >= 5) {
+  meta_df_sorted <- meta_df[order(meta_df$Pct_NE_hi, decreasing = TRUE), ]
+  meta_df_sorted$sample <- factor(meta_df_sorted$sample, levels = meta_df_sorted$sample)
+  p9 <- ggplot(meta_df_sorted, aes(x = sample, y = Pct_NE_hi, fill = group)) +
+    geom_col(width = 0.7, alpha = 0.9) +
+    geom_hline(yintercept = NEPC_SPOT_THRESHOLD * 100, linetype = "dashed",
+      color = "red", linewidth = 0.6) +
+    annotate("text", x = nrow(meta_df_sorted), y = NEPC_SPOT_THRESHOLD * 100,
+      label = paste0(NEPC_SPOT_THRESHOLD*100, "% threshold"),
+      hjust = 1, vjust = -0.5, color = "red", size = 3) +
+    scale_fill_brewer(palette = "Set1", name = "Group") +
+    theme_pub(7) +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6)) +
+    labs(title = "% NE_like-High Spots per Sample (Absolute Threshold)",
+      subtitle = paste0("NE_LIKE_THRESHOLD = ", round(NE_LIKE_THRESHOLD, 3),
+        " (calibrated from NEADT)"),
+      x = "", y = "% NE_like_hi Spots")
+  save_fig(p9, "Fig9_Pct_NE_hi_per_sample", w = 14, h = 6)
+}
+
+# --- Fig 10: Calibration diagnostic — NEADT NE_like score histogram ---
+if (length(calib_ne_per_sample) > 0) {
+  calib_plot_df <- bind_rows(lapply(names(calib_ne_per_sample), function(nm) {
+    data.frame(NE_score = calib_ne_per_sample[[nm]], sample = nm, stringsAsFactors = FALSE)
+  }))
+  p10 <- ggplot(calib_plot_df, aes(x = NE_score, fill = sample)) +
+    geom_histogram(bins = 60, alpha = 0.6, position = "identity") +
+    geom_vline(xintercept = NE_LIKE_THRESHOLD, linetype = "dashed",
+      color = "red", linewidth = 1) +
+    annotate("text", x = NE_LIKE_THRESHOLD, y = Inf,
+      label = paste0("Threshold = ", round(NE_LIKE_THRESHOLD, 3), "\n(75th pctl)"),
+      hjust = -0.1, vjust = 1.5, color = "red", size = 3.5, fontface = "bold") +
+    scale_fill_brewer(palette = "Set2", name = "NEADT Sample") +
+    theme_pub(10) +
+    labs(title = "NE_like Threshold Calibration from NEADT Samples",
+      subtitle = paste0("Histogram of NE_like module scores | ",
+        length(calib_ne_per_sample), " NEADT samples used"),
+      x = "NE_like Module Score", y = "Number of Spots")
+  save_fig(p10, "Fig10_NE_calibration_histogram", w = 10, h = 6)
+}
+
+# --- Fig 11: Niche enrichment per-sample heatmap ---
+if (nrow(niche_df) >= 10) {
+  niche_hm <- niche_df %>%
+    group_by(sample, CellType) %>%
+    summarize(Enrichment = mean(Enrichment, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = CellType, values_from = Enrichment, values_fill = 0)
+  niche_hm_mat <- as.data.frame(niche_hm); rownames(niche_hm_mat) <- niche_hm_mat$sample
+  niche_hm_mat$sample <- NULL
+
+  # Add row annotation for NEPC class
+  row_ann <- meta_df[match(rownames(niche_hm_mat), meta_df$sample), c("group","NEPC_class")]
+  rownames(row_ann) <- rownames(niche_hm_mat)
+  ann_colors <- list(
+    group = c("BPH"="#E41A1C","TRNA"="#377EB8","NEADT"="#4DAF4A","CRPC"="#984EA3","MET"="#FF7F00"),
+    NEPC_class = c("NEPC_like"="#8E44AD","Adeno_like"="#2980B9"))
+
+  mx2 <- max(abs(as.matrix(niche_hm_mat)), na.rm=TRUE); if(mx2==0) mx2 <- 1
+  brk2 <- seq(-mx2, mx2, length.out=51)
+  tryCatch({
+    png(file.path(out_root, "05_Figures", "Fig11_niche_per_sample_heatmap.png"),
+      w=2400, h=1800, res=200)
+    pheatmap(as.matrix(niche_hm_mat),
+      color = colorRampPalette(c("#2980B9","white","#8E44AD"))(50), breaks=brk2,
+      annotation_row = row_ann, annotation_colors = ann_colors,
+      main = "Niche Enrichment per Sample (all cell types)",
+      fontsize=8, border_color="grey90", clustering_method="ward.D2",
+      show_rownames=TRUE, show_colnames=TRUE)
+    dev.off()
+    cat("  Saved: Fig11_niche_per_sample_heatmap.png\n")
+  }, error = function(e) cat(paste0("  Heatmap error: ", e$message, "\n")))
+}
+
+# --- Fig 12: Top L-R dot plot by source cell type ---
+if (nrow(lr_ct_wide) >= 5 && "Enrich_Diff" %in% colnames(lr_ct_wide)) {
+  top_lr_ct <- lr_ct_wide[!is.na(lr_ct_wide$Enrich_Diff) & lr_ct_wide$Enrich_Diff > 0, , drop=FALSE]
+  top_lr_ct <- head(top_lr_ct[order(-top_lr_ct$Enrich_Diff), ], 40)
+  if (nrow(top_lr_ct) >= 5) {
+    top_lr_ct$Label <- paste0(top_lr_ct$Ligand, "->", top_lr_ct$Receptor)
+    p12 <- ggplot(top_lr_ct, aes(x = Source_CT, y = reorder(Label, Enrich_Diff))) +
+      geom_point(aes(size = abs(Enrich_Diff), color = Enrich_Diff), alpha = 0.8) +
+      scale_color_gradient2(low = "#2980B9", mid = "grey90", high = "#8E44AD",
+        midpoint = 0, name = "Enrich\nDiff") +
+      scale_size_continuous(range = c(1, 6), name = "|Diff|") +
+      theme_pub(7) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+      labs(title = "Top NEPC-Enriched L-R Pairs by Source Cell Type",
+        subtitle = "Size = |enrichment difference| | Color = direction",
+        x = "Source Cell Type", y = "Ligand -> Receptor")
+    save_fig(p12, "Fig12_LR_dotplot_by_source_CT", w = 12,
+      h = clamp_h(nrow(top_lr_ct) * 0.3, 6, 18))
+  }
+}
+
+# --- Fig 13: NEPC composite vs AR score scatter ---
+if (nrow(meta_df) >= 5 && "Mean_NEPC" %in% colnames(meta_df) && "Mean_AR" %in% colnames(meta_df)) {
+  p13 <- ggplot(meta_df, aes(x = Mean_AR, y = Mean_NEPC, color = group, shape = NEPC_class)) +
+    geom_point(size = 3.5, alpha = 0.8) +
+    geom_text_repel(aes(label = sample), size = 2.2, max.overlaps = 15) +
+    scale_color_brewer(palette = "Set1", name = "Group") +
+    scale_shape_manual(values = c("NEPC_like" = 17, "Adeno_like" = 16), name = "Class") +
+    geom_hline(yintercept = 0, linetype = "dotted", alpha = 0.3) +
+    geom_vline(xintercept = 0, linetype = "dotted", alpha = 0.3) +
+    theme_pub(10) +
+    labs(title = "NEPC Composite vs AR Score per Sample",
+      subtitle = "NEPC = NEPC_UP - NEPC_DN | AR = Hallmark Androgen Response",
+      x = "Mean Hallmark AR Score", y = "Mean NEPC Composite Score") +
+    annotate("text", x = -Inf, y = Inf, label = "High NEPC\nLow AR",
+      hjust = -0.1, vjust = 1.3, color = "#8E44AD", size = 3, fontface = "bold") +
+    annotate("text", x = Inf, y = -Inf, label = "Low NEPC\nHigh AR",
+      hjust = 1.1, vjust = -0.3, color = "#2980B9", size = 3, fontface = "bold")
+  save_fig(p13, "Fig13_NEPC_vs_AR_scatter", w = 10, h = 7)
+}
+
 # ==============================================================================
 # SUMMARY REPORT
 # ==============================================================================
@@ -1527,38 +1617,25 @@ sink(file.path(out_root, "04_NEPC_vs_Adeno", "SUMMARY_REPORT.txt"))
 cat("================================================================\n")
 cat("  NICHE -> ASPC L-R ANALYSIS (GENE READOUT)\n")
 cat("  NEPC vs ADENOCARCINOMA\n")
+cat("  v2: Absolute NE_like threshold calibrated from NEADT\n")
 cat("  L-R Database: CellChat + Curated Nerve Supplement\n")
 cat("  With Background-Correction and Permutation Controls\n")
 cat("================================================================\n\n")
 
 cat("NEPC CLASSIFICATION:\n")
-cat(paste0("  Rule: NE_like_hi spots > ", NEPC_SPOT_THRESHOLD * 100,
-  "% of total spots in a sample\n"))
-cat("  NE_like_hi = spots with NE_like module score >= 75th percentile\n")
+cat(paste0("  Rule: NE_like_hi spots > ", NEPC_SPOT_THRESHOLD * 100, "% of total spots\n"))
+cat(paste0("  NE_LIKE_THRESHOLD = ", round(NE_LIKE_THRESHOLD, 4),
+  " (calibrated from NEADT, 75th percentile)\n"))
+cat("  NE_like_hi = spots with NE_like module score >= threshold\n")
 cat("  NE_like signature: SYP, CHGA, CHGB, ENO2, NCAM1, ASCL1, INSM1\n\n")
 
 cat("CONTROLS:\n")
 cat("  Control 1: Background-corrected niche enrichment\n")
-cat("    = ASPC-niche CT score - Global sample average CT score\n")
-cat("    Removes tissue composition confounding\n\n")
+cat("    = ASPC-niche CT score - Global sample average CT score\n\n")
 cat(paste0("  Control 2: Random-spot permutation (", N_PERMUTATIONS, " iterations)\n"))
-cat("    = For each sample, draw random spots (same N as ASPC-hi)\n")
-cat("    Compute niche around random spots → null distribution\n")
-cat("    Z-score = (ASPC niche - null mean) / null SD\n")
-cat("    Empirical p-value from permutation distribution\n\n")
-
-cat("METHOD:\n")
-cat("  - CellChat + curated nerve supplement L-R database\n")
-cat("  - LIGAND readout: expression in niche CT-high spots near ASPC\n")
-cat("  - RECEPTOR readout: expression in ASPC-high spots\n")
-cat("  - Interaction = Ligand(niche CT) x Receptor(ASPC)\n\n")
+cat("    Z-score = (ASPC niche - null mean) / null SD\n\n")
 
 cat(paste0("Samples: ", nrow(meta_df), "\n"))
-cat(paste0("  BPH: ", sum(meta_df$group == "BPH"), "\n"))
-cat(paste0("  TRNA: ", sum(meta_df$group == "TRNA"), "\n"))
-cat(paste0("  NEADT: ", sum(meta_df$group == "NEADT"), "\n"))
-cat(paste0("  CRPC: ", sum(meta_df$group == "CRPC"), "\n"))
-cat(paste0("  MET: ", sum(meta_df$group == "MET"), "\n"))
 cat(paste0("  NEPC_like: ", sum(meta_df$NEPC_class == "NEPC_like"), "\n"))
 cat(paste0("  Adeno_like: ", sum(meta_df$NEPC_class == "Adeno_like"), "\n"))
 
@@ -1571,14 +1648,7 @@ for (i in 1:nrow(meta_df)) {
     " -> ", meta_df$NEPC_class[i], "\n"))
 }
 
-cat("\n\n================================================================\n")
-cat("  NICHE VALIDATION: RAW vs BACKGROUND-CORRECTED vs PERMUTATION\n")
-cat("================================================================\n\n")
-cat(paste0(sprintf("%-18s", "CellType"),
-  sprintf("%8s", "Raw_D"), sprintf("%8s", "BgC_D"), sprintf("%8s", "PermZ_D"),
-  sprintf("%7s", "R_FDR"), sprintf("%7s", "B_FDR"), sprintf("%7s", "P_FDR"),
-  "  Validated?\n"))
-cat(paste(rep("-", 75), collapse=""), "\n")
+cat("\n\nNICHE VALIDATION TABLE:\n\n")
 for (i in 1:nrow(validation_df)) {
   vflag <- if (validation_df$Validated[i]) "  YES <<<" else "  no"
   cat(paste0(sprintf("%-18s", validation_df$CellType[i]),
@@ -1590,29 +1660,17 @@ for (i in 1:nrow(validation_df)) {
     sprintf("%7.3f", validation_df$Perm_FDR[i]),
     vflag, "\n"))
 }
-cat(paste0("\nValidated (FDR<0.05 in all 3, consistent direction): ",
-  n_valid, "/", nrow(validation_df), "\n"))
-if (n_valid > 0)
-  cat(paste0("  ", paste(valid_cts, collapse = ", "), "\n"))
-
-cat("\n\nRAW NICHE (NEPC vs Adeno):\n\n")
-for (i in 1:nrow(niche_stats_df)) {
-  sig <- if (!is.na(niche_stats_df$FDR[i]) && niche_stats_df$FDR[i] < 0.05) " *" else ""
-  cat(paste0("  ", sprintf("%-18s", niche_stats_df$CellType[i]),
-    " Diff=", sprintf("%+.3f", niche_stats_df$Diff[i]),
-    " FDR=", niche_stats_df$FDR[i], sig, "\n"))
-}
+cat(paste0("\nValidated: ", n_valid, "/", nrow(validation_df), "\n"))
+if (n_valid > 0) cat(paste0("  ", paste(valid_cts, collapse = ", "), "\n"))
 
 cat("\n\nTOP 30 NEPC-ENRICHED L-R:\n\n")
 for (i in 1:min(30, nrow(top_nepc_lr))) {
   sig <- if (!is.na(top_nepc_lr$FDR[i]) && top_nepc_lr$FDR[i] < 0.05) " *" else ""
   pw <- if ("Pathway" %in% colnames(top_nepc_lr) && !is.na(top_nepc_lr$Pathway[i]))
     paste0(" {", top_nepc_lr$Pathway[i], "}") else ""
-  nerve_flag <- if (!is.na(top_nepc_lr$Annotation[i]) &&
-    grepl("Nerve|curated", top_nepc_lr$Annotation[i], ignore.case=TRUE)) " [NERVE]" else ""
   cat(paste0("  ", sprintf("%2d", i), ". ",
     top_nepc_lr$Ligand[i], "->", top_nepc_lr$Receptor[i],
-    " [", top_nepc_lr$Best_source[i], "]", pw, nerve_flag,
+    " [", top_nepc_lr$Best_source[i], "]", pw,
     " Int_D=+", round(top_nepc_lr$Int_Diff[i], 4),
     " FDR=", top_nepc_lr$FDR[i], sig, "\n"))
 }
@@ -1627,16 +1685,6 @@ for (i in 1:min(20, nrow(top_adeno_lr))) {
     " Int_D=", round(top_adeno_lr$Int_Diff[i], 4), "\n"))
 }
 
-if (!is.null(pw_summary)) {
-  cat("\n\nPATHWAYS (NEPC enrichment):\n\n")
-  for (i in 1:nrow(pw_summary)) {
-    nerve_flag <- if (pw_summary$Pathway[i] %in% nerve_pws) " <<NERVE>>" else ""
-    cat(paste0("  ", sprintf("%2d",i), ". ", pw_summary$Pathway[i], nerve_flag,
-      " Diff=", sprintf("%+.4f", pw_summary$Mean_Diff[i]),
-      " (n=", pw_summary$N_pairs[i], ")\n"))
-  }
-}
-
 cat("\n================================================================\n")
 sink()
 cat("  Summary report saved\n")
@@ -1645,26 +1693,38 @@ cat("  Summary report saved\n")
 # FINAL
 # ==============================================================================
 cat("\n##############################################################\n")
-cat("  PIPELINE COMPLETE\n")
+cat("  PIPELINE COMPLETE (v2: absolute NE threshold + figures)\n")
 cat(paste0("  Output: ", out_root, "\n\n"))
 cat("  KEY FEATURES:\n")
-cat(paste0("    - NEPC classification: NE_like_hi > ",
-  NEPC_SPOT_THRESHOLD*100, "% of spots\n"))
-cat("    - CellChat + curated nerve-specific L-R supplement\n")
-cat("    - Control 1: Background-corrected niche (tissue composition removed)\n")
-cat(paste0("    - Control 2: Random-spot permutation (", N_PERMUTATIONS, " iterations)\n"))
-cat("    - Combined validation table (Raw + BgCorr + Perm)\n")
-cat(paste0("    - Validated cell types: ", n_valid, "/", nrow(validation_df), "\n"))
-if (n_valid > 0)
-  cat(paste0("      ", paste(valid_cts, collapse = ", "), "\n"))
+cat(paste0("    - NE_LIKE_THRESHOLD = ", round(NE_LIKE_THRESHOLD, 4),
+  " (calibrated from NEADT)\n"))
 cat(paste0("    - NEPC_like: ", sum(meta_df$NEPC_class == "NEPC_like"), " samples\n"))
-cat(paste0("    - Adeno_like: ", sum(meta_df$NEPC_class == "Adeno_like"), " samples\n\n"))
-cat("  Files:\n")
-for (d in c("01_QC","02_Niche","03_LR","04_NEPC_vs_Adeno","05_Figures","06_Controls")) {
-  fls <- list.files(file.path(out_root, d))
-  for (f in fls) {
-    sz <- round(file.info(file.path(out_root, d, f))$size / 1024, 1)
-    cat(paste0("    ", d, "/", sprintf("%-50s", f), " (", sz, " KB)\n"))
-  }
+cat(paste0("    - Adeno_like: ", sum(meta_df$NEPC_class == "Adeno_like"), " samples\n"))
+cat(paste0("    - Validated cell types: ", n_valid, "/", nrow(validation_df), "\n"))
+cat("    - Control 1: Background-corrected niche\n")
+cat(paste0("    - Control 2: Permutation (", N_PERMUTATIONS, " iterations)\n"))
+cat("\n  FIGURES (05_Figures/):\n")
+cat("    Fig1   — Niche NEPC vs Adeno (raw enrichment)\n")
+cat("    Fig1b  — Control 1: Background-corrected niche\n")
+cat("    Fig1c  — Control 2: Permutation Z-scores\n")
+cat("    Fig1d  — 3-panel validation comparison\n")
+cat("    Fig2   — Top L-R pairs barplot (NEPC vs Adeno)\n")
+cat("    Fig3   — Ligand vs Receptor scatter\n")
+cat("    Fig4   — Source CT x Receptor heatmap\n")
+cat("    Fig5   — Pathway enrichment barplot\n")
+cat("    Fig6   — Sample classification scatter\n")
+cat("    Fig7   — Niche boxplot by NEPC class\n")
+cat("    Fig8   — NE_like score violin by disease group\n")
+cat("    Fig9   — % NE_hi spots per sample barplot\n")
+cat("    Fig10  — NE threshold calibration histogram\n")
+cat("    Fig11  — Niche enrichment per-sample heatmap\n")
+cat("    Fig12  — Top L-R dot plot by source cell type\n")
+cat("    Fig13  — NEPC composite vs AR score scatter\n")
+
+fls <- list.files(file.path(out_root, "05_Figures"))
+cat(paste0("\n  Total figure files: ", length(fls), "\n"))
+for (f in fls) {
+  sz <- round(file.info(file.path(out_root, "05_Figures", f))$size / 1024, 1)
+  cat(paste0("    ", sprintf("%-55s", f), " (", sz, " KB)\n"))
 }
 cat("##############################################################\n")
