@@ -2,11 +2,15 @@
 # GSE278936 — Evidence That ASPC-AR Interaction Promotes NEPC Emergence
 # 8 Lines of Spatial Evidence | Seurat v5 Compatible
 #
-# This script runs AFTER the main per-sample processing.
-# It reads the saved Seurat objects (*_seurat_scored.rds) OR
-# processes from raw data if RDS not found.
-#
-# Output: /GSE278936 Visium/NEPC_Causation_Evidence/
+# REVISION: Stricter spot-level NEPC call
+#   - Pool all spots across 52 samples, robust z-score NEPC_UP and NEPC_DN
+#   - NEPC+ spot requires BOTH:   z(NEPC_UP) >  NEPC_UP_CUT  (default  1.0)
+#                            AND  z(NEPC_DN) <  NEPC_DN_CUT  (default -0.5)
+#   - BPH samples are ALWAYS "Benign" (never NEPC)
+#   - Cancer samples: "NEPC_sample" only if >5% NEPC+ spots, else "Adeno_sample"
+#   - BUGFIX: back-map pooled z-scores using explicit sample||barcode key
+#   - BUGFIX: NA-safe counting in sample-level classification
+#   - UPDATE: Evidence 4 now visualizes TOP 12 L-R pairs (was 10)
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -27,7 +31,15 @@ safe_GetAssayData <- function(obj, layer_name = "data") {
 }
 
 # ------------------------------------------------------------------------------
-# 1. Paths
+# Stricter-NEPC parameters
+# ------------------------------------------------------------------------------
+NEPC_UP_CUT     <- 1.0     # pooled robust-z threshold for NEPC_UP
+NEPC_DN_CUT     <- -0.5    # pooled robust-z threshold for NEPC_DN
+NEPC_SAMPLE_PCT <- 5       # % NEPC+ spots above which a cancer sample = NEPC_sample
+BENIGN_GROUPS   <- c("BPH")
+
+# ------------------------------------------------------------------------------
+# 1. Paths & sample list
 # ------------------------------------------------------------------------------
 base_root <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE278936 Visium"
 out_dir   <- file.path(base_root, "NEPC_Causation_Evidence")
@@ -36,7 +48,6 @@ for (d in c("Evidence1_Gradient","Evidence2_Transition","Evidence3_Distance_NEPC
             "Evidence7_EMT_Plasticity","Evidence8_Oncogenic_NE","Summary"))
   dir.create(file.path(out_dir, d), showWarnings = FALSE, recursive = TRUE)
 
-# Sample definitions
 samples <- list(
   list(name="BPH_1",   dir=file.path(base_root,"GSM8557976_BPH_1"),   group="BPH"),
   list(name="BPH_2",   dir=file.path(base_root,"GSM8557977_BPH_2"),   group="BPH"),
@@ -157,7 +168,6 @@ EMT_genes <- c("ABI3BP","ACTA2","ADAM12","ANPEP","APLP1","AREG","BASP1","BDNF",
   "TNFRSF11B","TNFRSF12A","TPM1","TPM2","TPM4","VCAM1","VCAN","VIM",
   "WIPF1","WNT5A")
 
-# Plasticity-inducing L-R pairs (ASPC ligand -> NE-promoting receptor)
 plasticity_LR <- data.frame(
   Ligand   = c("FGF2","FGF2","BMP1","NOTCH3","FZD2","MDK","MDK",
                "POSTN","CRLF1","SULF1","GAS6","GAS6"),
@@ -186,20 +196,26 @@ find_file <- function(base, suffix) {
   if (length(hits)==0) return(NA_character_); hits[1]
 }
 
-# ==============================================================================
-# 2. PROCESS ALL SAMPLES — Collect Evidence Data
-# ==============================================================================
-cat("\n========== Processing All Samples ==========\n")
+robust_z <- function(x) {
+  m <- median(x, na.rm = TRUE)
+  s <- mad(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) s <- sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(0, length(x)))
+  (x - m) / s
+}
 
-all_evidence <- list()
-all_sample_smry <- list()
+# ==============================================================================
+# 2. PASS 1 — Load + score every sample
+# ==============================================================================
+cat("\n========== PASS 1: Load + score all samples ==========\n")
+
+sample_cache <- list()
 completed <- c(); skipped <- c()
 
 for (s in samples) {
   nm <- s$name; bd <- s$dir; grp <- s$group
   cat(paste0("\n--- ",nm," [",grp,"] ---\n"))
 
-  # Find files
   f_bc  <- find_file(bd,"barcodes.tsv.gz")
   f_ft  <- find_file(bd,"features.tsv.gz")
   f_mx  <- find_file(bd,"matrix.mtx.gz")
@@ -212,7 +228,6 @@ for (s in samples) {
   if (any(is.na(req))||any(!file.exists(req[!is.na(req)]))) {
     cat("  Missing files — skip\n"); skipped <- c(skipped,nm); next }
 
-  # Load
   barcodes <- readLines(gzfile(f_bc))
   features <- read.delim(gzfile(f_ft),header=FALSE,stringsAsFactors=FALSE)
   mat <- readMM(gzfile(f_mx)); colnames(mat) <- barcodes
@@ -246,7 +261,6 @@ for (s in samples) {
 
   sobj <- SCTransform(sobj,assay="Spatial",verbose=FALSE)
 
-  # Scores
   ctrl_sz <- min(100,floor(nrow(sobj)/4)); nb <- max(5,min(24,ncol(sobj)-1))
   safe_score <- function(obj,genes,prefix) {
     av <- genes[genes %in% rownames(obj)]
@@ -278,540 +292,555 @@ for (s in samples) {
   if(!ok1||!ok2||!ok3||!ok4) { skipped <- c(skipped,nm); next }
   sobj$NEPC_composite <- sobj$NEPC_UP_1 - sobj$NEPC_DN_1
 
-  # Build metadata
   md <- sobj@meta.data
   md$spatial_x <- sobj$spatial_x; md$spatial_y <- sobj$spatial_y
   md$sample <- nm; md$group <- grp
+  md$has_onco <- ok5; md$has_emt <- ok6
+  md$barcode  <- rownames(md)
 
-  # Spot phenotype
+  expr_data <- safe_GetAssayData(sobj, "data")
+  lr_genes  <- unique(c(plasticity_LR$Ligand, plasticity_LR$Receptor))
+  lr_genes  <- lr_genes[lr_genes %in% rownames(sobj)]
+  lr_expr   <- if (length(lr_genes) > 0) as.matrix(expr_data[lr_genes, , drop = FALSE]) else NULL
+
+  sample_cache[[nm]] <- list(md = md, sf_json = sf_json, lr_expr = lr_expr, group = grp)
+  completed <- c(completed, nm)
+  cat(paste0("  cached (", ncol(sobj), " spots)\n"))
+}
+
+if (length(sample_cache) == 0) stop("No samples successfully loaded.")
+
+# ==============================================================================
+# 3. POOLED ROBUST Z-SCORING (back-map via sample||barcode key)
+# ==============================================================================
+cat("\n========== Pooling scores across samples + robust z-scoring ==========\n")
+
+pool_df <- bind_rows(lapply(sample_cache, function(x) {
+  x$md[, c("sample","group","barcode",
+           "ASPC_1","AR_1","NEPC_UP_1","NEPC_DN_1","NEPC_composite")]
+}))
+
+pool_df <- pool_df %>%
+  mutate(
+    ASPC_z     = robust_z(ASPC_1),
+    AR_z       = robust_z(AR_1),
+    NEPC_UP_z  = robust_z(NEPC_UP_1),
+    NEPC_DN_z  = robust_z(NEPC_DN_1),
+    NEPC_comp_z= robust_z(NEPC_composite),
+    key        = paste(sample, barcode, sep = "||")
+  )
+
+for (nm in names(sample_cache)) {
+  md <- sample_cache[[nm]]$md
+  md$key <- paste(md$sample, md$barcode, sep = "||")
+  idx <- match(md$key, pool_df$key)
+
+  md$ASPC_z      <- pool_df$ASPC_z[idx]
+  md$AR_z        <- pool_df$AR_z[idx]
+  md$NEPC_UP_z   <- pool_df$NEPC_UP_z[idx]
+  md$NEPC_DN_z   <- pool_df$NEPC_DN_z[idx]
+  md$NEPC_comp_z <- pool_df$NEPC_comp_z[idx]
+
+  md$is_NEPC_spot <- (md$NEPC_UP_z > NEPC_UP_CUT) & (md$NEPC_DN_z < NEPC_DN_CUT)
+  md$is_NEPC_spot[is.na(md$is_NEPC_spot)] <- FALSE
+
+  ar   <- md$AR_1;   ar[is.na(ar)] <- 0
+  aspc <- md$ASPC_1; aspc[is.na(aspc)] <- 0
+
   md$spot_pheno <- ifelse(
-    md$AR_1>0 & md$NEPC_composite<=0, "AR_epithelial",
+    ar > 0 & !md$is_NEPC_spot, "AR_epithelial",
   ifelse(
-    md$NEPC_composite>0 & md$AR_1<=0, "NEPC",
+    md$is_NEPC_spot & ar <= 0, "NEPC",
   ifelse(
-    md$AR_1>0 & md$NEPC_composite>0, "Transition",
+    ar > 0 & md$is_NEPC_spot, "Transition",
   ifelse(
-    md$ASPC_1>0 & md$AR_1<=0 & md$NEPC_composite<=0, "Stromal_ASPC",
+    aspc > 0 & ar <= 0 & !md$is_NEPC_spot, "Stromal_ASPC",
     "Other"))))
+  md$spot_pheno[is.na(md$spot_pheno)] <- "Other"
 
-  n_nepc <- sum(md$spot_pheno=="NEPC")
-  md$sample_type <- ifelse(n_nepc==0,"Adeno_sample","NEPC_sample")
+  n_spots  <- nrow(md)
+  n_nepc   <- sum(md$spot_pheno == "NEPC", na.rm = TRUE)
+  pct_nepc <- if (n_spots > 0) 100 * n_nepc / n_spots else 0
+  if (is.na(pct_nepc)) pct_nepc <- 0
+  md$pct_NEPC_spots <- pct_nepc
 
-  # -----------------------------------------------------------------------
-  # COMPUTE INTERFACE ZONES (ASPC-AR)
-  # -----------------------------------------------------------------------
-  spot_radius <- sf_json$spot_diameter_fullres * 3
-  all_xy <- as.matrix(md[,c("spatial_x","spatial_y")])
+  md$sample_type <- if (sample_cache[[nm]]$group %in% BENIGN_GROUPS) {
+    "Benign"
+  } else if (pct_nepc > NEPC_SAMPLE_PCT) {
+    "NEPC_sample"
+  } else {
+    "Adeno_sample"
+  }
+
+  sample_cache[[nm]]$md <- md
+}
+
+cat(sprintf("  Stricter NEPC rule: z(NEPC_UP) > %.2f AND z(NEPC_DN) < %.2f\n",
+            NEPC_UP_CUT, NEPC_DN_CUT))
+cat(sprintf("  BPH forced to 'Benign' (BENIGN_GROUPS = %s)\n",
+            paste(BENIGN_GROUPS, collapse=",")))
+
+# ==============================================================================
+# 4. PASS 2 — Interface geometry + per-sample evidence
+# ==============================================================================
+cat("\n========== PASS 2: Interface geometry + evidence ==========\n")
+
+all_evidence    <- list()
+all_sample_smry <- list()
+
+for (nm in names(sample_cache)) {
+  cat(paste0("\n--- ", nm, " ---\n"))
+  ent <- sample_cache[[nm]]
+  md  <- ent$md
+  grp <- ent$group
+
+  spot_radius <- ent$sf_json$spot_diameter_fullres * 3
+  all_xy <- as.matrix(md[, c("spatial_x","spatial_y")])
   n_spots <- nrow(md)
 
   md$at_ASPC_AR_interface <- FALSE
-  md$dist_to_nearest_ASPC <- NA
-  md$dist_to_nearest_AR   <- NA
+  md$dist_to_nearest_ASPC <- NA_real_
+  md$dist_to_nearest_AR   <- NA_real_
 
-  aspc_idx <- which(md$spot_pheno=="Stromal_ASPC")
-  ar_idx   <- which(md$spot_pheno=="AR_epithelial")
+  aspc_idx <- which(md$spot_pheno == "Stromal_ASPC")
+  ar_idx   <- which(md$spot_pheno == "AR_epithelial")
 
-  if (length(aspc_idx)>=3 && length(ar_idx)>=3) {
+  if (length(aspc_idx) >= 3 && length(ar_idx) >= 3) {
     aspc_xy <- all_xy[aspc_idx,,drop=FALSE]
     ar_xy   <- all_xy[ar_idx,,drop=FALSE]
-
-    # Distance of every spot to nearest ASPC and nearest AR
-    for (i in 1:n_spots) {
-      md$dist_to_nearest_ASPC[i] <- min(sqrt((aspc_xy[,1]-all_xy[i,1])^2+(aspc_xy[,2]-all_xy[i,2])^2))
-      md$dist_to_nearest_AR[i]   <- min(sqrt((ar_xy[,1]-all_xy[i,1])^2+(ar_xy[,2]-all_xy[i,2])^2))
+    for (i in seq_len(n_spots)) {
+      md$dist_to_nearest_ASPC[i] <- min(sqrt((aspc_xy[,1]-all_xy[i,1])^2 +
+                                             (aspc_xy[,2]-all_xy[i,2])^2))
+      md$dist_to_nearest_AR[i]   <- min(sqrt((ar_xy[,1]-all_xy[i,1])^2 +
+                                             (ar_xy[,2]-all_xy[i,2])^2))
     }
-
-    # Interface = spots with both ASPC and AR neighbors within radius
-    for (i in 1:n_spots) {
-      dists <- sqrt((all_xy[,1]-all_xy[i,1])^2+(all_xy[,2]-all_xy[i,2])^2)
-      nbrs <- which(dists>0 & dists<=spot_radius)
+    for (i in seq_len(n_spots)) {
+      dists <- sqrt((all_xy[,1]-all_xy[i,1])^2 + (all_xy[,2]-all_xy[i,2])^2)
+      nbrs  <- which(dists > 0 & dists <= spot_radius)
       nbr_ph <- md$spot_pheno[nbrs]
-      if (any(nbr_ph=="Stromal_ASPC") && any(nbr_ph=="AR_epithelial"))
+      if (any(nbr_ph == "Stromal_ASPC") && any(nbr_ph == "AR_epithelial"))
         md$at_ASPC_AR_interface[i] <- TRUE
     }
   }
 
-  n_interface <- sum(md$at_ASPC_AR_interface)
+  n_interface <- sum(md$at_ASPC_AR_interface, na.rm = TRUE)
+  n_nepc      <- sum(md$spot_pheno == "NEPC", na.rm = TRUE)
 
-  # -----------------------------------------------------------------------
-  # EVIDENCE 1: NEPC score gradient toward ASPC-AR interface
-  # For AR_epithelial spots: does NEPC_composite increase near interface?
-  # -----------------------------------------------------------------------
-  ev1 <- NULL
-  ar_spots_md <- md[md$spot_pheno=="AR_epithelial",]
-  if (nrow(ar_spots_md)>=20 && length(aspc_idx)>=5) {
-    ar_spots_md$dist_cat <- cut(ar_spots_md$dist_to_nearest_ASPC,
-                                 breaks=quantile(ar_spots_md$dist_to_nearest_ASPC,
-                                                 probs=seq(0,1,0.25),na.rm=TRUE),
-                                 include.lowest=TRUE, labels=c("Q1_nearest","Q2","Q3","Q4_farthest"))
-    ev1 <- ar_spots_md %>%
-      filter(!is.na(dist_cat)) %>%
-      group_by(dist_cat) %>%
-      summarize(
-        N=n(),
-        Mean_NEPC=mean(NEPC_composite,na.rm=TRUE),
-        Mean_NEPC_onco=if(ok5) mean(NEPC_onco_1,na.rm=TRUE) else NA,
-        Mean_EMT=if(ok6) mean(EMT_1,na.rm=TRUE) else NA,
-        .groups="drop"
-      ) %>%
-      mutate(sample=nm, group=grp)
-    # Correlation: distance to ASPC vs NEPC score in AR spots
-    ev1_cor <- cor.test(ar_spots_md$dist_to_nearest_ASPC, ar_spots_md$NEPC_composite,
-                        method="spearman")
+  # ------------ EVIDENCE 1: NEPC gradient in AR+ spots vs dist to ASPC -------
+  ev1 <- NULL; ev1_cor <- NULL
+  ar_spots_md <- md[md$spot_pheno == "AR_epithelial", ]
+  if (nrow(ar_spots_md) >= 20 && length(aspc_idx) >= 5) {
+    qs <- quantile(ar_spots_md$dist_to_nearest_ASPC,
+                   probs = seq(0,1,0.25), na.rm = TRUE)
+    if (length(unique(qs)) >= 3) {
+      ar_spots_md$dist_cat <- cut(ar_spots_md$dist_to_nearest_ASPC,
+                                  breaks = qs, include.lowest = TRUE,
+                                  labels = c("Q1_nearest","Q2","Q3","Q4_farthest"))
+      ev1 <- ar_spots_md %>%
+        filter(!is.na(dist_cat)) %>%
+        group_by(dist_cat) %>%
+        summarize(
+          N = n(),
+          Mean_NEPC      = mean(NEPC_composite, na.rm = TRUE),
+          Mean_NEPC_onco = if ("NEPC_onco_1" %in% colnames(ar_spots_md))
+                             mean(NEPC_onco_1, na.rm = TRUE) else NA,
+          Mean_EMT       = if ("EMT_1" %in% colnames(ar_spots_md))
+                             mean(EMT_1, na.rm = TRUE) else NA,
+          .groups = "drop"
+        ) %>%
+        mutate(sample = nm, group = grp)
+      ev1_cor <- suppressWarnings(cor.test(
+        ar_spots_md$dist_to_nearest_ASPC, ar_spots_md$NEPC_composite,
+        method = "spearman"))
+    }
   }
 
-  # -----------------------------------------------------------------------
-  # EVIDENCE 2: Transition spots at interface
-  # Are Transition (AR+/NEPC+) spots enriched at the ASPC-AR interface?
-  # -----------------------------------------------------------------------
+  # ------------ EVIDENCE 2: Transition enrichment at interface ---------------
   ev2 <- NULL
-  if (n_interface >= 5 && sum(md$spot_pheno=="Transition")>=1) {
-    n_trans_at_iface    <- sum(md$spot_pheno=="Transition" & md$at_ASPC_AR_interface)
-    n_trans_not_iface   <- sum(md$spot_pheno=="Transition" & !md$at_ASPC_AR_interface)
-    n_other_at_iface    <- sum(md$spot_pheno!="Transition" & md$at_ASPC_AR_interface)
-    n_other_not_iface   <- sum(md$spot_pheno!="Transition" & !md$at_ASPC_AR_interface)
+  if (n_interface >= 5 && sum(md$spot_pheno == "Transition", na.rm = TRUE) >= 1) {
+    n_trans_at_iface  <- sum(md$spot_pheno == "Transition" &  md$at_ASPC_AR_interface, na.rm = TRUE)
+    n_trans_not_iface <- sum(md$spot_pheno == "Transition" & !md$at_ASPC_AR_interface, na.rm = TRUE)
+    n_other_at_iface  <- sum(md$spot_pheno != "Transition" &  md$at_ASPC_AR_interface, na.rm = TRUE)
+    n_other_not_iface <- sum(md$spot_pheno != "Transition" & !md$at_ASPC_AR_interface, na.rm = TRUE)
     fisher_mat <- matrix(c(n_trans_at_iface, n_trans_not_iface,
-                           n_other_at_iface, n_other_not_iface), nrow=2)
-    ft <- tryCatch(fisher.test(fisher_mat), error=function(e) NULL)
+                           n_other_at_iface, n_other_not_iface), nrow = 2)
+    ft <- tryCatch(fisher.test(fisher_mat), error = function(e) NULL)
     ev2 <- data.frame(
-      sample=nm, group=grp,
-      N_Transition_at_interface=n_trans_at_iface,
-      N_Transition_away=n_trans_not_iface,
-      Pct_Trans_at_interface=round(n_trans_at_iface/(n_trans_at_iface+n_trans_not_iface)*100,1),
-      Fisher_OR=if(!is.null(ft)) round(ft$estimate,3) else NA,
-      Fisher_p=if(!is.null(ft)) signif(ft$p.value,4) else NA
+      sample = nm, group = grp,
+      N_Transition_at_interface = n_trans_at_iface,
+      N_Transition_away = n_trans_not_iface,
+      Pct_Trans_at_interface = round(n_trans_at_iface /
+                                     max(1, n_trans_at_iface + n_trans_not_iface) * 100, 1),
+      Fisher_OR = if (!is.null(ft)) round(ft$estimate, 3) else NA,
+      Fisher_p  = if (!is.null(ft)) signif(ft$p.value, 4) else NA
     )
   }
 
-  # -----------------------------------------------------------------------
-  # EVIDENCE 3: Distance-dependent NEPC score
-  # Among ALL spots: does NEPC_composite decrease with distance from ASPC?
-  # -----------------------------------------------------------------------
-  ev3_cor <- NA
-  if (sum(!is.na(md$dist_to_nearest_ASPC))>=20) {
-    ev3_cor <- cor(md$dist_to_nearest_ASPC, md$NEPC_composite,
-                   method="spearman", use="complete.obs")
+  # ------------ EVIDENCE 3: Distance-dependent NEPC --------------------------
+  ev3_cor <- NA_real_
+  if (sum(!is.na(md$dist_to_nearest_ASPC)) >= 20) {
+    ev3_cor <- suppressWarnings(
+      cor(md$dist_to_nearest_ASPC, md$NEPC_composite,
+          method = "spearman", use = "complete.obs"))
   }
 
-  # -----------------------------------------------------------------------
-  # EVIDENCE 4: L-R at interface (computed in cross-sample)
-  # -----------------------------------------------------------------------
-  ev4 <- NULL
-  expr_data <- safe_GetAssayData(sobj, "data")
-  all_gene_names <- rownames(sobj)
-
-  lr_iface_results <- data.frame()
-  for (j in 1:nrow(plasticity_LR)) {
-    lig <- plasticity_LR$Ligand[j]; rec <- plasticity_LR$Receptor[j]
-    if (lig %in% all_gene_names && rec %in% all_gene_names) {
-      lig_e <- as.numeric(expr_data[lig,])
-      rec_e <- as.numeric(expr_data[rec,])
-      int_score <- sqrt(pmax(lig_e,0)*pmax(rec_e,0))
-
-      # Mean interaction at interface vs away
-      mean_at_iface <- mean(int_score[md$at_ASPC_AR_interface], na.rm=TRUE)
-      mean_away     <- mean(int_score[!md$at_ASPC_AR_interface], na.rm=TRUE)
-
-      lr_iface_results <- rbind(lr_iface_results, data.frame(
-        sample=nm, group=grp,
-        Ligand=lig, Receptor=rec, Pathway=plasticity_LR$Pathway[j],
-        NE_link=plasticity_LR$NE_link[j],
-        Mean_at_interface=round(mean_at_iface,4),
-        Mean_away=round(mean_away,4),
-        Fold_enrichment=round(mean_at_iface/(mean_away+0.0001),2),
-        stringsAsFactors=FALSE
-      ))
+  # ------------ EVIDENCE 4: L-R at interface ---------------------------------
+  ev4 <- data.frame()
+  if (!is.null(ent$lr_expr)) {
+    lr_expr <- ent$lr_expr
+    rn <- rownames(lr_expr)
+    for (j in seq_len(nrow(plasticity_LR))) {
+      lig <- plasticity_LR$Ligand[j]; rec <- plasticity_LR$Receptor[j]
+      if (lig %in% rn && rec %in% rn) {
+        lig_e <- as.numeric(lr_expr[lig, ])
+        rec_e <- as.numeric(lr_expr[rec, ])
+        int_score <- sqrt(pmax(lig_e, 0) * pmax(rec_e, 0))
+        mean_at <- mean(int_score[md$at_ASPC_AR_interface], na.rm = TRUE)
+        mean_aw <- mean(int_score[!md$at_ASPC_AR_interface], na.rm = TRUE)
+        ev4 <- rbind(ev4, data.frame(
+          sample = nm, group = grp,
+          Ligand = lig, Receptor = rec,
+          Pathway = plasticity_LR$Pathway[j],
+          NE_link = plasticity_LR$NE_link[j],
+          Mean_at_interface = round(mean_at, 4),
+          Mean_away         = round(mean_aw, 4),
+          Fold_enrichment   = round(mean_at / (mean_aw + 1e-4), 2),
+          stringsAsFactors = FALSE
+        ))
+      }
     }
   }
-  ev4 <- lr_iface_results
 
-  # -----------------------------------------------------------------------
-  # EVIDENCE 5: Sample-level metrics for cross-sample analysis
-  # -----------------------------------------------------------------------
+  # ------------ Sample summary ------------------------------------------------
   smry <- data.frame(
-    Sample=nm, Group=grp,
-    Sample_type=md$sample_type[1],
-    N_spots=nrow(md),
-    N_AR=sum(md$spot_pheno=="AR_epithelial"),
-    N_NEPC=n_nepc,
-    N_ASPC=sum(md$spot_pheno=="Stromal_ASPC"),
-    N_Transition=sum(md$spot_pheno=="Transition"),
-    N_Interface=n_interface,
-    Pct_Interface=round(n_interface/nrow(md)*100,1),
-    Pct_NEPC=round(n_nepc/nrow(md)*100,1),
-    Pct_Transition=round(sum(md$spot_pheno=="Transition")/nrow(md)*100,1),
-    NEPC_gradient_cor=if(!is.null(ev1)&&exists("ev1_cor")) round(ev1_cor$estimate,4) else NA,
-    NEPC_gradient_p=if(!is.null(ev1)&&exists("ev1_cor")) signif(ev1_cor$p.value,4) else NA,
-    Trans_at_interface_OR=if(!is.null(ev2)) ev2$Fisher_OR else NA,
-    Trans_at_interface_p=if(!is.null(ev2)) ev2$Fisher_p else NA,
-    Dist_NEPC_cor=round(ev3_cor,4),
-    stringsAsFactors=FALSE
+    Sample = nm, Group = grp,
+    Sample_type    = md$sample_type[1],
+    N_spots        = nrow(md),
+    N_AR           = sum(md$spot_pheno == "AR_epithelial", na.rm = TRUE),
+    N_NEPC         = n_nepc,
+    N_ASPC         = sum(md$spot_pheno == "Stromal_ASPC", na.rm = TRUE),
+    N_Transition   = sum(md$spot_pheno == "Transition",   na.rm = TRUE),
+    N_Interface    = n_interface,
+    Pct_Interface  = round(n_interface / nrow(md) * 100, 1),
+    Pct_NEPC       = round(n_nepc      / nrow(md) * 100, 1),
+    Pct_Transition = round(sum(md$spot_pheno == "Transition", na.rm = TRUE) / nrow(md) * 100, 1),
+    NEPC_gradient_cor = if (!is.null(ev1_cor)) round(ev1_cor$estimate, 4) else NA_real_,
+    NEPC_gradient_p   = if (!is.null(ev1_cor)) signif(ev1_cor$p.value, 4) else NA_real_,
+    Trans_at_interface_OR = if (!is.null(ev2)) ev2$Fisher_OR else NA,
+    Trans_at_interface_p  = if (!is.null(ev2)) ev2$Fisher_p else NA,
+    Dist_NEPC_cor = round(ev3_cor, 4),
+    stringsAsFactors = FALSE
   )
 
   all_sample_smry[[nm]] <- smry
-  all_evidence[[nm]] <- list(ev1=ev1,ev2=ev2,ev3_cor=ev3_cor,ev4=ev4,md=md)
+  all_evidence[[nm]] <- list(ev1 = ev1, ev2 = ev2, ev3_cor = ev3_cor, ev4 = ev4, md = md)
 
-  completed <- c(completed,nm)
-  cat(paste0("  DONE -> ",md$sample_type[1],
-             " | Interface=",n_interface,
-             " | NEPC_gradient_cor=",smry$NEPC_gradient_cor,"\n"))
+  cat(paste0("  DONE -> ", md$sample_type[1],
+             " | Interface=", n_interface,
+             " | %NEPC=", round(100*n_nepc/nrow(md),1),
+             " | NEPC_gradient_cor=", smry$NEPC_gradient_cor, "\n"))
 }
 
 # ==============================================================================
-# 3. AGGREGATE AND GENERATE EVIDENCE PLOTS
+# 5. AGGREGATE AND GENERATE EVIDENCE PLOTS
 # ==============================================================================
 cat("\n========== Generating Evidence ==========\n")
 
 L1_df <- bind_rows(all_sample_smry)
-L1_df$Group <- factor(L1_df$Group, levels=c("BPH","TRNA","NEADT","CRPC","MET"))
-write.csv(L1_df, file.path(out_dir,"all_samples_evidence_summary.csv"), row.names=FALSE)
+L1_df$Group <- factor(L1_df$Group, levels = c("BPH","TRNA","NEADT","CRPC","MET"))
+write.csv(L1_df, file.path(out_dir,"all_samples_evidence_summary.csv"), row.names = FALSE)
 
 group_colors <- c("BPH"="#2ECC71","TRNA"="#3498DB","NEADT"="#9B59B6",
                   "CRPC"="#E67E22","MET"="#E74C3C")
-type_colors  <- c("Adeno_sample"="#2980B9","NEPC_sample"="#E74C3C")
+type_colors  <- c("Benign"="#7F8C8D","Adeno_sample"="#2980B9","NEPC_sample"="#E74C3C")
 
-# ==========================================================================
-# EVIDENCE 1: NEPC Score Gradient Toward ASPC-AR Interface
-# ==========================================================================
+# --------- EVIDENCE 1 ----------
 cat("\n--- Evidence 1: NEPC Gradient ---\n")
 ev1_dir <- file.path(out_dir,"Evidence1_Gradient")
-
 ev1_all <- bind_rows(lapply(all_evidence, function(x) x$ev1))
-if (nrow(ev1_all)>0) {
-  write.csv(ev1_all, file.path(ev1_dir,"gradient_data_all_samples.csv"), row.names=FALSE)
-
-  # Aggregate across samples
+if (nrow(ev1_all) > 0) {
+  write.csv(ev1_all, file.path(ev1_dir,"gradient_data_all_samples.csv"), row.names = FALSE)
   ev1_agg <- ev1_all %>%
     group_by(dist_cat, group) %>%
-    summarize(Mean_NEPC=mean(Mean_NEPC,na.rm=TRUE),
-              SE_NEPC=sd(Mean_NEPC,na.rm=TRUE)/sqrt(n()),
-              N=n(), .groups="drop")
-
-  p_ev1 <- ggplot(ev1_agg, aes(x=dist_cat,y=Mean_NEPC,fill=group)) +
-    geom_col(position=position_dodge(0.8),alpha=0.8) +
-    geom_errorbar(aes(ymin=Mean_NEPC-SE_NEPC,ymax=Mean_NEPC+SE_NEPC),
-                  position=position_dodge(0.8),width=0.3) +
-    scale_fill_manual(values=group_colors) +
-    theme_minimal(base_size=13) +
-    ggtitle("EVIDENCE 1: NEPC Score in AR+ Spots by Distance to Nearest ASPC\n(Q1=closest to ASPC, Q4=farthest)") +
-    xlab("Distance to Nearest ASPC (quartile)") + ylab("Mean NEPC Composite Score") +
-    theme(plot.title=element_text(size=13,face="bold",hjust=0.5))
-  ggsave(file.path(ev1_dir,"evidence1_NEPC_gradient.png"),p_ev1,width=12,height=7,dpi=200,bg="white")
-
-  # Gradient correlation across samples
+    summarize(Mean = mean(Mean_NEPC, na.rm = TRUE),
+              SE   = sd(Mean_NEPC, na.rm = TRUE) / sqrt(n()),
+              N    = n(), .groups = "drop")
+  p_ev1 <- ggplot(ev1_agg, aes(x = dist_cat, y = Mean, fill = group)) +
+    geom_col(position = position_dodge(0.8), alpha = 0.8) +
+    geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE),
+                  position = position_dodge(0.8), width = 0.3) +
+    scale_fill_manual(values = group_colors) +
+    theme_minimal(base_size = 13) +
+    ggtitle("EVIDENCE 1: NEPC score in AR+ spots by distance to nearest ASPC") +
+    xlab("Distance to nearest ASPC (quartile)") + ylab("Mean NEPC composite")
+  ggsave(file.path(ev1_dir,"evidence1_NEPC_gradient.png"),
+         p_ev1, width = 12, height = 7, dpi = 200, bg = "white")
   grad_cors <- L1_df %>% filter(!is.na(NEPC_gradient_cor))
-  if (nrow(grad_cors)>=3) {
-    p_gcor <- ggplot(grad_cors, aes(x=Group,y=NEPC_gradient_cor,fill=Group)) +
-      geom_boxplot(alpha=0.7) + geom_jitter(width=0.2,size=1.5) +
-      geom_hline(yintercept=0,linetype="dashed") +
-      scale_fill_manual(values=group_colors) +
-      theme_minimal(base_size=13) +
-      ggtitle("EVIDENCE 1: NEPC Gradient Correlation per Sample\n(Negative = NEPC increases near ASPC)") +
-      ylab("Spearman rho (Dist_to_ASPC vs NEPC_score in AR+ spots)")
-    ggsave(file.path(ev1_dir,"evidence1_gradient_correlation.png"),p_gcor,width=10,height=7,dpi=200,bg="white")
+  if (nrow(grad_cors) >= 3) {
+    p_gcor <- ggplot(grad_cors, aes(x = Group, y = NEPC_gradient_cor, fill = Group)) +
+      geom_boxplot(alpha = 0.7) + geom_jitter(width = 0.2, size = 1.5) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      scale_fill_manual(values = group_colors) + theme_minimal(base_size = 13) +
+      ggtitle("EVIDENCE 1: Per-sample NEPC gradient (negative = NEPC high near ASPC)") +
+      ylab("Spearman rho")
+    ggsave(file.path(ev1_dir,"evidence1_gradient_correlation.png"),
+           p_gcor, width = 10, height = 7, dpi = 200, bg = "white")
   }
   cat("  Evidence 1 saved\n")
 }
 
-# ==========================================================================
-# EVIDENCE 2: Transition Spots Enriched at ASPC-AR Interface
-# ==========================================================================
+# --------- EVIDENCE 2 ----------
 cat("\n--- Evidence 2: Transition at Interface ---\n")
 ev2_dir <- file.path(out_dir,"Evidence2_Transition")
-
 ev2_all <- bind_rows(lapply(all_evidence, function(x) x$ev2))
-if (nrow(ev2_all)>0) {
-  ev2_all <- merge(ev2_all, L1_df[,c("Sample","Group")], by.x="sample",by.y="Sample")
-  write.csv(ev2_all, file.path(ev2_dir,"transition_at_interface.csv"), row.names=FALSE)
-
-  p_ev2 <- ggplot(ev2_all, aes(x=Group,y=log2(Fisher_OR+0.01),fill=Group)) +
-    geom_boxplot(alpha=0.7) + geom_jitter(width=0.2,size=1.5) +
-    geom_hline(yintercept=0,linetype="dashed") +
-    scale_fill_manual(values=group_colors) +
-    theme_minimal(base_size=13) +
-    ggtitle("EVIDENCE 2: Transition Spots Enriched at ASPC-AR Interface\n(log2 OR > 0 = enrichment at interface)") +
-    ylab("log2(Fisher Odds Ratio)")
-  ggsave(file.path(ev2_dir,"evidence2_transition_enrichment.png"),p_ev2,width=10,height=7,dpi=200,bg="white")
+if (nrow(ev2_all) > 0) {
+  ev2_all <- merge(ev2_all, L1_df[, c("Sample","Group")],
+                   by.x = "sample", by.y = "Sample")
+  write.csv(ev2_all, file.path(ev2_dir,"transition_at_interface.csv"), row.names = FALSE)
+  p_ev2 <- ggplot(ev2_all, aes(x = Group, y = log2(Fisher_OR + 0.01), fill = Group)) +
+    geom_boxplot(alpha = 0.7) + geom_jitter(width = 0.2, size = 1.5) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_fill_manual(values = group_colors) + theme_minimal(base_size = 13) +
+    ggtitle("EVIDENCE 2: Transition spots enriched at ASPC-AR interface") +
+    ylab("log2(Fisher OR)")
+  ggsave(file.path(ev2_dir,"evidence2_transition_enrichment.png"),
+         p_ev2, width = 10, height = 7, dpi = 200, bg = "white")
   cat("  Evidence 2 saved\n")
 }
 
-# ==========================================================================
-# EVIDENCE 3: Distance-Dependent NEPC Score
-# ==========================================================================
+# --------- EVIDENCE 3 ----------
 cat("\n--- Evidence 3: Distance-NEPC Correlation ---\n")
 ev3_dir <- file.path(out_dir,"Evidence3_Distance_NEPC")
-
 dist_nepc_cors <- L1_df %>% filter(!is.na(Dist_NEPC_cor))
-if (nrow(dist_nepc_cors)>=3) {
-  p_ev3 <- ggplot(dist_nepc_cors, aes(x=Group,y=Dist_NEPC_cor,fill=Group)) +
-    geom_boxplot(alpha=0.7) + geom_jitter(width=0.2,size=1.5) +
-    geom_hline(yintercept=0,linetype="dashed") +
-    scale_fill_manual(values=group_colors) +
-    theme_minimal(base_size=13) +
-    ggtitle("EVIDENCE 3: NEPC Score vs Distance to ASPC (All Spots)\n(Negative = NEPC higher near ASPC)") +
-    ylab("Spearman rho (Dist_to_ASPC vs NEPC_composite)")
-  ggsave(file.path(ev3_dir,"evidence3_distance_nepc.png"),p_ev3,width=10,height=7,dpi=200,bg="white")
-  write.csv(dist_nepc_cors, file.path(ev3_dir,"distance_NEPC_correlations.csv"), row.names=FALSE)
+if (nrow(dist_nepc_cors) >= 3) {
+  p_ev3 <- ggplot(dist_nepc_cors, aes(x = Group, y = Dist_NEPC_cor, fill = Group)) +
+    geom_boxplot(alpha = 0.7) + geom_jitter(width = 0.2, size = 1.5) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_fill_manual(values = group_colors) + theme_minimal(base_size = 13) +
+    ggtitle("EVIDENCE 3: NEPC score vs distance to ASPC (all spots)") +
+    ylab("Spearman rho")
+  ggsave(file.path(ev3_dir,"evidence3_distance_nepc.png"),
+         p_ev3, width = 10, height = 7, dpi = 200, bg = "white")
+  write.csv(dist_nepc_cors, file.path(ev3_dir,"distance_NEPC_correlations.csv"),
+            row.names = FALSE)
   cat("  Evidence 3 saved\n")
 }
 
-# ==========================================================================
-# EVIDENCE 4: L-R Interactions at Interface
-# ==========================================================================
+# --------- EVIDENCE 4 ----------
 cat("\n--- Evidence 4: L-R at Interface ---\n")
 ev4_dir <- file.path(out_dir,"Evidence4_LR_Mechanism")
-
 ev4_all <- bind_rows(lapply(all_evidence, function(x) x$ev4))
-if (nrow(ev4_all)>0) {
-  write.csv(ev4_all, file.path(ev4_dir,"LR_at_interface_all_samples.csv"), row.names=FALSE)
-
+if (nrow(ev4_all) > 0) {
+  write.csv(ev4_all, file.path(ev4_dir,"LR_at_interface_all_samples.csv"),
+            row.names = FALSE)
   lr_summary <- ev4_all %>%
-    group_by(Ligand,Receptor,Pathway,NE_link) %>%
-    summarize(
-      N=n(),
-      Mean_fold_enrichment=round(mean(Fold_enrichment,na.rm=TRUE),2),
-      Mean_at_interface=round(mean(Mean_at_interface,na.rm=TRUE),4),
-      .groups="drop"
-    ) %>% arrange(desc(Mean_fold_enrichment))
-  write.csv(lr_summary, file.path(ev4_dir,"LR_interface_enrichment_summary.csv"), row.names=FALSE)
-
-  top_lr <- lr_summary[1:min(10,nrow(lr_summary)),] %>%
-    mutate(LR=paste0(Ligand,"->",Receptor))
-
-  p_ev4 <- ggplot(top_lr, aes(x=reorder(LR,Mean_fold_enrichment),y=Mean_fold_enrichment,fill=Pathway)) +
-    geom_col(alpha=0.8) + coord_flip() +
-    geom_hline(yintercept=1,linetype="dashed") +
-    theme_minimal(base_size=12) +
-    ggtitle("EVIDENCE 4: ASPC-Cancer L-R Pairs Enriched at ASPC-AR Interface\n(Fold > 1 = enriched at interface)") +
-    xlab("") + ylab("Fold Enrichment at Interface vs Away")
-  ggsave(file.path(ev4_dir,"evidence4_LR_enrichment.png"),p_ev4,width=12,height=7,dpi=200,bg="white")
-  cat("  Evidence 4 saved\n")
+    group_by(Ligand, Receptor, Pathway, NE_link) %>%
+    summarize(N = n(),
+              Mean_fold_enrichment = round(mean(Fold_enrichment, na.rm = TRUE), 2),
+              Mean_at_interface    = round(mean(Mean_at_interface, na.rm = TRUE), 4),
+              .groups = "drop") %>% arrange(desc(Mean_fold_enrichment))
+  write.csv(lr_summary, file.path(ev4_dir,"LR_interface_enrichment_summary.csv"),
+            row.names = FALSE)
+  # Visualize TOP 12 L-R pairs (was 10)
+  top_lr <- lr_summary[1:min(12, nrow(lr_summary)), ] %>%
+    mutate(LR = paste0(Ligand, "->", Receptor))
+  p_ev4 <- ggplot(top_lr, aes(x = reorder(LR, Mean_fold_enrichment),
+                              y = Mean_fold_enrichment, fill = Pathway)) +
+    geom_col(alpha = 0.8) + coord_flip() +
+    geom_hline(yintercept = 1, linetype = "dashed") +
+    theme_minimal(base_size = 12) +
+    ggtitle("EVIDENCE 4: Top 12 plasticity L-R pairs enriched at ASPC-AR interface") +
+    xlab("") + ylab("Fold enrichment at interface vs away")
+  ggsave(file.path(ev4_dir,"evidence4_LR_enrichment.png"),
+         p_ev4, width = 12, height = 7, dpi = 200, bg = "white")
+  cat("  Evidence 4 saved (top 12 L-R pairs)\n")
 }
 
-# ==========================================================================
-# EVIDENCE 5: Cross-Sample — More Interface = More NEPC
-# ==========================================================================
+# --------- EVIDENCE 5 ----------
 cat("\n--- Evidence 5: Cross-Sample Dose-Response ---\n")
 ev5_dir <- file.path(out_dir,"Evidence5_Cross_Sample")
-
-plot_df <- L1_df %>% filter(Pct_Interface>0)
-if (nrow(plot_df)>=5) {
-  ct <- cor.test(plot_df$Pct_Interface, plot_df$Pct_NEPC, method="spearman")
-
-  p_ev5a <- ggplot(plot_df, aes(x=Pct_Interface,y=Pct_NEPC,color=Group)) +
-    geom_point(size=3,alpha=0.7) +
-    geom_smooth(method="lm",se=TRUE,color="black",linewidth=0.5,inherit.aes=FALSE,
-                aes(x=Pct_Interface,y=Pct_NEPC)) +
-    scale_color_manual(values=group_colors) +
-    theme_minimal(base_size=13) +
-    ggtitle(paste0("EVIDENCE 5: ASPC-AR Interface % vs NEPC % Across Samples\n(rho=",
-                   round(ct$estimate,3),", p=",signif(ct$p.value,4),")")) +
-    xlab("% ASPC-AR Interface Spots") + ylab("% NEPC Spots")
-  ggsave(file.path(ev5_dir,"evidence5a_interface_vs_NEPC.png"),p_ev5a,width=10,height=8,dpi=200,bg="white")
-
-  # Also: interface vs Transition
-  ct2 <- cor.test(plot_df$Pct_Interface, plot_df$Pct_Transition, method="spearman")
-  p_ev5b <- ggplot(plot_df, aes(x=Pct_Interface,y=Pct_Transition,color=Group)) +
-    geom_point(size=3,alpha=0.7) +
-    geom_smooth(method="lm",se=TRUE,color="black",linewidth=0.5,inherit.aes=FALSE,
-                aes(x=Pct_Interface,y=Pct_Transition)) +
-    scale_color_manual(values=group_colors) +
-    theme_minimal(base_size=13) +
-    ggtitle(paste0("EVIDENCE 5: ASPC-AR Interface % vs Transition % Across Samples\n(rho=",
-                   round(ct2$estimate,3),", p=",signif(ct2$p.value,4),")")) +
-    xlab("% ASPC-AR Interface Spots") + ylab("% Transition (AR+/NEPC+) Spots")
-  ggsave(file.path(ev5_dir,"evidence5b_interface_vs_transition.png"),p_ev5b,width=10,height=8,dpi=200,bg="white")
-
+plot_df <- L1_df %>% filter(Pct_Interface > 0, Group != "BPH")
+if (nrow(plot_df) >= 5) {
+  ct <- cor.test(plot_df$Pct_Interface, plot_df$Pct_NEPC, method = "spearman")
+  p_ev5a <- ggplot(plot_df, aes(x = Pct_Interface, y = Pct_NEPC, color = Group)) +
+    geom_point(size = 3, alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.5,
+                inherit.aes = FALSE, aes(x = Pct_Interface, y = Pct_NEPC)) +
+    scale_color_manual(values = group_colors) + theme_minimal(base_size = 13) +
+    ggtitle(paste0("EVIDENCE 5: Interface % vs NEPC % (cancer samples) rho=",
+                   round(ct$estimate, 3), ", p=", signif(ct$p.value, 4))) +
+    xlab("% ASPC-AR interface spots") + ylab("% NEPC spots")
+  ggsave(file.path(ev5_dir,"evidence5a_interface_vs_NEPC.png"),
+         p_ev5a, width = 10, height = 8, dpi = 200, bg = "white")
+  ct2 <- cor.test(plot_df$Pct_Interface, plot_df$Pct_Transition, method = "spearman")
+  p_ev5b <- ggplot(plot_df, aes(x = Pct_Interface, y = Pct_Transition, color = Group)) +
+    geom_point(size = 3, alpha = 0.7) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.5,
+                inherit.aes = FALSE, aes(x = Pct_Interface, y = Pct_Transition)) +
+    scale_color_manual(values = group_colors) + theme_minimal(base_size = 13) +
+    ggtitle(paste0("EVIDENCE 5: Interface % vs Transition % (cancer) rho=",
+                   round(ct2$estimate, 3), ", p=", signif(ct2$p.value, 4))) +
+    xlab("% ASPC-AR interface spots") + ylab("% Transition spots")
+  ggsave(file.path(ev5_dir,"evidence5b_interface_vs_transition.png"),
+         p_ev5b, width = 10, height = 8, dpi = 200, bg = "white")
   cat("  Evidence 5 saved\n")
 }
 
-# ==========================================================================
-# EVIDENCE 6: Disease Progression
-# ==========================================================================
+# --------- EVIDENCE 6 ----------
 cat("\n--- Evidence 6: Disease Progression ---\n")
 ev6_dir <- file.path(out_dir,"Evidence6_Progression")
-
 prog <- L1_df %>%
   group_by(Group) %>%
-  summarize(
-    N=n(),
-    Mean_Interface=mean(Pct_Interface,na.rm=TRUE),
-    SE_Interface=sd(Pct_Interface,na.rm=TRUE)/sqrt(n()),
-    Mean_NEPC=mean(Pct_NEPC,na.rm=TRUE),
-    SE_NEPC=sd(Pct_NEPC,na.rm=TRUE)/sqrt(n()),
-    Mean_Transition=mean(Pct_Transition,na.rm=TRUE),
-    .groups="drop"
-  )
+  summarize(N = n(),
+            Mean_Interface  = mean(Pct_Interface, na.rm = TRUE),
+            SE_Interface    = sd(Pct_Interface, na.rm = TRUE) / sqrt(n()),
+            Mean_NEPC       = mean(Pct_NEPC, na.rm = TRUE),
+            SE_NEPC         = sd(Pct_NEPC, na.rm = TRUE) / sqrt(n()),
+            Mean_Transition = mean(Pct_Transition, na.rm = TRUE),
+            .groups = "drop")
 prog$SE_Interface[is.na(prog$SE_Interface)] <- 0
 prog$SE_NEPC[is.na(prog$SE_NEPC)] <- 0
-write.csv(prog, file.path(ev6_dir,"progression_summary.csv"), row.names=FALSE)
-
+write.csv(prog, file.path(ev6_dir,"progression_summary.csv"), row.names = FALSE)
 prog_long <- prog %>%
-  select(Group,Mean_Interface,Mean_NEPC,Mean_Transition) %>%
-  pivot_longer(-Group, names_to="Metric",values_to="Value") %>%
-  mutate(Metric=gsub("Mean_","",Metric))
-
-p_ev6 <- ggplot(prog_long, aes(x=Group,y=Value,color=Metric,group=Metric)) +
-  geom_line(linewidth=1.2) + geom_point(size=3) +
-  scale_color_manual(values=c("Interface"="#8E44AD","NEPC"="#E74C3C","Transition"="#F39C12")) +
-  theme_minimal(base_size=14) +
-  ggtitle("EVIDENCE 6: ASPC-AR Interface, NEPC, and Transition Across Progression\n(Parallel trends suggest mechanistic link)") +
-  ylab("Mean % Spots") + xlab("Disease Category")
-ggsave(file.path(ev6_dir,"evidence6_progression.png"),p_ev6,width=10,height=7,dpi=200,bg="white")
+  select(Group, Mean_Interface, Mean_NEPC, Mean_Transition) %>%
+  pivot_longer(-Group, names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = gsub("Mean_","",Metric))
+p_ev6 <- ggplot(prog_long, aes(x = Group, y = Value, color = Metric, group = Metric)) +
+  geom_line(linewidth = 1.2) + geom_point(size = 3) +
+  scale_color_manual(values = c("Interface"="#8E44AD","NEPC"="#E74C3C","Transition"="#F39C12")) +
+  theme_minimal(base_size = 14) +
+  ggtitle("EVIDENCE 6: Interface, NEPC & Transition across progression (stricter; BPH=Benign)") +
+  ylab("Mean % spots") + xlab("Disease category")
+ggsave(file.path(ev6_dir,"evidence6_progression.png"),
+       p_ev6, width = 10, height = 7, dpi = 200, bg = "white")
 cat("  Evidence 6 saved\n")
 
-# ==========================================================================
-# EVIDENCE 7: EMT/Plasticity at Interface
-# ==========================================================================
+# --------- EVIDENCE 7 ----------
 cat("\n--- Evidence 7: EMT at Interface ---\n")
 ev7_dir <- file.path(out_dir,"Evidence7_EMT_Plasticity")
-
 emt_data <- lapply(all_evidence, function(x) {
   md <- x$md
   if (!"EMT_1" %in% colnames(md)) return(NULL)
   md %>% group_by(at_ASPC_AR_interface) %>%
-    summarize(Mean_EMT=mean(EMT_1,na.rm=TRUE),
-              Mean_NEPC=mean(NEPC_composite,na.rm=TRUE),
-              N=n(), .groups="drop") %>%
-    mutate(sample=md$sample[1], group=md$group[1])
+    summarize(Mean_EMT  = mean(EMT_1, na.rm = TRUE),
+              Mean_NEPC = mean(NEPC_composite, na.rm = TRUE),
+              N = n(), .groups = "drop") %>%
+    mutate(sample = md$sample[1], group = md$group[1])
 })
 emt_all <- bind_rows(emt_data)
-
-if (nrow(emt_all)>0) {
-  write.csv(emt_all, file.path(ev7_dir,"EMT_at_interface.csv"), row.names=FALSE)
-
+if (nrow(emt_all) > 0) {
+  write.csv(emt_all, file.path(ev7_dir,"EMT_at_interface.csv"), row.names = FALSE)
   emt_agg <- emt_all %>%
     group_by(at_ASPC_AR_interface) %>%
-    summarize(Mean_EMT=mean(Mean_EMT,na.rm=TRUE),
-              SE=sd(Mean_EMT,na.rm=TRUE)/sqrt(n()),
-              N=n(),.groups="drop")
-
-  p_ev7 <- ggplot(emt_agg, aes(x=at_ASPC_AR_interface,y=Mean_EMT,
-                                 fill=at_ASPC_AR_interface)) +
-    geom_col(alpha=0.8,width=0.5) +
-    geom_errorbar(aes(ymin=Mean_EMT-SE,ymax=Mean_EMT+SE),width=0.2) +
-    scale_fill_manual(values=c("FALSE"="#BDC3C7","TRUE"="#E74C3C"),
-                      labels=c("Away from Interface","At ASPC-AR Interface")) +
-    theme_minimal(base_size=14) +
-    ggtitle("EVIDENCE 7: EMT Score at ASPC-AR Interface vs Away\n(EMT = prerequisite for NE transdifferentiation)") +
-    ylab("Mean EMT Score") + xlab("")
-  ggsave(file.path(ev7_dir,"evidence7_EMT_at_interface.png"),p_ev7,width=8,height=7,dpi=200,bg="white")
+    summarize(Mean = mean(Mean_EMT, na.rm = TRUE),
+              SE   = sd(Mean_EMT, na.rm = TRUE) / sqrt(n()),
+              N    = n(), .groups = "drop")
+  p_ev7 <- ggplot(emt_agg, aes(x = at_ASPC_AR_interface, y = Mean,
+                               fill = at_ASPC_AR_interface)) +
+    geom_col(alpha = 0.8, width = 0.5) +
+    geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.2) +
+    scale_fill_manual(values = c("FALSE"="#BDC3C7","TRUE"="#E74C3C"),
+                      labels = c("Away","At ASPC-AR interface")) +
+    theme_minimal(base_size = 14) +
+    ggtitle("EVIDENCE 7: EMT score at ASPC-AR interface vs away") +
+    ylab("Mean EMT score") + xlab("")
+  ggsave(file.path(ev7_dir,"evidence7_EMT_at_interface.png"),
+         p_ev7, width = 8, height = 7, dpi = 200, bg = "white")
   cat("  Evidence 7 saved\n")
 }
 
-# ==========================================================================
-# EVIDENCE 8: Oncogenic NE Markers at Interface
-# ==========================================================================
+# --------- EVIDENCE 8 ----------
 cat("\n--- Evidence 8: Oncogenic NE at Interface ---\n")
 ev8_dir <- file.path(out_dir,"Evidence8_Oncogenic_NE")
-
 onco_data <- lapply(all_evidence, function(x) {
   md <- x$md
   if (!"NEPC_onco_1" %in% colnames(md)) return(NULL)
   md %>% group_by(at_ASPC_AR_interface) %>%
-    summarize(Mean_NEPC_onco=mean(NEPC_onco_1,na.rm=TRUE),
-              N=n(),.groups="drop") %>%
-    mutate(sample=md$sample[1], group=md$group[1])
+    summarize(Mean_NEPC_onco = mean(NEPC_onco_1, na.rm = TRUE),
+              N = n(), .groups = "drop") %>%
+    mutate(sample = md$sample[1], group = md$group[1])
 })
 onco_all <- bind_rows(onco_data)
-
-if (nrow(onco_all)>0) {
-  write.csv(onco_all, file.path(ev8_dir,"oncogenic_NE_at_interface.csv"),row.names=FALSE)
-
+if (nrow(onco_all) > 0) {
+  write.csv(onco_all, file.path(ev8_dir,"oncogenic_NE_at_interface.csv"),
+            row.names = FALSE)
   onco_agg <- onco_all %>%
     group_by(at_ASPC_AR_interface) %>%
-    summarize(Mean=mean(Mean_NEPC_onco,na.rm=TRUE),
-              SE=sd(Mean_NEPC_onco,na.rm=TRUE)/sqrt(n()),
-              N=n(),.groups="drop")
-
-  p_ev8 <- ggplot(onco_agg, aes(x=at_ASPC_AR_interface,y=Mean,fill=at_ASPC_AR_interface)) +
-    geom_col(alpha=0.8,width=0.5) +
-    geom_errorbar(aes(ymin=Mean-SE,ymax=Mean+SE),width=0.2) +
-    scale_fill_manual(values=c("FALSE"="#BDC3C7","TRUE"="#E74C3C"),
-                      labels=c("Away","At ASPC-AR Interface")) +
-    theme_minimal(base_size=14) +
-    ggtitle("EVIDENCE 8: Oncogenic NE Markers (AURKA/EZH2/MYCN) at Interface\n(Cancer-specific, not normal NE cells)") +
-    ylab("Mean NEPC Oncogenic Score") + xlab("")
-  ggsave(file.path(ev8_dir,"evidence8_oncogenic_NE.png"),p_ev8,width=8,height=7,dpi=200,bg="white")
+    summarize(Mean = mean(Mean_NEPC_onco, na.rm = TRUE),
+              SE   = sd(Mean_NEPC_onco, na.rm = TRUE) / sqrt(n()),
+              N    = n(), .groups = "drop")
+  p_ev8 <- ggplot(onco_agg, aes(x = at_ASPC_AR_interface, y = Mean,
+                                fill = at_ASPC_AR_interface)) +
+    geom_col(alpha = 0.8, width = 0.5) +
+    geom_errorbar(aes(ymin = Mean - SE, ymax = Mean + SE), width = 0.2) +
+    scale_fill_manual(values = c("FALSE"="#BDC3C7","TRUE"="#E74C3C"),
+                      labels = c("Away","At ASPC-AR interface")) +
+    theme_minimal(base_size = 14) +
+    ggtitle("EVIDENCE 8: Oncogenic NE markers (AURKA/EZH2/MYCN) at interface") +
+    ylab("Mean NEPC oncogenic score") + xlab("")
+  ggsave(file.path(ev8_dir,"evidence8_oncogenic_NE.png"),
+         p_ev8, width = 8, height = 7, dpi = 200, bg = "white")
   cat("  Evidence 8 saved\n")
 }
 
-# ==========================================================================
-# SUMMARY FIGURE
-# ==========================================================================
+# --------- SUMMARY FIGURE ----------
 cat("\n--- Summary Figure ---\n")
 sum_dir <- file.path(out_dir,"Summary")
-
 tryCatch({
-  # Build multi-panel if enough data
   panels <- list()
-
-  # P1: Gradient correlation
-  if (exists("grad_cors") && nrow(grad_cors)>=3) {
-    panels[["A"]] <- ggplot(grad_cors,aes(x=Group,y=NEPC_gradient_cor,fill=Group)) +
-      geom_boxplot(alpha=0.7)+geom_jitter(width=0.2,size=1)+geom_hline(yintercept=0,linetype="dashed")+
-      scale_fill_manual(values=group_colors)+theme_minimal(base_size=10)+
-      ggtitle("A) NEPC Gradient\n(neg=NEPC near ASPC)")+ylab("rho")+guides(fill="none")
+  if (exists("grad_cors") && nrow(grad_cors) >= 3) {
+    panels[["A"]] <- ggplot(grad_cors, aes(x = Group, y = NEPC_gradient_cor, fill = Group)) +
+      geom_boxplot(alpha = 0.7) + geom_jitter(width = 0.2, size = 1) +
+      geom_hline(yintercept = 0, linetype = "dashed") +
+      scale_fill_manual(values = group_colors) + theme_minimal(base_size = 10) +
+      ggtitle("A) NEPC gradient") + ylab("rho") + guides(fill = "none")
   }
-
-  # P2: Transition enrichment
-  if (exists("ev2_all") && nrow(ev2_all)>0) {
-    panels[["B"]] <- ggplot(ev2_all,aes(x=Group,y=log2(Fisher_OR+0.01),fill=Group)) +
-      geom_boxplot(alpha=0.7)+geom_hline(yintercept=0,linetype="dashed")+
-      scale_fill_manual(values=group_colors)+theme_minimal(base_size=10)+
-      ggtitle("B) Transition at Interface\n(>0 = enriched)")+ylab("log2(OR)")+guides(fill="none")
+  if (exists("ev2_all") && nrow(ev2_all) > 0) {
+    panels[["B"]] <- ggplot(ev2_all, aes(x = Group, y = log2(Fisher_OR + 0.01), fill = Group)) +
+      geom_boxplot(alpha = 0.7) + geom_hline(yintercept = 0, linetype = "dashed") +
+      scale_fill_manual(values = group_colors) + theme_minimal(base_size = 10) +
+      ggtitle("B) Transition at interface") + ylab("log2(OR)") + guides(fill = "none")
   }
-
-  # P3: Interface vs NEPC scatter
-  if (exists("plot_df") && nrow(plot_df)>=5) {
-    panels[["C"]] <- ggplot(plot_df,aes(x=Pct_Interface,y=Pct_NEPC,color=Group)) +
-      geom_point(size=2)+geom_smooth(method="lm",se=TRUE,color="black",linewidth=0.5,
-                                      inherit.aes=FALSE,aes(x=Pct_Interface,y=Pct_NEPC))+
-      scale_color_manual(values=group_colors)+theme_minimal(base_size=10)+
-      ggtitle("C) Interface % vs NEPC %")+xlab("% Interface")+ylab("% NEPC")
+  if (exists("plot_df") && nrow(plot_df) >= 5) {
+    panels[["C"]] <- ggplot(plot_df, aes(x = Pct_Interface, y = Pct_NEPC, color = Group)) +
+      geom_point(size = 2) +
+      geom_smooth(method = "lm", se = TRUE, color = "black", linewidth = 0.5,
+                  inherit.aes = FALSE, aes(x = Pct_Interface, y = Pct_NEPC)) +
+      scale_color_manual(values = group_colors) + theme_minimal(base_size = 10) +
+      ggtitle("C) Interface % vs NEPC %") + xlab("% Interface") + ylab("% NEPC")
   }
-
-  # P4: Progression
   if (exists("prog_long")) {
-    panels[["D"]] <- ggplot(prog_long,aes(x=Group,y=Value,color=Metric,group=Metric)) +
-      geom_line(linewidth=1)+geom_point(size=2)+
-      scale_color_manual(values=c("Interface"="#8E44AD","NEPC"="#E74C3C","Transition"="#F39C12"))+
-      theme_minimal(base_size=10)+ggtitle("D) Progression Trends")+ylab("% Spots")
+    panels[["D"]] <- ggplot(prog_long, aes(x = Group, y = Value, color = Metric, group = Metric)) +
+      geom_line(linewidth = 1) + geom_point(size = 2) +
+      scale_color_manual(values = c("Interface"="#8E44AD","NEPC"="#E74C3C","Transition"="#F39C12")) +
+      theme_minimal(base_size = 10) + ggtitle("D) Progression trends") + ylab("% Spots")
   }
-
-  if (length(panels)>=3) {
+  if (length(panels) >= 3) {
     p_summary <- wrap_plots(panels) +
       plot_annotation(
-        title="Evidence: ASPC-AR Interaction Promotes NEPC Emergence",
-        subtitle="8 lines of spatial evidence from 52 Visium samples (GSE278936)",
-        theme=theme(plot.title=element_text(size=16,face="bold",hjust=0.5),
-                    plot.subtitle=element_text(size=11,hjust=0.5,color="grey30"))
+        title    = "Evidence: ASPC-AR interaction promotes NEPC emergence (stricter NEPC call)",
+        subtitle = "8 lines of spatial evidence from 52 Visium samples (GSE278936) | BPH forced to Benign",
+        theme    = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5),
+                         plot.subtitle = element_text(size = 11, hjust = 0.5, color = "grey30"))
       )
     ggsave(file.path(sum_dir,"Figure_NEPC_causation_evidence.png"),
-           p_summary,width=18,height=10,dpi=300,bg="white")
+           p_summary, width = 18, height = 10, dpi = 300, bg = "white")
     ggsave(file.path(sum_dir,"Figure_NEPC_causation_evidence.pdf"),
-           p_summary,width=18,height=10,bg="white")
+           p_summary, width = 18, height = 10, bg = "white")
     cat("  Summary figure saved\n")
   }
-}, error=function(e) cat(paste0("  Summary figure error: ",e$message,"\n")))
+}, error = function(e) cat(paste0("  Summary figure error: ", e$message, "\n")))
 
 # ==============================================================================
 # FINAL REPORT
 # ==============================================================================
 cat("\n\n")
 cat("##############################################################\n")
-cat("  NEPC CAUSATION EVIDENCE — COMPLETE\n")
+cat("  NEPC CAUSATION EVIDENCE — COMPLETE (stricter NEPC call)\n")
 cat("##############################################################\n")
-cat(paste0("  Completed: ",length(completed),"/",length(samples),"\n"))
-if(length(skipped)>0) cat(paste0("  Skipped: ",paste(skipped,collapse=", "),"\n"))
-cat(paste0("\n  OUTPUT: ",out_dir,"\n"))
-cat("\n  8 LINES OF EVIDENCE:\n")
-cat("  1. NEPC gradient: NEPC score increases toward ASPC in AR+ spots\n")
-cat("  2. Transition enrichment: AR->NEPC transition at ASPC-AR interface\n")
-cat("  3. Distance-NEPC: NEPC decreases with distance from ASPC\n")
-cat("  4. L-R mechanism: Plasticity-inducing L-R pairs at interface\n")
-cat("  5. Cross-sample: More interface = more NEPC (dose-response)\n")
-cat("  6. Progression: Interface & NEPC parallel BPH->TRNA->NEADT->CRPC->MET\n")
-cat("  7. EMT/Plasticity: EMT elevated at ASPC-AR interface\n")
-cat("  8. Oncogenic NE: AURKA/EZH2/MYCN elevated at interface\n")
-cat("##############################################################\n")
+cat(sprintf("  Stricter spot NEPC rule: z(NEPC_UP) > %.2f AND z(NEPC_DN) < %.2f\n",
+            NEPC_UP_CUT, NEPC_DN_CUT))
+cat(sprintf("  Sample-level NEPC threshold: >%.1f%% NEPC+ spots\n", NEPC_SAMPLE_PCT))
+cat(sprintf("  Benign groups (never NEPC): %s\n", paste(BENIGN_GROUPS, collapse=", ")))
+cat(paste0("  Completed: ", length(completed), "/", length(samples), "\n"))
+if (length(skipped) > 0) cat(pa
