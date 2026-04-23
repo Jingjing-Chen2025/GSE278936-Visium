@@ -1,0 +1,412 @@
+# =============================================================================
+# Visium Spatial Transcriptomics Analysis - GSE278936_Stricter NEPC spot calling
+# Prostate disease spectrum: BPH, TRNA, NEADT, CRPC, MET
+#
+# - Handles GEO-style prefixed filenames (e.g. GSMxxxx_BPH_1_barcodes.tsv.gz)
+# - Compatible with Seurat v4 (VisiumV1 / @coordinates) and
+#   Seurat v5 (VisiumV2 / GetTissueCoordinates())
+# - Scores ASPC, HALLMARK_ADIPOGENESIS, NEPC (UP - DOWN), HALLMARK_ANDROGEN_RESPONSE
+# - Stricter NEPC spot calling (z(NEPC_UP) high AND z(NEPC_DN) low)
+# - BPH is always labeled "Benign" (cannot be NEPC)
+# - Cancer samples: "NEPC" if >5% NEPC+ spots, else "Adenocarcinoma"
+# - Computes ASPC-AR Interface % per sample
+# - Compares Adeno vs NEPC within each cancer category
+# - Writes all outputs to .../GSE278936 Visium/Level4_Pooled
+# =============================================================================
+
+## ---- 0. Packages -----------------------------------------------------------
+pkgs <- c("Seurat", "Matrix", "ggplot2", "dplyr", "tidyr", "readr",
+          "stringr", "purrr", "ggpubr", "patchwork", "jsonlite", "png")
+for (p in pkgs) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  suppressPackageStartupMessages(library(p, character.only = TRUE))
+}
+set.seed(1234)
+
+## ---- 1. Paths & sample roster ----------------------------------------------
+BASE_DIR <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE278936 Visium"
+OUT_DIR  <- file.path(BASE_DIR, "Level4_Pooled")
+dir.create(OUT_DIR, showWarnings = FALSE, recursive = TRUE)
+
+sample_roster <- dplyr::bind_rows(
+  data.frame(category = "BPH",   suffix = paste0("BPH_",   1:4)),
+  data.frame(category = "TRNA",  suffix = paste0("TRNA_",  1:17)),
+  data.frame(category = "NEADT", suffix = paste0("NEADT_", 1:22)),
+  data.frame(category = "CRPC",  suffix = paste0("CRPC_",  1:5)),
+  data.frame(category = "MET",   suffix = paste0("MET_",   LETTERS[1:4]))
+)
+
+all_dirs <- list.dirs(BASE_DIR, recursive = TRUE, full.names = TRUE)
+
+find_sample_dir <- function(suffix) {
+  cand <- all_dirs[grepl(paste0(suffix, "$"), basename(all_dirs))]
+  cand <- cand[vapply(cand, function(d) {
+    dir.exists(file.path(d, "filtered_feature_bc_matrix")) &&
+      dir.exists(file.path(d, "spatial"))
+  }, logical(1))]
+  if (length(cand) == 0) return(NA_character_)
+  cand[1]
+}
+
+sample_roster$path <- vapply(sample_roster$suffix, find_sample_dir, character(1))
+missing_samples <- sample_roster[is.na(sample_roster$path), ]
+if (nrow(missing_samples) > 0) {
+  warning("Missing sample folders:\n",
+          paste(missing_samples$suffix, collapse = ", "))
+}
+sample_roster <- sample_roster[!is.na(sample_roster$path), ]
+
+## ---- 2. Gene signatures ----------------------------------------------------
+ASPC_SIGNATURE <- c(
+  "LAMA2","THBS3","FGF2","POSTN","THBS2","VCAN","LAMB1","COL4A1","GAS6","BMPER",
+  "COL5A1","COL6A5","COL5A3","ENTPD2","ALDH1A1","MFAP2","COL5A2","LOXL2","FBLN7",
+  "BDH2","COL3A1","GPC6","LGI2","AK1","SRPX2","LOXL3","NOTCH3","CLU","CTHRC1",
+  "FGFR1","C3","DPEP1","SSC5D","NAALAD2","ITGBL1","FOXS1","COL11A1","NNMT","HEYL",
+  "TFCP2L1","PRG4","ZFHX4","BNC2","ADAMTS2","NFASC","CHRD","PDGFRL","C1QTNF2",
+  "ANO1","HOXB7","ADAMTS15","ADAMTS12","IGSF10","DNM1","CHL1","HAS2","CYGB",
+  "NR2F1","ZFPM2","ADAMTS5","CP","SULF1","C2","PCSK5","PTPRD","FAP","TNFAIP6",
+  "S100A16","HSD11B1","TIMP1","BMP1","CACNA2D1","TBX2","RBP1","NFATC4","GPRC5B",
+  "MMP11","DPYSL3","ADAMTSL1","KRT7","FST","ID4","SERPINH1","MDK","HOXC8",
+  "PDGFRA","ANGPT4","HIGD1B","MMP3","GPR153","MEG3","ISL1","TSPAN11","HOXC9",
+  "GJC1","SMIM22","ABCC9","ILDR2","HP","LHFP","NTRK2","FEZ1","FMO2","FZD2",
+  "TMEM45A","MMP15","CRLF1","TENM3","ARHGEF25","FOXC2","PIEZO2","S1PR3","CADM3",
+  "DCLK1","LRRN2","LBP","KCNE4","PLS3","PKDCC","NUMBL","STOX2","PLCE1","STEAP3",
+  "CCDC102B","PRKG1","ARHGAP42","S100A14","ELF3","SPHK1","NAV3","FXYD1","SULT1E1",
+  "GABRA3","MEDAG","GPR39","PALM2-AKAP2","CASP12","SNTG1","CERCAM","FKBP9",
+  "CDR2L","PTK7","KIF21A","NSG1","ROBO1","CCDC74A"
+)
+HALLMARK_ADIPOGENESIS <- c(
+  "ABCA1","ABCB8","ACAA2","ACADL","ACADM","ACADS","ACLY","ACO2","ACOX1","ADCY6",
+  "ADIG","ADIPOQ","ADIPOR2","AGPAT3","AIFM1","AK2","ALDH2","ALDOA","ANGPT1",
+  "ANGPTL4","APLP2","APOE","ARAF","ARL4A","ATL2","ATP1B3","ATP5PO","BAZ2A",
+  "BCKDHA","BCL2L13","BCL6","C3","CAT","CAVIN1","CAVIN2","CCNG2","CD151","CD302",
+  "CD36","CDKN2C","CHCHD10","CHUK","CIDEA","CMBL","CMPK1","COL15A1","COL4A1",
+  "COQ3","COQ5","COQ9","COX6A1","COX7B","COX8A","CPT2","CRAT","CS","CYC1",
+  "CYP4B1","DBT","DDT","DECR1","DGAT1","DHCR7","DHRS7","DHRS7B","DLAT","DLD",
+  "DNAJB9","DNAJC15","DRAM2","ECH1","ECHS1","ELMOD3","ELOVL6","ENPP2","EPHX2",
+  "ESRRA","ESYT1","ETFB","FABP4","FAH","FZD4","G3BP2","GADD45A","GBE1","GHITM",
+  "GPAM","GPAT4","GPD2","GPHN","GPX3","GPX4","GRPEL1","HADH","HIBCH","HSPB8",
+  "IDH1","IDH3A","IDH3G","IFNGR1","IMMT","ITGA7","ITIH5","ITSN1","JAGN1","LAMA4",
+  "LEP","LIFR","LIPE","LPCAT3","LPL","LTC4S","MAP4K3","MCCC1","MDH2","ME1",
+  "MGLL","MGST3","MIGA2","MRAP","MRPL15","MTARC2","MTCH2","MYLK","NABP1",
+  "NDUFA5","NDUFAB1","NDUFB7","NDUFS3","NKIRAS1","NMT1","OMD","ORM1","PDCD4",
+  "PEMT","PEX14","PFKFB3","PFKL","PGM1","PHLDB1","PHYH","PIM3","PLIN2","POR",
+  "PPARG","PPM1B","PPP1R15B","PRDX3","PREB","PTCD3","PTGER3","QDPR","RAB34",
+  "REEP5","REEP6","RETN","RETSAT","RIOK3","RMDN3","RNF11","RREB1","RTN3",
+  "SAMM50","SCARB1","SCP2","SDHB","SDHC","SLC19A1","SLC1A5","SLC25A1","SLC25A10",
+  "SLC27A1","SLC5A6","SLC66A3","SNCG","SOD1","SORBS1","SOWAHC","SPARCL1","SQOR",
+  "SSPN","STAT5A","STOM","SUCLG1","SULT1A1","TALDO1","TANK","TKT","TOB1","TST",
+  "UBC","UBQLN1","UCK1","UCP2","UQCR10","UQCR11","UQCRC1","UQCRQ","VEGFB","YWHAG"
+)
+NEPC_UP <- c(
+  "ASXL3","CAND2","ETV5","GPX2","JAKMIP2","KIAA0408","SOGA3","TRIM9","BRINP1",
+  "C7orf76","GNAO1","KCNB2","KCND2","LRRC16B","MAP10","NRSN1","PCSK1","PROX1",
+  "RGS7","SCG3","SEC11C","SEZ6","ST8SIA3","SVOP","SYT11","AURKA","DNMT1","EZH2",
+  "MYCN"
+)
+NEPC_DOWN <- c(
+  "AR","CCND1","CIITA","CREBBP","CSDE1","CYLD","DICER1","FHIT","FOXP1","HERPUD1",
+  "MMP2","MYH9","NUP93","PAX8","RBBP6","TRIM33","GATA2","MAPKAPK3","SPDEF",
+  "ARHGAP8","CATSPERB","EFNA4","EPN3","EVPL","HOXB13","KLK3","KLK4","LMAN1L",
+  "NKX3-1","OPHN1","PIEZO1","PRR5-ARHGAP8","PSCA","RAB27B","RGS10","RIPK2",
+  "SLC25A37","SLC44A4","TC2N","UPK2","RB1"
+)
+HALLMARK_ANDROGEN_RESPONSE <- c(
+  "ABCC4","ABHD2","ACSL3","ACTN1","ADAMTS1","ADRM1","AKAP12","AKT1","ALDH1A3",
+  "ANKH","APPBP2","ARID5B","AZGP1","B2M","B4GALT1","BMPR1B","CAMKK2","CCND1",
+  "CCND3","CDC14B","CDK6","CENPN","DBI","DHCR24","DNAJB9","ELK4","ELL2","ELOVL5",
+  "FADS1","FKBP5","GNAI3","GPD1L","GSR","GUCY1A1","H1-0","HERC3","HMGCR",
+  "HMGCS1","HOMER2","HPGD","HSD17B14","IDI1","INPP4B","INSIG1","IQGAP2","ITGAV",
+  "KLK2","KLK3","KRT19","KRT8","LIFR","LMAN1","MAF","MAK","MAP7","MERTK",
+  "MYL12A","NCOA4","NDRG1","NGLY1","NKX3-1","PA2G4","PDLIM5","PGM3","PIAS1",
+  "PLPP1","PMEPA1","PTK2B","PTPN21","RAB4A","RPS6KA3","RRP12","SAT1","SCD",
+  "SEC24D","SELENOP","SGK1","SLC26A2","SLC38A2","SMS","SORD","SPCS3","SPDEF",
+  "SRF","SRP19","STEAP4","STK39","TARP","TMEM50A","TMPRSS2","TNFAIP8","TPD52",
+  "TSC22D1","UAP1","UBE2I","UBE2J1","VAPA","XRCC5","XRCC6","ZBTB10","ZMIZ1"
+)
+
+## ---- 3. Flexible loaders (handle GSM-prefixed filenames) --------------------
+find_10x_file <- function(dir, patterns) {
+  files <- list.files(dir, full.names = TRUE)
+  for (pat in patterns) {
+    hit <- files[grepl(pat, basename(files), ignore.case = TRUE)]
+    if (length(hit) > 0) return(hit[1])
+  }
+  NA_character_
+}
+
+read_10x_flexible <- function(mat_dir) {
+  bc_f <- find_10x_file(mat_dir, c("barcodes\\.tsv\\.gz$", "barcodes\\.tsv$"))
+  ft_f <- find_10x_file(mat_dir, c("features\\.tsv\\.gz$", "features\\.tsv$",
+                                   "genes\\.tsv\\.gz$",    "genes\\.tsv$"))
+  mx_f <- find_10x_file(mat_dir, c("matrix\\.mtx\\.gz$",   "matrix\\.mtx$"))
+  if (any(is.na(c(bc_f, ft_f, mx_f))))
+    stop("Missing 10x files in ", mat_dir)
+
+  mat <- Matrix::readMM(mx_f)
+  bcs <- readLines(bc_f)
+  fts <- read.delim(ft_f, header = FALSE, stringsAsFactors = FALSE)
+  gene_names <- if (ncol(fts) >= 2) fts[[2]] else fts[[1]]
+  gene_names <- make.unique(gene_names)
+  rownames(mat) <- gene_names
+  colnames(mat) <- bcs
+  as(mat, "CsparseMatrix")
+}
+
+read_image_flexible <- function(spa_dir) {
+  img_f   <- find_10x_file(spa_dir, c("tissue_lowres_image\\.png$",
+                                      "tissue_hires_image\\.png$"))
+  scale_f <- find_10x_file(spa_dir, c("scalefactors_json\\.json$"))
+  pos_f   <- find_10x_file(spa_dir, c("tissue_positions\\.csv\\.gz$",
+                                      "tissue_positions\\.csv$",
+                                      "tissue_positions_list\\.csv\\.gz$",
+                                      "tissue_positions_list\\.csv$"))
+  if (any(is.na(c(img_f, scale_f, pos_f)))) {
+    warning("Missing spatial files in ", spa_dir, " — continuing without image.")
+    return(NULL)
+  }
+  tmp <- file.path(tempdir(),
+                   paste0("spa_", basename(dirname(spa_dir)), "_",
+                          as.integer(Sys.time()), "_", sample.int(1e6, 1)))
+  dir.create(tmp, showWarnings = FALSE, recursive = TRUE)
+  file.copy(img_f,   file.path(tmp, "tissue_lowres_image.png"),  overwrite = TRUE)
+  file.copy(scale_f, file.path(tmp, "scalefactors_json.json"),   overwrite = TRUE)
+  pos_dest <- if (grepl("_list", basename(pos_f)))
+    "tissue_positions_list.csv" else "tissue_positions.csv"
+  if (grepl("\\.gz$", pos_f)) pos_dest <- paste0(pos_dest, ".gz")
+  file.copy(pos_f, file.path(tmp, pos_dest), overwrite = TRUE)
+
+  tryCatch(
+    Seurat::Read10X_Image(image.dir = tmp, filter.matrix = TRUE),
+    error = function(e) { message("   image load failed: ", e$message); NULL }
+  )
+}
+
+## ---- 4. Seurat v4/v5-compatible sample loader ------------------------------
+load_visium_sample <- function(sample_path, sample_id) {
+  message(">> Loading ", sample_id)
+  mat_dir <- file.path(sample_path, "filtered_feature_bc_matrix")
+  spa_dir <- file.path(sample_path, "spatial")
+
+  counts <- read_10x_flexible(mat_dir)
+  obj <- Seurat::CreateSeuratObject(counts = counts, assay = "Spatial",
+                                    project = sample_id)
+
+  img <- read_image_flexible(spa_dir)
+  if (!is.null(img)) {
+    img_barcodes <- tryCatch(
+      rownames(Seurat::GetTissueCoordinates(img)),
+      error = function(e) tryCatch(rownames(img@coordinates),
+                                   error = function(e2) NULL)
+    )
+    if (!is.null(img_barcodes) && length(img_barcodes) > 0) {
+      common <- intersect(colnames(obj), img_barcodes)
+      if (length(common) > 0) {
+        obj <- obj[, common]
+        img <- tryCatch(img[common], error = function(e) img)
+      }
+    }
+    Seurat::DefaultAssay(img) <- "Spatial"
+    obj[[sample_id]] <- img
+  }
+  obj$sample_id <- sample_id
+  obj
+}
+
+## ---- 5. Scoring ------------------------------------------------------------
+score_sample <- function(obj, sample_id) {
+  obj <- Seurat::NormalizeData(obj, verbose = FALSE)
+  add_score <- function(obj, genes, name) {
+    genes <- intersect(genes, rownames(obj))
+    if (length(genes) < 3) { obj[[name]] <- 0; return(obj) }
+    Seurat::AddModuleScore(obj, features = list(genes),
+                           name = name, assay = "Spatial")
+  }
+  obj <- add_score(obj, ASPC_SIGNATURE,             "ASPC_")
+  obj <- add_score(obj, HALLMARK_ADIPOGENESIS,      "ADIPO_")
+  obj <- add_score(obj, NEPC_UP,                    "NEPC_UP_")
+  obj <- add_score(obj, NEPC_DOWN,                  "NEPC_DN_")
+  obj <- add_score(obj, HALLMARK_ANDROGEN_RESPONSE, "AR_")
+
+  md <- obj@meta.data
+  md$ASPC_score  <- md$ASPC_1
+  md$ADIPO_score <- md$ADIPO_1
+  md$AR_score    <- md$AR_1
+  md$NEPC_score  <- md$NEPC_UP_1 - md$NEPC_DN_1
+  md$sample_id   <- sample_id
+  obj@meta.data <- md
+  obj
+}
+
+## ---- 6. Master loop (LOAD + SCORE; classification done after pooling) ------
+raw_spot_list <- list()
+
+for (i in seq_len(nrow(sample_roster))) {
+  s_id   <- sample_roster$suffix[i]
+  s_cat  <- sample_roster$category[i]
+  s_path <- sample_roster$path[i]
+
+  obj <- tryCatch(load_visium_sample(s_path, s_id),
+                  error = function(e) { message("  load failed: ", e$message); NULL })
+  if (is.null(obj)) next
+
+  obj <- score_sample(obj, s_id)
+  md  <- obj@meta.data
+  md$category <- s_cat
+  raw_spot_list[[s_id]] <- md
+}
+
+if (length(raw_spot_list) == 0)
+  stop("No samples loaded. Check folder paths / file patterns.")
+
+## ---- 6b. Pool all spots & robust z-score signatures globally ---------------
+per_spot_df <- dplyr::bind_rows(raw_spot_list, .id = "sample_id_key")
+
+robust_z <- function(x) {
+  m <- median(x, na.rm = TRUE)
+  s <- mad(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) s <- sd(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(0, length(x)))
+  (x - m) / s
+}
+
+per_spot_df <- per_spot_df %>%
+  dplyr::mutate(
+    ASPC_z    = robust_z(ASPC_score),
+    AR_z      = robust_z(AR_score),
+    NEPC_UP_z = robust_z(NEPC_UP_1),
+    NEPC_DN_z = robust_z(NEPC_DN_1),
+    ADIPO_z   = robust_z(ADIPO_score)
+  )
+
+## ---- 6c. Spot-level classification (stricter NEPC) -------------------------
+# NEPC+ spot requires BOTH: neuroendocrine UP high AND AR/luminal DOWN-set low.
+# Prevents stromal/basal (common in BPH) from being mis-called NEPC.
+NEPC_UP_CUT <- 1.0     # ~top 16% of pooled spots
+NEPC_DN_CUT <- -0.5    # AR/luminal program suppressed
+ASPC_CUT    <- 0
+AR_CUT      <- 0
+
+per_spot_df <- per_spot_df %>%
+  dplyr::mutate(
+    is_ASPC = ASPC_score > ASPC_CUT,
+    is_AR   = AR_score   > AR_CUT,
+    is_NEPC = (NEPC_UP_z > NEPC_UP_CUT) & (NEPC_DN_z < NEPC_DN_CUT),
+    is_ASPC_AR_interface = is_ASPC & is_AR
+  )
+
+readr::write_csv(per_spot_df, file.path(OUT_DIR, "per_spot_scores.csv"))
+
+## ---- 7. Per-sample summary & classification --------------------------------
+# Rule:
+#   BPH  -> always "Benign"
+#   Cancer categories -> "NEPC" if >5% NEPC+ spots, else "Adenocarcinoma"
+per_sample_df <- per_spot_df %>%
+  dplyr::group_by(sample_id, category) %>%
+  dplyr::summarise(
+    n_spots               = dplyr::n(),
+    pct_NEPC_spots        = 100 * mean(is_NEPC, na.rm = TRUE),
+    pct_ASPC_AR_interface = 100 * mean(is_ASPC_AR_interface, na.rm = TRUE),
+    mean_ASPC             = mean(ASPC_score,  na.rm = TRUE),
+    mean_AR               = mean(AR_score,    na.rm = TRUE),
+    mean_ADIPO            = mean(ADIPO_score, na.rm = TRUE),
+    mean_NEPC_UP          = mean(NEPC_UP_1,   na.rm = TRUE),
+    mean_NEPC_DN          = mean(NEPC_DN_1,   na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    sample_type = dplyr::case_when(
+      category == "BPH"   ~ "Benign",
+      pct_NEPC_spots > 5  ~ "NEPC",
+      TRUE                ~ "Adenocarcinoma"
+    )
+  )
+
+readr::write_csv(per_sample_df, file.path(OUT_DIR, "per_sample_summary.csv"))
+
+## ---- 7b. Per-sample QC scatter plots ---------------------------------------
+for (s_id in unique(per_spot_df$sample_id)) {
+  md   <- per_spot_df[per_spot_df$sample_id == s_id, ]
+  info <- per_sample_df[per_sample_df$sample_id == s_id, ]
+  try({
+    p <- ggplot(md, aes(ASPC_score, AR_score, color = is_NEPC)) +
+      geom_point(alpha = 0.6, size = 0.6) +
+      geom_hline(yintercept = 0, linetype = 2) +
+      geom_vline(xintercept = 0, linetype = 2) +
+      scale_color_manual(values = c(`FALSE` = "grey70", `TRUE` = "red")) +
+      labs(title = paste0(s_id, " (", info$category, ") - ", info$sample_type),
+           subtitle = sprintf("%%NEPC=%.1f  %%ASPC-AR=%.1f",
+                              info$pct_NEPC_spots, info$pct_ASPC_AR_interface)) +
+      theme_bw()
+    ggsave(file.path(OUT_DIR, paste0("spot_scatter_", s_id, ".png")),
+           p, width = 5, height = 4.2, dpi = 150)
+  }, silent = TRUE)
+}
+
+## ---- 8. Stats: Adeno vs NEPC within each cancer category -------------------
+per_sample_df$category <- factor(per_sample_df$category,
+                                 levels = c("BPH","TRNA","NEADT","CRPC","MET"))
+per_sample_df$sample_type <- factor(per_sample_df$sample_type,
+                                    levels = c("Benign","Adenocarcinoma","NEPC"))
+
+cancer_df <- per_sample_df %>% dplyr::filter(category != "BPH")
+
+stat_results <- cancer_df %>%
+  dplyr::group_by(category) %>%
+  dplyr::group_modify(~{
+    d <- .x
+    types <- droplevels(d$sample_type)
+    if (length(unique(types)) < 2 || any(table(types) < 2)) {
+      return(data.frame(p_value = NA_real_, method = "insufficient_n",
+                        n_adeno = sum(d$sample_type == "Adenocarcinoma"),
+                        n_nepc  = sum(d$sample_type == "NEPC")))
+    }
+    tt <- tryCatch(wilcox.test(pct_ASPC_AR_interface ~ sample_type, data = d),
+                   error = function(e) NULL)
+    data.frame(p_value = if (is.null(tt)) NA_real_ else tt$p.value,
+               method  = "wilcoxon",
+               n_adeno = sum(d$sample_type == "Adenocarcinoma"),
+               n_nepc  = sum(d$sample_type == "NEPC"))
+  }) %>% dplyr::ungroup()
+
+readr::write_csv(stat_results,
+                 file.path(OUT_DIR, "ASPC_AR_Adeno_vs_NEPC_stats.csv"))
+
+## ---- 9. Plots --------------------------------------------------------------
+# Main comparison: Adeno vs NEPC across cancer categories
+p_cancer <- ggplot(cancer_df,
+                   aes(sample_type, pct_ASPC_AR_interface, fill = sample_type)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.15, size = 2, alpha = 0.9) +
+  facet_wrap(~ category, nrow = 1, scales = "free_x") +
+  ggpubr::stat_compare_means(method = "wilcox.test", label = "p.format") +
+  scale_fill_manual(values = c(Adenocarcinoma = "#4C9AFF", NEPC = "#E5484D")) +
+  labs(x = NULL, y = "ASPC-AR Interface (% of spots)",
+       title = "ASPC-AR interface: Adenocarcinoma vs NEPC across cancer categories") +
+  theme_bw(base_size = 12) + theme(legend.position = "top")
+
+ggsave(file.path(OUT_DIR, "ASPC_AR_Adeno_vs_NEPC_by_category.png"),
+       p_cancer, width = 12, height = 4.6, dpi = 200)
+ggsave(file.path(OUT_DIR, "ASPC_AR_Adeno_vs_NEPC_by_category.pdf"),
+       p_cancer, width = 12, height = 4.6)
+
+# Supplemental: all categories including BPH (Benign) for reference
+p_all <- ggplot(per_sample_df,
+                aes(category, pct_ASPC_AR_interface, fill = sample_type)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6,
+               position = position_dodge(preserve = "single")) +
+  geom_point(position = position_jitterdodge(jitter.width = 0.1),
+             size = 1.8, alpha = 0.9) +
+  scale_fill_manual(values = c(Benign = "#8A8A8A",
+                               Adenocarcinoma = "#4C9AFF",
+                               NEPC = "#E5484D")) +
+  labs(x = NULL, y = "ASPC-AR Interface (% of spots)",
+       title = "ASPC-AR interface across disease categories (incl. BPH benign)") +
+  theme_bw(base_size = 12) + theme(legend.position = "top")
+
+ggsave(file.path(OUT_DIR, "ASPC_AR_all_categories_overview.png"),
+       p_all, width = 12, height = 4.6, dpi = 200)
+
+message("\nDone. Outputs written to: ", OUT_DIR)
+print(stat_results)
+print(per_sample_df)
