@@ -1,0 +1,375 @@
+# ==============================================================================
+# GSE278936 Visium — Section 4 (REVISED v4)
+# Cross-sample analysis WITHOUT thresholds or group dichotomisation.
+#
+# Hypothesis: within prostate cancer, samples with greater neuroendocrine
+# content show greater ASPC transcriptional output.
+#
+# BPH HANDLING ----------------------------------------------------------------
+# BPH is EXCLUDED from the primary model AND, by default, from the figures.
+#   Rationale: BPH is benign, stroma-rich and luminal-epithelium-poor. Because
+#   NEPC_Beltran_composite = NEPC_UP - NEPC_DOWN, and the DOWN list is dominated
+#   by AR/luminal identity genes (AR, KLK3, KLK4, NKX3-1, HOXB13, PSCA, SPDEF),
+#   a stroma-rich benign tissue scores HIGH on the composite for compositional
+#   reasons, while also scoring high on ASPC because it is stromal. Retaining
+#   BPH risks generating the association from epithelium-vs-stroma composition
+#   rather than from NE biology.
+#   Set SHOW_BPH_REFERENCE <- TRUE to overlay BPH as open triangles; it is
+#   NEVER included in lm() or cor.test() either way.
+#
+# v4 CHANGE: label placement in the primary panel is now non-overlapping —
+#   ggrepel with segment leader lines, increased repulsion, unlimited overlaps,
+#   fixed seed for reproducibility, and expanded axis limits so labels near the
+#   plot edge are pushed inward rather than clipped. LABEL_MODE lets you switch
+#   between labelling all samples, only influential/extreme samples, or none.
+#
+# Primary model : ASPC_mean ~ NE_comp_mean, cancer samples only (BPH excluded)
+# Secondary     : NE_UP alone; 90th-percentile variants; %NE-leaning spots
+# Robustness    : Spearman, AR-adjusted, group-adjusted, leave-one-out
+#
+# Input : <base_root>/**/<SAMPLE>_full_spot_data.csv  (written by the main loop)
+# Output: Cross_Sample_Analysis/ASPC_vs_NE_continuous_regression.pdf  + CSVs
+# ==============================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2)
+  library(ggrepel); library(patchwork); library(gridExtra)
+})
+
+base_root <- "/Users/cj719/Library/Mobile Documents/com~apple~CloudDocs/Adipocyte NEPC/cj719/GSE278936 Visium"
+cross_sample_dir <- file.path(base_root, "Cross_Sample_Analysis")
+dir.create(cross_sample_dir, showWarnings = FALSE, recursive = TRUE)
+
+## ---- switches ---------------------------------------------------------------
+SHOW_BPH_REFERENCE   <- FALSE   # TRUE = overlay BPH as open triangles (never modelled)
+SHOW_BPH_SENSITIVITY <- FALSE   # TRUE = include the with/without-BPH comparison panel
+
+## Label placement in the primary panel:
+##   "all"      - every sample labelled, repelled with leader lines
+##   "extremes" - label only the most extreme / most influential samples
+##   "none"     - no labels (cleanest for a main figure)
+LABEL_MODE   <- "all"
+LABEL_SEED   <- 42     # fixes repel layout so the figure is reproducible
+N_EXTREME    <- 10     # how many samples to label when LABEL_MODE = "extremes"
+
+## Groups treated as malignant. BPH is deliberately NOT in this vector.
+CANCER_GROUPS <- c("TRNA", "NEADT", "CRPC", "MET")
+
+# ------------------------------------------------------------------------------
+# 4a. Collect per-spot data and aggregate to ONE ROW PER SAMPLE
+#     Sample-level aggregation is essential: spots within a biopsy are not
+#     independent, and treating ~2,000 spots as n would inflate significance by
+#     orders of magnitude.
+# ------------------------------------------------------------------------------
+spot_files <- list.files(base_root, pattern = "_full_spot_data\\.csv$",
+                         recursive = TRUE, full.names = TRUE)
+cat("Per-spot files found:", length(spot_files), "\n")
+stopifnot(length(spot_files) > 0)
+
+per_sample <- lapply(spot_files, function(f) {
+  d <- read.csv(f, stringsAsFactors = FALSE)
+  s <- sub("_full_spot_data\\.csv$", "", basename(f))
+  need <- c("ASPC_score", "NEPC_Beltran_composite", "HallmarkAR_score")
+  if (!all(need %in% names(d))) {
+    warning("Skipping ", s, " - missing column(s): ",
+            paste(setdiff(need, names(d)), collapse = ", "))
+    return(NULL)
+  }
+  has_up <- "NEPC_UP_score" %in% names(d)
+  tibble(
+    Sample       = s,
+    Group        = d$disease_group[1],
+    n_spots      = nrow(d),
+    # --- PRIMARY NE metric: Beltran composite (UP - DOWN) ---
+    NE_comp_mean = mean(d$NEPC_Beltran_composite, na.rm = TRUE),
+    NE_comp_q90  = quantile(d$NEPC_Beltran_composite, 0.90, na.rm = TRUE),
+    # --- SECONDARY: UP genes only, no AR/luminal term ---
+    NE_UP_mean   = if (has_up) mean(d$NEPC_UP_score, na.rm = TRUE) else NA_real_,
+    # --- continuous ASPC output ---
+    ASPC_mean    = mean(d$ASPC_score, na.rm = TRUE),
+    ASPC_q90     = quantile(d$ASPC_score, 0.90, na.rm = TRUE),
+    # --- epithelial/AR context, used as an adjustment covariate ---
+    AR_mean      = mean(d$HallmarkAR_score, na.rm = TRUE),
+    # --- legacy thresholded metric, reported for continuity ONLY ---
+    pct_NE_spot  = 100 * mean(d$NEPC_Beltran_composite > 0 &
+                              d$HallmarkAR_score <= 0, na.rm = TRUE)
+  )
+}) %>% bind_rows()
+
+per_sample$Group <- factor(per_sample$Group,
+                           levels = c("BPH", "TRNA", "NEADT", "CRPC", "MET"))
+
+## ---- split: primary analysis set vs benign reference ------------------------
+ps_cancer <- per_sample %>% filter(Group %in% CANCER_GROUPS) %>% droplevels()
+ps_bph    <- per_sample %>% filter(Group == "BPH")
+ps_all    <- per_sample
+
+write.csv(per_sample, file.path(cross_sample_dir,
+          "per_sample_continuous_metrics.csv"), row.names = FALSE)
+
+cat("\n--- SAMPLE ACCOUNTING ---------------------------------------------\n")
+cat("Total samples processed      : ", nrow(per_sample), "\n")
+cat("PRIMARY model (cancer only)  : n = ", nrow(ps_cancer), "\n")
+cat("Excluded as benign (BPH)     : n = ", nrow(ps_bph),
+    if (nrow(ps_bph) > 0) paste0(" (", paste(ps_bph$Sample, collapse = ", "), ")") else "",
+    "\n", sep = "")
+print(table(per_sample$Group))
+stopifnot(nrow(ps_cancer) >= 10)
+
+# ------------------------------------------------------------------------------
+# 4b. Models
+# ------------------------------------------------------------------------------
+fit_report <- function(df, xvar, yvar, label) {
+  df <- df[is.finite(df[[xvar]]) & is.finite(df[[yvar]]), ]
+  if (nrow(df) < 5) return(NULL)
+  m  <- lm(as.formula(paste(yvar, "~", xvar)), data = df)
+  sm <- summary(m)
+  sp <- suppressWarnings(cor.test(df[[xvar]], df[[yvar]], method = "spearman"))
+  tibble(model = label, n = nrow(df),
+         slope = coef(sm)[2, 1], se = coef(sm)[2, 2],
+         ci_lo = confint(m)[2, 1], ci_hi = confint(m)[2, 2],
+         t = coef(sm)[2, 3], p_lm = coef(sm)[2, 4],
+         r2 = sm$r.squared, rho = unname(sp$estimate), p_spearman = sp$p.value)
+}
+
+res <- bind_rows(
+  # ---- PRIMARY: Beltran composite, cancer only ----
+  fit_report(ps_cancer, "NE_comp_mean", "ASPC_mean", "PRIMARY  ASPC ~ NE composite     [cancer only]"),
+  # ---- secondary / continuity ----
+  fit_report(ps_cancer, "NE_UP_mean",   "ASPC_mean", "ASPC ~ NE_UP only                [cancer only]"),
+  fit_report(ps_cancer, "NE_comp_q90",  "ASPC_mean", "ASPC ~ NE composite 90th pct     [cancer only]"),
+  fit_report(ps_cancer, "NE_comp_mean", "ASPC_q90",  "ASPC 90th pct ~ NE composite     [cancer only]"),
+  fit_report(ps_cancer, "pct_NE_spot",  "ASPC_mean", "ASPC ~ %NE-leaning spots         [cancer only]"),
+  # ---- sensitivity: what BPH inclusion would do (reported, not plotted) ----
+  fit_report(ps_all,    "NE_comp_mean", "ASPC_mean", "SENSITIVITY ASPC ~ NE composite  [BPH included]"),
+  fit_report(ps_all,    "NE_UP_mean",   "ASPC_mean", "SENSITIVITY ASPC ~ NE_UP         [BPH included]")
+)
+
+## AR-adjusted: is the association independent of epithelial content?
+m_ar   <- lm(ASPC_mean ~ NE_comp_mean + AR_mean, data = ps_cancer)
+ar_tb  <- as.data.frame(summary(m_ar)$coefficients)
+
+## group-adjusted: is it just disease-stage restated?
+m_adj  <- lm(ASPC_mean ~ NE_comp_mean + Group, data = ps_cancer)
+adj_tb <- as.data.frame(summary(m_adj)$coefficients)
+
+## leave-one-out influence on the primary slope
+loo <- sapply(seq_len(nrow(ps_cancer)), function(i)
+  coef(lm(ASPC_mean ~ NE_comp_mean, data = ps_cancer[-i, ]))[2])
+loo_tb <- tibble(dropped = ps_cancer$Sample, slope_without = loo,
+                 slope_full = res$slope[1]) %>%
+  mutate(pct_change = 100 * (slope_without - slope_full) / slope_full) %>%
+  arrange(desc(abs(pct_change)))
+
+write.csv(res,    file.path(cross_sample_dir, "ASPC_vs_NE_regression_stats.csv"),  row.names = FALSE)
+write.csv(ar_tb,  file.path(cross_sample_dir, "ASPC_vs_NE_AR_adjusted.csv"))
+write.csv(adj_tb, file.path(cross_sample_dir, "ASPC_vs_NE_group_adjusted.csv"))
+write.csv(loo_tb, file.path(cross_sample_dir, "ASPC_vs_NE_leave_one_out.csv"),     row.names = FALSE)
+
+cat("\n--- MODELS ---------------------------------------------------------\n")
+print(as.data.frame(res %>% mutate(across(where(is.numeric), ~signif(.x, 3)))))
+cat("\n--- AR-ADJUSTED (cancer only) --------------------------------------\n"); print(signif(ar_tb, 3))
+cat("\n--- GROUP-ADJUSTED (cancer only) -----------------------------------\n"); print(signif(adj_tb, 3))
+cat("\n--- MOST INFLUENTIAL SAMPLES ---------------------------------------\n"); print(head(loo_tb, 5))
+
+# ------------------------------------------------------------------------------
+# 4c. Figures  (cancer samples only unless SHOW_BPH_* switches are TRUE)
+# ------------------------------------------------------------------------------
+group_colors <- c(BPH = "#2ECC71", TRNA = "#3498DB", NEADT = "#9B59B6",
+                  CRPC = "#E67E22", MET = "#E74C3C")
+r <- res[1, ]
+sub <- sprintf(paste0("Cancer samples only (BPH excluded): n = %d | slope = %.3f ",
+                      "(95%% CI %.3f to %.3f) | R\u00b2 = %.3f | P = %.3g | ",
+                      "Spearman \u03c1 = %.3f, P = %.3g"),
+               r$n, r$slope, r$ci_lo, r$ci_hi, r$r2, r$p_lm, r$rho, r$p_spearman)
+
+## ---- choose which samples get labels ----------------------------------------
+lab_df <- switch(
+  LABEL_MODE,
+  "all"  = ps_cancer,
+  "none" = ps_cancer[0, ],
+  "extremes" = {
+    m0 <- lm(ASPC_mean ~ NE_comp_mean, data = ps_cancer)
+    ps_cancer %>%
+      mutate(.resid = abs(resid(m0)),
+             .lev   = abs(scale(NE_comp_mean)[, 1]),
+             .score = scale(.resid)[, 1] + scale(.lev)[, 1]) %>%
+      arrange(desc(.score)) %>% slice_head(n = min(N_EXTREME, nrow(ps_cancer)))
+  },
+  ps_cancer
+)
+
+## ---- PANEL 1: primary model -------------------------------------------------
+## Label overlap is handled by: leader-line segments (min.segment.length = 0),
+## strong repulsion, no overlap cap, a fixed seed, and expanded axis limits so
+## edge labels are pushed inward instead of clipped.
+p1 <- ggplot(ps_cancer, aes(NE_comp_mean, ASPC_mean)) +
+  geom_smooth(method = "lm", se = TRUE, colour = "black",
+              linewidth = .6, fill = "grey85") +
+  { if (SHOW_BPH_REFERENCE && nrow(ps_bph) > 0)
+      geom_point(data = ps_bph, aes(NE_comp_mean, ASPC_mean), shape = 2, size = 3.2,
+                 colour = "#2ECC71", stroke = 1.1, inherit.aes = FALSE) } +
+  geom_point(aes(fill = Group, size = n_spots), shape = 21,
+             colour = "grey20", stroke = .3, alpha = .95) +
+  geom_text_repel(
+    data              = lab_df,
+    aes(label = Sample),
+    size              = 2.3,
+    colour            = "grey25",
+    segment.colour    = "grey55",
+    segment.size      = .25,
+    segment.alpha     = .8,
+    min.segment.length = 0,        # always draw a leader line
+    box.padding       = 0.55,      # space around each label box
+    point.padding     = 0.45,      # keep labels clear of the marker itself
+    force             = 12,        # label-label repulsion
+    force_pull        = 0.4,       # keep label near its own point
+    max.overlaps      = Inf,       # never silently drop a label
+    max.iter          = 20000,
+    max.time          = 3,
+    seed              = LABEL_SEED
+  ) +
+  { if (SHOW_BPH_REFERENCE && nrow(ps_bph) > 0)
+      geom_text_repel(data = ps_bph, aes(NE_comp_mean, ASPC_mean, label = Sample),
+                      size = 2.3, colour = "#1E8449", fontface = "italic",
+                      segment.colour = "#1E8449", min.segment.length = 0,
+                      box.padding = .55, point.padding = .45, force = 12,
+                      max.overlaps = Inf, seed = LABEL_SEED, inherit.aes = FALSE) } +
+  scale_fill_manual(values = group_colors, name = "Group", drop = TRUE) +
+  scale_size_continuous(range = c(2, 7), name = "Spots") +
+  ## extra head-room on both axes so repelled labels stay inside the panel
+  scale_x_continuous(expand = expansion(mult = 0.10)) +
+  scale_y_continuous(expand = expansion(mult = 0.10)) +
+  guides(fill = guide_legend(override.aes = list(size = 3.5))) +
+  labs(title = "ASPC output scales with neuroendocrine content across prostate cancer samples",
+       subtitle = sub,
+       caption = if (SHOW_BPH_REFERENCE)
+         "Open green triangles: BPH, plotted as benign reference only and excluded from the model."
+         else "Benign (BPH) samples excluded from both the model and the plot.",
+       x = "Mean NEPC composite score, UP - DOWN (per sample)",
+       y = "Mean ASPC signature score (per sample)") +
+  theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title    = element_text(face = "bold", size = 12),
+        plot.subtitle = element_text(size = 8.5, colour = "grey25"),
+        plot.caption  = element_text(size = 7.5, colour = "grey40", hjust = 0))
+
+## ---- PANEL 2 (optional): with vs without BPH --------------------------------
+p2 <- if (SHOW_BPH_SENSITIVITY && nrow(ps_bph) > 0) {
+  comp_df <- bind_rows(
+    ps_cancer  %>% mutate(model_set = sprintf("Cancer only (n=%d)", nrow(ps_cancer))),
+    per_sample %>% mutate(model_set = sprintf("BPH included (n=%d)", nrow(per_sample)))
+  )
+  ggplot(comp_df, aes(NE_comp_mean, ASPC_mean)) +
+    geom_smooth(method = "lm", se = TRUE, colour = "black", linewidth = .5, fill = "grey88") +
+    geom_point(aes(fill = Group), shape = 21, size = 2.4, colour = "grey20") +
+    scale_fill_manual(values = group_colors) +
+    facet_wrap(~ model_set) +
+    labs(title = "Effect of including benign tissue",
+         x = "Mean NEPC composite", y = "Mean ASPC score") +
+    theme_bw(base_size = 10)
+} else {
+  ggplot(ps_cancer, aes(Group, ASPC_mean, fill = Group)) +
+    geom_boxplot(alpha = .7, outlier.shape = NA) +
+    geom_jitter(width = .18, size = 1.6, alpha = .75, shape = 21, colour = "grey20") +
+    scale_fill_manual(values = group_colors, guide = "none") +
+    labs(title = "ASPC output by disease group (cancer only)",
+         x = NULL, y = "Mean ASPC score") +
+    theme_bw(base_size = 10)
+}
+
+## ---- PANEL 3: rank-based ----------------------------------------------------
+p3 <- ggplot(ps_cancer, aes(rank(NE_comp_mean), rank(ASPC_mean))) +
+  geom_smooth(method = "lm", se = FALSE, colour = "black", linewidth = .5) +
+  geom_point(aes(fill = Group), shape = 21, size = 2.6, colour = "grey20") +
+  scale_fill_manual(values = group_colors) +
+  labs(title = sprintf("Rank-based (Spearman \u03c1 = %.3f, P = %.3g)", r$rho, r$p_spearman),
+       x = "Rank of NE composite", y = "Rank of ASPC output") +
+  theme_bw(base_size = 10)
+
+## ---- PANEL 4: AR-adjusted partial relationship ------------------------------
+ps_cancer$ASPC_resid_AR <- resid(lm(ASPC_mean    ~ AR_mean, data = ps_cancer))
+ps_cancer$NE_resid_AR   <- resid(lm(NE_comp_mean ~ AR_mean, data = ps_cancer))
+p4 <- ggplot(ps_cancer, aes(NE_resid_AR, ASPC_resid_AR)) +
+  geom_smooth(method = "lm", se = TRUE, colour = "black", linewidth = .5, fill = "grey88") +
+  geom_point(aes(fill = Group), shape = 21, size = 2.6, colour = "grey20") +
+  scale_fill_manual(values = group_colors) +
+  labs(title = sprintf("AR-adjusted partial plot (NE composite P = %.3g)", ar_tb[2, 4]),
+       x = "NE composite residual (AR removed)", y = "ASPC residual (AR removed)") +
+  theme_bw(base_size = 10)
+
+## ---- PANEL 5: secondary, NE_UP only -----------------------------------------
+p5 <- if (all(is.na(ps_cancer$NE_UP_mean))) {
+  ggplot() + theme_void() +
+    annotate("text", x = 0, y = 0, size = 3,
+             label = "NEPC_UP_score not present in per-spot CSVs\n(secondary model unavailable)")
+} else {
+  p_up <- res$p_lm[grepl("NE_UP only", res$model)][1]
+  ggplot(ps_cancer, aes(NE_UP_mean, ASPC_mean)) +
+    geom_smooth(method = "lm", se = TRUE, colour = "black", linewidth = .5, fill = "grey88") +
+    geom_point(aes(fill = Group), shape = 21, size = 2.6, colour = "grey20") +
+    scale_fill_manual(values = group_colors) +
+    labs(title = sprintf("Secondary: NE_UP only, no AR term (P = %.3g)", p_up),
+         x = "Mean NEPC-UP score", y = "Mean ASPC score") +
+    theme_bw(base_size = 10)
+}
+
+## ---- PANEL 6: leave-one-out influence ---------------------------------------
+p6 <- ggplot(loo_tb, aes(reorder(dropped, pct_change), pct_change)) +
+  geom_col(fill = "#8E44AD", alpha = .8) + coord_flip() +
+  geom_hline(yintercept = 0, linewidth = .3) +
+  geom_hline(yintercept = c(-20, 20), linetype = "dashed",
+             colour = "red", linewidth = .3) +
+  labs(title = "Leave-one-out influence on primary slope",
+       x = NULL, y = "% change in slope when sample dropped") +
+  theme_bw(base_size = 7)
+
+# ------------------------------------------------------------------------------
+# 4d. Write PDF
+#     Page 1 is deliberately large (14 x 10 in) so ggrepel has room to separate
+#     labels; a second, label-free version of the same panel is written for use
+#     as a clean main-figure candidate.
+# ------------------------------------------------------------------------------
+pdf_path <- file.path(cross_sample_dir, "ASPC_vs_NE_continuous_regression.pdf")
+pdf(pdf_path, width = 14, height = 10, useDingbats = FALSE)
+
+set.seed(LABEL_SEED)
+print(p1)
+
+## clean, label-free version of the same panel
+print(p1 %+% ps_cancer +
+        list(labs(caption = paste0(
+          if (SHOW_BPH_REFERENCE) "Open green triangles: BPH, reference only. "
+          else "Benign (BPH) samples excluded. ",
+          "Unlabelled version; sample identities in per_sample_continuous_metrics.csv."))) )
+
+print((p2 | p3) / (p4 | p5) +
+        plot_annotation(title = "Robustness of the continuous ASPC-NE association (cancer samples only)",
+                        theme = theme(plot.title = element_text(face = "bold"))))
+
+print(p6 + labs(subtitle = "Dashed lines: +/-20% change"))
+
+grid::grid.newpage()
+gridExtra::grid.table(
+  res %>% mutate(across(where(is.numeric), ~signif(.x, 3))) %>%
+    select(model, n, slope, ci_lo, ci_hi, r2, p_lm, rho, p_spearman),
+  rows = NULL,
+  theme = gridExtra::ttheme_default(base_size = 7)
+)
+
+grid::grid.newpage()
+grid::grid.text(
+  paste0("Sample accounting\n\n",
+         "Per-spot files found: ", length(spot_files), "\n",
+         "PRIMARY model (cancer only, BPH excluded): n = ", nrow(ps_cancer), "\n",
+         "Benign (BPH), excluded from model and plots: n = ", nrow(ps_bph), "\n\n",
+         paste(capture.output(print(table(per_sample$Group))), collapse = "\n"),
+         "\n\nPrimary NE metric: NEPC_Beltran_composite = NEPC_UP - NEPC_DOWN",
+         "\nSHOW_BPH_REFERENCE   = ", SHOW_BPH_REFERENCE,
+         "\nSHOW_BPH_SENSITIVITY = ", SHOW_BPH_SENSITIVITY,
+         "\nLABEL_MODE           = ", LABEL_MODE,
+         "\nLABEL_SEED           = ", LABEL_SEED),
+  x = .05, just = "left", gp = grid::gpar(fontsize = 10, fontfamily = "mono"))
+
+dev.off()
+cat("\nPDF written to:\n  ", pdf_path, "\n")
